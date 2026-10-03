@@ -237,6 +237,11 @@ func snapshotGatewayNativeAccount(a *Account) *Account {
 }
 
 func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.Context, route GatewayNativeRoute, body []byte) (*OpenAIForwardResult, bool, error) {
+	if ctx != nil {
+		if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+			defer lifetime.finish()
+		}
+	}
 	if ctx == nil || c == nil || c.Request == nil || s.accountRepo == nil || len(body) > 4<<20 || !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() || !gatewayNativeUnambiguousPolicyFields(body) ||
 		gjson.GetBytes(body, "model").String() != route.Model || (route.Profile != GatewayMiMoResponsesProfile && route.Profile != GatewayLegacyBridgeProfile) ||
 		gjson.GetBytes(body, "previous_response_id").String() != "" ||
@@ -245,6 +250,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		return nil, false, ErrGatewayNativeIdentity
 	}
 	if _, ok := s.accountRepo.(GatewayNativeAccountLocker); !ok {
+		return nil, false, ErrGatewayNativeIdentity
+	}
+	if s.GatewayNativeLifetimeReady() && gatewayNativeLifetime(ctx) == nil {
 		return nil, false, ErrGatewayNativeIdentity
 	}
 	consumer, err := GatewayNativeConsumer(ctx)
@@ -258,6 +266,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	}
 	scope, scopeErr := GatewayNativeCredentialScopeForAccount(a)
 	if scopeErr != nil || scope.Consumer != consumer || custody.ValidateEnvelope(a.GetCredential("api_key")) != nil {
+		return nil, false, ErrGatewayNativeIdentity
+	}
+	if lifetime := gatewayNativeLifetime(ctx); lifetime != nil && !lifetime.matchesScope(scope) {
 		return nil, false, ErrGatewayNativeIdentity
 	}
 	a = snapshotGatewayNativeAccount(a)
@@ -281,6 +292,11 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 			err = ErrGatewayNativeEffectUnknown
 		} else {
 			err = ErrGatewayNativeIdentity
+		}
+	}
+	if err == nil {
+		if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+			lifetime.success()
 		}
 	}
 	return result, state.entered.Load(), err
@@ -336,7 +352,7 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		release()
 		return noop, ErrGatewayNativeIdentity
 	}
-	if !state.entered.CompareAndSwap(false, true) {
+	if !gatewayNativeEntered(request.Context(), &state.entered) {
 		release()
 		return noop, ErrGatewayNativeReplay
 	}
@@ -394,4 +410,15 @@ func gatewayNativeUnambiguousPolicyFields(body []byte) bool {
 	}
 	token, err = decoder.Token()
 	return err == nil && token == json.Delim('}')
+}
+
+// GatewayNativePayloadFields reuses the repaired private protocol parser.
+// Tool and user values remain opaque; the caller names only critical fields.
+func GatewayNativePayloadFields(body []byte, critical ...string) (map[string]json.RawMessage, bool) {
+	return gatewayNativeCanonicalObject(body, critical...)
+}
+
+// Required private bootstrap custody input must be a constructed active adapter.
+func GatewayNativeCredentialCustodyReady(c *GatewayNativeCredentialCustody) bool {
+	return c != nil && c.active != "" && c.keys[c.active] != nil
 }
