@@ -6,7 +6,9 @@
 // replacing or passing it to detached processes, for its entire lifetime. It
 // waits for one byte on FD 5 before doing any transport work, then closes FD 5.
 // Once its private transport is ready it writes exactly "R" to FD 4 and closes
-// FD 4. This handshake is local bootstrap readiness, never a provider probe.
+// FD 4. GATEWAY_LAUNCHER_ENGINE_INCARNATION contains the supervisor-generated
+// canonical UUID also persisted in the original binding and retirement receipt.
+// This handshake is local bootstrap readiness, never a provider probe.
 // The engine must run in the foreground, create no surviving descendants, and
 // stop its transport before exiting. Stock sub2api main is NOT this bootstrap.
 //

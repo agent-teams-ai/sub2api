@@ -8,7 +8,8 @@ Supplied accepted source:
 `16d621c22385a83e4d068da70ebc280846dd8fb0`.
 Observed Git identity: **unverified**. The single Git preflight failed because
 the linked worktree's Git metadata is inaccessible in this installed worker.
-No Git write, commit, push, history rewrite, deployment or installation occurs.
+No Git write, commit, push, history rewrite, deployment or global installation occurs.
+Required qualified tools are unpacked only in the private temporary artifact cache.
 The controller's actual PR base is `release/account-gateway-v0.2.11`; the worker
 materialization alias does not change that base.
 
@@ -22,7 +23,9 @@ model selection remains controller-owned and is not independently attested here.
 ## Owned implementation
 
 Only new `internal/gatewaylauncher/**`, new `cmd/gateway-launcher/**` and this
-document are owned. The library uses the existing Go module and standard library.
+document are owned. The library uses the existing Go module, standard library and already-pinned
+`github.com/google/uuid v1.6.0`; test-only pidfds use already-pinned
+`golang.org/x/sys v0.47.0`. Module and lock files are unchanged.
 Linux is explicit in implementation and test build constraints.
 
 The lifetime policy lives in `launcher_linux.go`; protected filesystem,
@@ -92,6 +95,10 @@ The future accepted private native engine bootstrap MUST:
 The corresponding environment names are `GATEWAY_LAUNCHER_LOCK_FD`,
 `GATEWAY_LAUNCHER_GATE_FD`, `GATEWAY_LAUNCHER_READY_FD` and
 `GATEWAY_LAUNCHER_ORIGIN_REF`. FD values are respectively 3, 5 and 4.
+`GATEWAY_LAUNCHER_ENGINE_INCARNATION` carries the exact supervisor-generated
+lowercase hyphenated UUID recorded before the engine gate opens. Native
+composition must use that same value as kernel `engineIncarnation`; request
+nonce is a separate future wire identity, never derived from incarnation.
 Child stdin/stdout/stderr default to the null device. The launcher does not print
 argv, environment, credentials, provider bodies or retained prompts.
 
@@ -109,7 +116,7 @@ Readback re-establishes file/directory durability before returning facts that
 might have become visible during a previous failed fsync.
 
 Each supervisor-generated binding records originRef, kernel boot ID, PID,
-`/proc/PID/stat` birth ticks, a fresh 256-bit random incarnation, and lock
+`/proc/PID/stat` birth ticks, a fresh random RFC 4122 version-4 canonical UUID incarnation, and lock
 device/inode. There is no caller-provided incarnation or identity authority.
 The phases are `reserved`, `starting`, `ready`, `start-failed` and `retired`.
 Ready is published only after the local bootstrap handshake and durable
@@ -155,8 +162,15 @@ Never delete a lock inode or discard unresolved evidence to bypass a denial.
 ## Bounded shutdown and command use
 
 `Shutdown(ctx)` sends SIGTERM only through the exact exec child handle and waits
-within the supplied deadline. A stubborn child yields pending/failure with the
-lock and evidence preserved. No escalation, automatic restart or daemonization
+within the supplied deadline, including after actual child exit while the
+lifecycle mutex or durable publication is blocked. One lifetime publication
+worker owns all post-start readiness/retirement durability. Unbuffered admission
+keeps at most one operation outstanding; retries select their own context and
+create no new workers. Cancellation returns `ErrNotReady`/`ErrPending`, retains
+the original authority handle, and leaves ongoing publication to finish. A late
+successful publication remains available on that handle and protected readback;
+only durable receipt success closes its authority. A stubborn child yields
+pending/failure with the lock and evidence preserved. No escalation, automatic restart or daemonization
 is performed. Receipt success and an uncertain wait timeout are distinct.
 
 The command takes trusted `-protected-dir`, `-origin-ref`, `-engine`,
@@ -185,7 +199,7 @@ exit, immutable synthetic configuration, and saturation from 64 actual exits.
 Negative identity tests deliberately corrupt only disposable root-owned fixture
 metadata. They do not create production evidence or use missing APIs as negatives.
 
-Worker execution status: **NOT_RUN** for Go compilation, gofmt, vet, race and
+Initial worker execution status: **NOT_RUN** for Go compilation, gofmt, vet, race and
 Linux behavioral qualification because Go is not installed. The worker's root
 identity does not bypass its filesystem sandbox; /run fixture authority is not
 an installed-runtime qualification. No passing behavioral receipt is claimed.
@@ -221,3 +235,159 @@ The guarded terminal53949833 candidate was materialized only after actual base16
 Pinned Go1.27.1 from golang image sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414: gofmt on new owned Go files, actual disposable root Linux process tests in isolated container and go vet PASS, zero skips.
 Initial host race run skipped synthetic exec because host /run is noexec; it is NOT accepted as a behavioral pass. The same source race binary built using that pinned toolchain and host GCC ran in NEW digest-pinned PG17.10 Debian container ag-launcher-race-NEWTEST-20261003-v1, network none, with real nonroot synthetic exec: PASS, zero skips and no race diagnostics, including actual64-receipt saturation.
 Receipts retained under /srv/workers/jobs/account-gateway/first-slice-v1/tmp/qualification-launcher-v1/results/. Exact-source independent xhigh/default review and CI remain pending; native bootstrap composition, SQL acknowledgement, actual provider/E2E/deployment remain NOT_RUN.
+
+
+## e206 bounded repair handoff — 2026-10-03
+
+This changes only the existing seven-path PR3 component. Supplied repair base:
+`e206dc063c07f669373df7f089ff92ae9bdf4c82` (5ca plus qualified lintv5).
+The one exclusive Git lock probe returned ENOENT for the linked gitdir; no Git
+operation, write, commit, push or history change followed. Exact commit/tree
+association remains **UNVERIFIED**, not inferred from the supplied label.
+Before-file snapshots and their SHA256s are retained with the exact unified
+repair patch and after-file hashes outside the source tree at:
+`/srv/worker-state/jobs/account-gateway/first-slice-v1/jobs/account-gateway-20261003-native-launcher-reviewed-fixes-b3b/tmp/agent/launcher-e206-artifacts/`.
+Command source and command tests retain their supplied qualified lintv5 bytes.
+Only launcher lifecycle/storage, their existing tests, package contract comments
+and this existing document are edited; no other component is owned.
+
+Actual inputs read: `.spike-inputs/normative53.md` has the required immutable
+SHA256 `66a2393e7a55f76df1a78281af44379d0b455a0770d82f34e587dcca284157b0`;
+Q, launcher-review and lean-scope-review were read. Q's smallest cohesive
+boundary is one launcher-owned publication worker, with no generic framework,
+identity mapper, ledger, new dependency or production test hook.
+
+Both path walkers now Fstat the opened `/` before opening its first child:
+root owner, directory type and no group/other writes are mandatory. The owned
+root fixture changes only its fresh disposable directory to 0777 then 0755;
+a reexecuted child chroots there after loading its image (also usable by the
+race binary). Host `/` is never chmod'ed. Both actual walkers must deny 0777
+and accept 0755; unavailable chroot authority is explicitly NOT_RUN.
+
+Both orphan cleanup callbacks now acquire a Linux pidfd BEFORE birth-checking
+and signal exclusively through that pinned descriptor. No numeric-PID signal
+fallback exists. The additional controlled PID/mount namespace fixture adopts
+and reaps an actual engine orphan after its birth was checked, creates an
+actual same-PID replacement using namespace-local `ns_last_pid`, requires the
+old pinned signal to return ESRCH and proves the replacement exits normally
+under its own stop marker. Namespace-local proc mount/controlled reuse/pidfd
+restrictions are explicit NOT_RUN, never a pass. All processes are owned
+synthetic fixtures; the namespace must be PID 1 before any reuse control.
+
+Canonical UUID is generated with the existing UUID primitive, supplied to the
+engine environment, and checked on current reservation/birth and every retained
+retirement binding/readback. Lowercase hyphenated spelling is required; parsing
+alone is insufficient. The existing inherited-FD observable test independently
+checks a v4 UUID and exact engine/environment/binding agreement. Existing
+recovery denials now include old 64-hex journals, noncanonical spelling and
+legacy receipts, and assert denied journal bytes remain unchanged. This is a
+fresh unreleased sandbox contract: incompatible journals fail closed without
+migration, reset or guessed identity. Exact closure still requires child exit
+or protected recovery, original boot/PID birth/inode and scope, all holders
+gone and fsync. It proves local teardown only, never NoEffect or refunds.
+
+The deadline regression uses actual fixture R/EOF or child exit before holding
+the existing mutex. Readiness, Wait and Shutdown with a concurrent background
+Wait must return by their short context before unlock across repeated retries,
+retain real flock authority and later expose the same durable exact receipt.
+It uses no new production helper or hook, so an old-source overlay can compile
+and fail behaviorally. Authored tests are not observed behavioral reds.
+
+| Evidence | Current status |
+| --- | --- |
+| Protected source inspection, four repair edits, frozen Contract 53 digest and before/after byte hashes | Actually observed in this worker |
+| Exact unified patch against retained before-file bytes | Worker GNU patch dry-run PASS; application check only, no Go behavioral qualification |
+| Earlier primary Go/Linux/vet/race zeroSkip receipts above | Supplied prior-source evidence only; do not qualify this patch |
+| Go1.27.1 compile/typecheck of both packages and all their test contracts, gofmt, safe diagnostic/helper tests, vet | Worker PASS; actual retained logs and source hashes below |
+| Race binary compilation and qualified golangci-lint v2.13.0 | Worker PASS; full race invocation also observed below, controlled process behavior remains NOT_RUN |
+| Full sandbox launcher/command ordinary and race invocations, including root0777/0755 and same-PID replacement fixtures | Each exited 0 with **41 skipped cases**, all at separate synthetic UID/GID preflight; process/root/PID/race gates are NOT_RUN, not PASS |
+| Original production + repaired test overlay | Go1.27.1 compile PASS with retained original production hashes; actual before-red NOT_RUN because synthetic UID/GID qualification is unavailable |
+| Pinned source approval/CI and composed bootstrap/kernel/native loss qualification | Pending; no source approval or assembled acceptance claimed |
+
+Primary must first verify the before hashes against exact e206 and preserve
+other work/history. Apply only this patch, run pinned Go1.27.1 gofmt and the
+existing targeted test/vet/race commands above, plus the already-qualified lint
+configuration with pinned golangci-lint v2.13:
+`golangci-lint run ./internal/gatewaylauncher/... ./cmd/gateway-launcher/... --timeout=30m`.
+Keep actual logs and recompute hashes after formatting. Run the
+full launcher and command boundary; zero skips is mandatory for the final Linux
+gate. The PID/mount namespace fixture requires controlled disposable container
+namespace/proc-mount/reuse authority (including SYS_ADMIN and CHECKPOINT_RESTORE
+or SYS_ADMIN for namespace-local `ns_last_pid`); do not grant capabilities to
+a deployed engine. No host proc sysctl or unrelated process may be modified.
+
+For a believable before-red, copy the new test file onto a disposable copy of
+the exact e206 library while retaining its production files, then run
+`go test ./internal/gatewaylauncher -run 'TestPublicationDeadlinesAfterObservation|TestRootDirectoryAuthority|TestInheritedDescriptionAndAuthority|TestRecoveryIdentityDenials' -count=1 -v`
+in the same controlled fixture environment. The failure must be reached after
+actual exec/readiness/exit or unsafe-root acceptance, not a compiler diagnostic.
+The test-only pinned cleanup helper is compiled with that overlay and keeps the
+qualification safe even against old production source. Preserve all useful
+existing cases, required independent exact-source review and exact-head CI.
+No bootstrap, custody, kernel, RR, providers, credentials, real-project tests,
+full UI, OAuth or platform changes are part of this handoff.
+
+
+### Worker verification continuation — 2026-10-03
+
+To complete available checks, the worker unpacked only the required qualified
+versions into the private artifact directory, without global/runtime installation.
+The official [Go release manifest](https://go.dev/dl/?mode=json&include=all)
+and downloaded `go1.27.1.linux-amd64.tar.gz` independently agree on SHA256
+`63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445`;
+actual version output is `go version go1.27.1 linux/amd64`.
+The [official golangci-lint v2.13.0 release](https://github.com/golangci/golangci-lint/releases/tag/v2.13.0)
+archive matches its release checksum. That released lint executable was built
+with Go1.27.0; its analysis uses this worker's pinned Go1.27.1 executable and the
+unchanged repository lint configuration. These are worker observations, not
+reuse of the earlier supplied Docker qualification.
+
+Go1.27.1 gofmt, compilation/typechecking of both complete packages and their test
+contracts, the existing safe helper/argv diagnostic tests, go vet, race binary
+compilation and scoped qualified lint all PASS. The initial lint found two
+switch-style diagnostics and one fixture-only G702 taint warning; actual logs
+are retained. The test now uses tagged switches and reexecs the controller's
+own copied test ELF. G702's remaining argument taint is locally justified on
+that test call: owned fixture data is passed as argv inside the private PID
+namespace, with no shell/interpreter. No production suppression or lint config
+change was made; final lint reports zero issues.
+
+The full `go test ./internal/gatewaylauncher ./cmd/gateway-launcher -count=1 -v
+-timeout=3m` invocation exited 0, but **41 fixture cases were skipped** at the
+synthetic UID/GID ownership preflight. This is NOT a Linux/process behavioral
+PASS and does not clear the required zeroSkip gate. No same-UID fallback,
+capability grant, runtime patch or isolation weakening was attempted. Separate
+synthetic ownership, root0777/0755, actual same-PID reuse, process race execution
+and actual old-code behavioral red still require the controlled primary runner.
+
+The exact original production files were copied into a separate disposable
+compile overlay together with the repaired existing test file. Its Go1.27.1
+`go test -c ./internal/gatewaylauncher` PASS proves the regression does not rely
+on a missing production helper or compilation error; it is not a behavioral
+red. The overlay leaves the retained before snapshots and source worktree intact.
+
+All compiler/vet/race/lint invocations disable build VCS stamping and use
+read-only module mode (`GOFLAGS=-mod=readonly -buildvcs=false`, `GOVCS=*:off`).
+The one earlier Git probe was not repeated. Both module files and both command
+files retain their original exact bytes; Contract 53 and review inputs remain
+unchanged. No new Node helper was needed.
+
+Retained actual commands, logs, tool/checksum provenance, original-production
+compile overlay and race executable live under `worker-qualification/`,
+`qualified-go1.27.1/`, `qualified-golangci-lint-v2.13.0/` and
+`before-production-test-overlay/` in the artifact directory above.
+`worker-qualification/final-results.json`, `full-sandbox-suite-result.json` and
+`before-production-compile-result.json` distinguish completed checks from the
+remaining privileged gates. Exact patch and seven-file hashes are regenerated
+after actual formatting. The full goal remains unverified until controlled
+zeroSkip process/root/PID/race execution and the genuine before-red are observed.
+
+The subsequent full pinned Go1.27.1 worker race invocation,
+`go test -race ./internal/gatewaylauncher ./cmd/gateway-launcher -count=1 -v -timeout=3m`,
+exited 0 with the same **41 skipped fixture cases** at synthetic UID/GID
+ownership preflight. The safe helper and argv diagnostics actually ran under
+race instrumentation; the launcher lifecycle/root/PID behaviors were never
+reached and remain NOT_RUN. Actual output and the false zeroSkip gate are
+retained in `worker-qualification/full-sandbox-race-suite.log` and
+`full-sandbox-race-suite-result.json`. All six owned Go files retain their
+previously qualified exact bytes; only this evidence document changed.

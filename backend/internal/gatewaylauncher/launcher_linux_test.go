@@ -11,11 +11,15 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const fixtureUID uint32 = 65534
@@ -174,7 +178,16 @@ func probeLock(t *testing.T, c Config, busy bool) {
 		t.Fatal(err)
 	}
 	defer func() { _ = f.Close() }()
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	// Process-state observation alone does not prove this independent flock free.
+	// Require the actual flock itself, bounded by the fixture deadline.
+	until := time.Now().Add(5 * time.Second)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if busy || err == nil || (err != syscall.EWOULDBLOCK && err != syscall.EAGAIN) || !time.Now().Before(until) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if busy {
 		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
 			t.Fatalf("independent flock: want occupied, got %v", err)
@@ -196,6 +209,7 @@ type engineReport struct {
 	GID             int     `json:"gid"`
 	Groups          []int   `json:"groups"`
 	SyntheticMarker string  `json:"syntheticMarker"`
+	Incarnation     string  `json:"incarnation"`
 }
 
 type supervisorReport struct {
@@ -231,6 +245,45 @@ func TestSyntheticProcess(t *testing.T) {
 	kind, root, mode := args[0], args[1], args[2]
 	if filepath.Dir(root) != "/run" || !strings.HasPrefix(filepath.Base(root), "gatewaylauncher-fixture-") {
 		os.Exit(70)
+	}
+	if kind == "root-check" {
+		// Enter only the parent's OWN fixture after exec, so the same fixture
+		// also works with the dynamically linked race test executable.
+		if err := syscall.Chroot(root); err != nil {
+			if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+				os.Exit(78)
+			}
+			os.Exit(70)
+		}
+		if os.Chdir("/") != nil {
+			os.Exit(70)
+		}
+		a, authorityErr := openAuthority("/protected")
+		if a != nil {
+			a.close()
+		}
+		engineErr := checkEngine("/synthetic-engine")
+		if mode == "unsafe" {
+			if !errors.Is(authorityErr, ErrUnsafe) || !errors.Is(engineErr, ErrUnsafe) {
+				os.Exit(70)
+			}
+		} else if authorityErr != nil || engineErr != nil {
+			os.Exit(70)
+		}
+		os.Exit(0)
+	}
+	if kind == "pid-reuse" {
+		qualifyFixturePIDReuse(t, root)
+		os.Exit(0)
+	}
+	if kind == "witness" {
+		writeSynthetic(filepath.Join(root, "exchange", "witness.json"), map[string]int{"pid": os.Getpid()})
+		for {
+			if _, err := os.Stat(filepath.Join(root, "exchange", "stop-witness")); err == nil {
+				os.Exit(0)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 	if kind == "qualification" {
 		if os.Geteuid() != int(fixtureUID) || os.Getegid() != int(fixtureGID) {
@@ -326,7 +379,7 @@ func TestSyntheticProcess(t *testing.T) {
 	}
 	writeSynthetic(filepath.Join(root, "exchange", "engine.json"), engineReport{
 		uint64(st.Dev), st.Ino, fdFlags, accessMode & syscall.O_ACCMODE, shared,
-		os.IsPermission(metadataErr), os.Geteuid(), os.Getegid(), groups, os.Getenv("SYNTHETIC_VALUE"),
+		os.IsPermission(metadataErr), os.Geteuid(), os.Getegid(), groups, os.Getenv("SYNTHETIC_VALUE"), os.Getenv("GATEWAY_LAUNCHER_ENGINE_INCARNATION"),
 	})
 	ready := os.NewFile(4, "synthetic-ready")
 	if _, err = ready.Write([]byte("R")); err != nil {
@@ -352,6 +405,9 @@ func TestInheritedDescriptionAndAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := l.Binding()
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(b.Incarnation) || report.Incarnation != b.Incarnation {
+		t.Fatal("kernel canonical UUID differs from inherited engine identity")
+	}
 	if report.Device != b.LockDevice || report.Inode != b.LockInode || report.FDFlags&syscall.FD_CLOEXEC != 0 || report.AccessMode != syscall.O_RDONLY || !report.SharedFlock || !report.MetadataDenied || report.UID != int(fixtureUID) || report.GID != int(fixtureGID) {
 		t.Fatalf("inherited descriptor/authority violation: %+v", report)
 	}
@@ -411,12 +467,7 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 		t.Fatal("synthetic supervisor failed")
 	}
 	// Cleanup targets this synthetic child only, using its observed birth.
-	t.Cleanup(func() {
-		n, state, err := birth(old.Binding.PID)
-		if err == nil && n == old.Binding.BirthTicks && state != 'Z' {
-			_ = syscall.Kill(old.Binding.PID, syscall.SIGKILL)
-		}
-	})
+	t.Cleanup(func() { cleanupFixtureProcess(t, old.Binding) })
 	if err := p.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +512,7 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 		t.Fatalf("old recovery evidence overwritten: %v", err)
 	}
 	wrong := old.Binding
-	wrong.Incarnation = strings.Repeat("a", 64)
+	wrong.Incarnation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	if _, err = ReadReceipt(f.config.Authority, wrong); !errors.Is(err, ErrBinding) {
 		t.Fatal("wrong incarnation accepted")
 	}
@@ -486,12 +537,7 @@ func TestRacingSupervisors(t *testing.T) {
 	if b.Status == "started" {
 		winner = b
 	}
-	t.Cleanup(func() {
-		n, state, err := birth(winner.Binding.PID)
-		if err == nil && n == winner.Binding.BirthTicks && state != 'Z' {
-			_ = syscall.Kill(winner.Binding.PID, syscall.SIGKILL)
-		}
-	})
+	t.Cleanup(func() { cleanupFixtureProcess(t, winner.Binding) })
 	probeLock(t, f.config, true)
 	stopEngine(t, f.root)
 	if err := p.Wait(); err != nil {
@@ -759,7 +805,7 @@ func TestExactReceiptBindings(t *testing.T) {
 			case "birth":
 				b.BirthTicks++
 			case "incarnation":
-				b.Incarnation = strings.Repeat("b", 64)
+				b.Incarnation = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 			case "device":
 				b.LockDevice++
 			case "inode":
@@ -795,7 +841,7 @@ func TestExactReceiptBindings(t *testing.T) {
 // turn PID reuse, a fresh boot, or a live process into old retirement proof.
 func TestRecoveryIdentityDenials(t *testing.T) {
 	t.Log("Regression: a free lock cannot certify wrong boot or reused/live process identity")
-	for _, mode := range []string{"boot", "pid-reuse", "live-exact", "reserved"} {
+	for _, mode := range []string{"boot", "pid-reuse", "live-exact", "reserved", "legacy-incarnation", "uppercase-incarnation", "unhyphenated-incarnation", "legacy-receipt"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Log("Regression: recovery rejects " + mode)
 			f := newFixture(t)
@@ -838,6 +884,19 @@ func TestRecoveryIdentityDenials(t *testing.T) {
 					t.Fatal(e)
 				}
 				j.Current.Binding.BirthTicks = n
+			case "legacy-incarnation":
+				j.Current.Binding.Incarnation = strings.Repeat("a", 64)
+			case "uppercase-incarnation":
+				j.Current.Binding.Incarnation = "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"
+			case "unhyphenated-incarnation":
+				j.Current.Binding.Incarnation = "abcdefabcdef4abc8defabcdefabcdef"
+			case "legacy-receipt":
+				legacy := j.Current.Binding
+				legacy.Incarnation = strings.Repeat("b", 64)
+				j.Receipts = []Receipt{{legacy, LocalTeardownScope, "observed-child-exit"}}
+				j.Current.Phase = "start-failed"
+				j.Current.Binding.PID = 0
+				j.Current.Binding.BirthTicks = 0
 			case "reserved":
 				j.Current.Phase = "reserved"
 				j.Current.Binding.PID = 0
@@ -848,11 +907,19 @@ func TestRecoveryIdentityDenials(t *testing.T) {
 				t.Fatal(err)
 			}
 			a.close()
+			before, err := os.ReadFile(filepath.Join(f.config.Authority.Directory, journalName))
+			if err != nil {
+				t.Fatal(err)
+			}
 			probeLock(t, f.config, false)
 			next, startErr := Start(f.config)
 			trackLauncher(t, next)
 			if next != nil || startErr == nil {
 				t.Fatal("identity mismatch or unresolved reservation recovered")
+			}
+			after, err := os.ReadFile(filepath.Join(f.config.Authority.Directory, journalName))
+			if err != nil || string(before) != string(after) {
+				t.Fatal("denied identity was guessed, migrated or discarded")
 			}
 			if _, err := ReadReceipt(f.config.Authority, l.Binding()); err == nil {
 				t.Fatal("denial manufactured receipt")
@@ -1047,5 +1114,292 @@ func TestBoundedAbandonedStaging(t *testing.T) {
 	}
 	if _, err = ReadReceipt(f.config.Authority, l.Binding()); err != nil {
 		t.Fatal("previous exact receipt lost")
+	}
+}
+
+// Pin BEFORE reading birth. A subsequent exit or numeric PID reuse cannot
+// retarget this descriptor. There is deliberately no numeric-signal fallback.
+func pinFixtureProcess(b Binding) (int, error) {
+	fd, err := unix.PidfdOpen(b.PID, 0)
+	if err != nil {
+		return -1, err
+	}
+	n, state, err := birth(b.PID)
+	if err != nil || n != b.BirthTicks || state == 'Z' || state == 'X' {
+		_ = unix.Close(fd)
+		if os.IsNotExist(err) || state == 'Z' || state == 'X' {
+			return -1, unix.ESRCH
+		}
+		return -1, ErrBinding
+	}
+	return fd, nil
+}
+
+func cleanupFixtureProcess(t *testing.T, b Binding) {
+	t.Helper()
+	fd, err := pinFixtureProcess(b)
+	if errors.Is(err, unix.ESRCH) || errors.Is(err, ErrBinding) {
+		return // absent original or replaced numeric identity: never signal it
+	}
+	if err != nil {
+		t.Errorf("exact synthetic cleanup cannot acquire pidfd: %v", err)
+		return
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		t.Errorf("exact synthetic pidfd cleanup failed: %v", err)
+	}
+}
+
+// This uses only helpers present on e206: an old-source run compiles, reaches
+// actual R/EOF or exit, then fails behaviorally when its mutex wait overruns.
+func TestPublicationDeadlinesAfterObservation(t *testing.T) {
+	t.Log("Regression: observed readiness/exit cannot bypass caller deadlines during serialized durability")
+	for _, mode := range []string{"ready", "wait", "shutdown-with-background-wait"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newFixture(t)
+			l, err := Start(f.config)
+			trackLauncher(t, l)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := deadline(t)
+			defer cancel()
+			select {
+			case <-l.readyDone:
+			case <-ctx.Done():
+				t.Fatal("actual readiness handshake absent")
+			}
+			if mode != "ready" {
+				if err = l.AwaitReady(ctx); err != nil {
+					t.Fatal(err)
+				}
+				stopEngine(t, f.root)
+				select {
+				case <-l.done:
+				case <-ctx.Done():
+					t.Fatal("actual child exit absent")
+				}
+			}
+			l.mu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					l.mu.Unlock()
+				}
+			}()
+			baselineWorkers := runtime.NumGoroutine()
+			background := make(chan error, 1)
+			if mode == "shutdown-with-background-wait" {
+				go func() { _, e := l.Wait(context.Background()); background <- e }()
+			}
+			// Many retries must time out without creating publication workers,
+			// losing the inherited lock, or falsely returning a durable fact.
+			for retry := 0; retry < 8; retry++ {
+				short, stop := context.WithTimeout(context.Background(), 25*time.Millisecond)
+				result := make(chan error, 1)
+				go func() {
+					switch mode {
+					case "ready":
+						result <- l.AwaitReady(short)
+					case "wait":
+						_, e := l.Wait(short)
+						result <- e
+					default:
+						_, e := l.Shutdown(short)
+						result <- e
+					}
+				}()
+				select {
+				case e := <-result:
+					stop()
+					want := ErrPending
+					if mode == "ready" {
+						want = ErrNotReady
+					}
+					if !errors.Is(e, want) {
+						t.Fatalf("deadline returned %v, want %v", e, want)
+					}
+				case <-time.After(time.Second):
+					stop()
+					l.mu.Unlock()
+					locked = false
+					<-result // release the old implementation before reporting red
+					t.Fatal("observed lifecycle blocked beyond deadline until mutex release")
+				}
+			}
+			if runtime.NumGoroutine() > baselineWorkers+3 {
+				t.Fatal("deadline retries accumulated blocked publication workers")
+			}
+			probeLock(t, f.config, true)
+			l.mu.Unlock()
+			locked = false
+			switch mode {
+			case "ready":
+				if err = l.AwaitReady(ctx); err != nil {
+					t.Fatal("late durable readiness unavailable", err)
+				}
+				stopEngine(t, f.root)
+			case "shutdown-with-background-wait":
+				select {
+				case err = <-background:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal("original publication did not finish")
+				}
+			}
+			r, err := l.Wait(ctx)
+			if err != nil || r.Binding != l.Binding() || r.Scope != LocalTeardownScope {
+				t.Fatal("late exact durable receipt unavailable", err)
+			}
+			read, err := ReadReceipt(f.config.Authority, l.Binding())
+			if err != nil || read != r {
+				t.Fatal("cancellation lost exact durable readback", err)
+			}
+		})
+	}
+}
+
+func TestRootDirectoryAuthority(t *testing.T) {
+	t.Log("Regression: both walkers validate the opened filesystem root before traversing")
+	f := newFixture(t)
+	for _, mode := range []string{"unsafe", "safe"} {
+		t.Run(mode, func(t *testing.T) {
+			perm := os.FileMode(0777)
+			if mode == "safe" {
+				perm = 0755
+			}
+			// Only this test's own disposable directory is chmod'ed. Host / is
+			// never modified; the child sees the directory as / through chroot.
+			if err := os.Chmod(f.root, perm); err != nil {
+				t.Fatal(err)
+			}
+			p := exec.Command(f.config.EnginePath, "-test.run=^TestSyntheticProcess$", "--", "root-check", f.root, mode)
+			p.Env = []string{}
+			if err := p.Run(); err != nil {
+				var exit *exec.ExitError
+				if errors.As(err, &exit) && exit.ExitCode() == 78 {
+					t.Skip("NOT_RUN: owned chroot capability unavailable")
+				}
+				t.Fatalf("actual chroot root %04o rejected expected walker outcome: %v", perm, err)
+			}
+		})
+	}
+}
+
+func TestPinnedOrphanCleanupPIDReuse(t *testing.T) {
+	t.Log("Regression: exited orphan's pinned pidfd cannot signal an actual same-PID replacement")
+	f := newFixture(t)
+	p := exec.Command(f.config.EnginePath, "-test.run=^TestSyntheticProcess$", "--", "pid-reuse", f.root, "controlled")
+	p.Env = []string{}
+	p.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS}
+	output, err := p.CombinedOutput()
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		t.Skip("NOT_RUN: controlled private PID/mount namespace unavailable")
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 78 {
+		t.Skip("NOT_RUN: namespace-local proc/pidfd/PID reuse authority unavailable")
+	}
+	if err != nil {
+		t.Fatalf("actual controlled PID reuse fixture failed: %v\n%s", err, output)
+	}
+}
+
+func qualifyFixturePIDReuse(t *testing.T, root string) {
+	t.Helper()
+	// Every numeric PID below belongs to this NEW namespace, never the host.
+	// A private proc mount also makes birth reads and ns_last_pid local.
+	if os.Getpid() != 1 {
+		t.Fatal("PID-reuse fixture is not its own namespace init")
+	}
+	if unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, "") != nil || unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "") != nil {
+		os.Exit(78)
+	}
+	f := fixture{root: root, config: fixtureConfig(root, "hold")}
+	p := runSupervisor(t, f, "hold", "pin-supervisor.json")
+	old := exactBinding(t, filepath.Join(root, "pin-supervisor.json"))
+	if old.Status != "started" {
+		t.Fatal("owned supervisor did not start")
+	}
+	fd, err := pinFixtureProcess(old.Binding)
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) {
+		os.Exit(78)
+	}
+	if err != nil {
+		t.Fatal("cannot pin original owned child", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err = p.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Wait()
+	// This is an actual orphan; as namespace init we adopt and reap it.
+	stopEngine(t, root)
+	var status unix.WaitStatus
+	if reaped, e := unix.Wait4(old.Binding.PID, &status, 0, nil); e != nil || reaped != old.Binding.PID {
+		t.Fatal("original orphan was not reaped", e)
+	}
+	time.Sleep(30 * time.Millisecond) // force a distinct kernel birth tick
+	// Reexec the copied fixture image actually running this controller.
+	image, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacement *exec.Cmd
+	for attempt := 0; attempt < 32; attempt++ {
+		if err = os.Remove(filepath.Join(root, "exchange", "witness.json")); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile("/proc/sys/kernel/ns_last_pid", []byte(strconv.Itoa(old.Binding.PID-1)), 0600); err != nil {
+			os.Exit(78)
+		}
+		// G702: reexec our own copied test ELF inside the private PID namespace;
+		// root is owned fixture data passed as argv, with no shell/interpreter.
+		q := exec.Command(image, "-test.run=^TestSyntheticProcess$", "--", "witness", root, "hold") //nolint:gosec
+		q.Env = []string{}
+		q.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: fixtureUID, Gid: fixtureGID, Groups: []uint32{}}}
+		if err = q.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if q.Process.Pid == old.Binding.PID {
+			replacement = q
+			break
+		}
+		_ = q.Process.Kill() // exact owned exec handle, no numeric fallback
+		_ = q.Wait()
+	}
+	if replacement == nil {
+		t.Fatal("controlled fixture did not actually reuse the original PID")
+	}
+	defer func() { _ = replacement.Process.Kill(); _ = replacement.Wait() }()
+	var witness map[string]int
+	if err = json.Unmarshal(waitFile(t, filepath.Join(root, "exchange", "witness.json")), &witness); err != nil || witness["pid"] != old.Binding.PID {
+		t.Fatal("replacement did not acknowledge its actual reused PID", err)
+	}
+	newBirth, state, err := birth(old.Binding.PID)
+	if err != nil || newBirth == old.Binding.BirthTicks || state == 'Z' || state == 'X' {
+		t.Fatal("replacement is not a distinct live kernel process", err)
+	}
+	if err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); !errors.Is(err, unix.ESRCH) {
+		t.Fatal("old pinned signal did not report original task gone", err)
+	}
+	if n, state, e := birth(old.Binding.PID); e != nil || n != newBirth || state == 'Z' || state == 'X' {
+		t.Fatal("same-PID replacement was affected by orphan cleanup", e)
+	}
+	retarget, err := pinFixtureProcess(old.Binding)
+	if retarget >= 0 {
+		_ = unix.Close(retarget)
+	}
+	if !errors.Is(err, ErrBinding) {
+		t.Fatal("cleanup accepted replacement's different birth", err)
+	}
+	if err = os.WriteFile(filepath.Join(root, "exchange", "stop-witness"), []byte("stop"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err = replacement.Wait(); err != nil {
+		t.Fatal("replacement did not survive to its own normal exit", err)
 	}
 }

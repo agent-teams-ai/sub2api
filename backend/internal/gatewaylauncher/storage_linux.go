@@ -4,8 +4,6 @@ package gatewaylauncher
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/google/uuid"
 )
 
 const lockName = "origin.lock"
@@ -72,11 +72,18 @@ type authority struct {
 }
 
 func randomID() (string, error) {
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	id, err := uuid.NewRandom()
+	if err != nil {
 		return "", ErrStorage
 	}
-	return hex.EncodeToString(b[:]), nil
+	return id.String(), nil
+}
+
+// UUID parsing alone also accepts noncanonical spellings. Persist and compare
+// the exact lowercase hyphenated identity used by the kernel, never a mapper.
+func canonicalUUID(s string) bool {
+	id, err := uuid.Parse(s)
+	return err == nil && id.String() == s
 }
 
 func statFD(f *os.File) (syscall.Stat_t, error) {
@@ -100,6 +107,11 @@ func openAuthority(path string) (*authority, error) {
 		return nil, ErrUnsafe
 	}
 	d := os.NewFile(uintptr(fd), "protected-directory")
+	s, err := statFD(d)
+	if err != nil || s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFDIR || s.Mode&0022 != 0 {
+		_ = d.Close()
+		return nil, ErrUnsafe
+	}
 	prefix := ""
 	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
 		prefix += "/" + part
@@ -308,7 +320,7 @@ func (a *authority) write(j journal) error {
 func bootID() (string, error) {
 	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	s := strings.TrimSpace(string(b))
-	if err != nil || len(s) != 36 {
+	if err != nil || !canonicalUUID(s) {
 		return "", ErrEvidence
 	}
 	return s, nil
@@ -336,19 +348,12 @@ func birth(pid int) (uint64, byte, error) {
 }
 
 func fullBinding(b Binding) bool {
-	if b.PID <= 0 || b.BirthTicks == 0 || b.LockInode == 0 || len(b.BootID) != 36 || len(b.Incarnation) != 64 || b.OriginRef == "" {
-		return false
-	}
-	_, err := hex.DecodeString(b.Incarnation)
-	return err == nil
+	return b.PID > 0 && b.BirthTicks > 0 && b.LockInode > 0 && canonicalUUID(b.BootID) && canonicalUUID(b.Incarnation) && b.OriginRef != ""
 }
 
 func (a *authority) validate(j journal, origin, boot string) error {
 	base := j.Current.Binding
-	if base.OriginRef != origin || base.BootID != boot || base.LockDevice != a.device || base.LockInode != a.inode || len(base.Incarnation) != 64 {
-		return ErrBinding
-	}
-	if _, err := hex.DecodeString(base.Incarnation); err != nil {
+	if base.OriginRef != origin || base.BootID != boot || !canonicalUUID(base.BootID) || base.LockDevice != a.device || base.LockInode != a.inode || !canonicalUUID(base.Incarnation) {
 		return ErrBinding
 	}
 	seen := map[string]bool{}

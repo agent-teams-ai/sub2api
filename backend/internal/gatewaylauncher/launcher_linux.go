@@ -53,6 +53,18 @@ type Launcher struct {
 	readyObserved bool
 	readyDurable  bool
 	receipt       *Receipt
+	publications  chan publication
+	retired       chan struct{}
+}
+
+type publication struct {
+	ready  bool
+	result chan publicationResult
+}
+
+type publicationResult struct {
+	receipt Receipt
+	err     error
 }
 
 func validAuthority(c AuthorityConfig) bool {
@@ -72,6 +84,11 @@ func checkEngine(path string) error {
 		return ErrUnsafe
 	}
 	d := os.NewFile(uintptr(fd), "engine-parent")
+	s, err := statFD(d)
+	if err != nil || s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFDIR || s.Mode&0022 != 0 {
+		_ = d.Close()
+		return ErrUnsafe
+	}
 	for _, part := range strings.Split(strings.TrimPrefix(parent, "/"), "/") {
 		if part == "" {
 			continue
@@ -95,7 +112,7 @@ func checkEngine(path string) error {
 	}
 	f := os.NewFile(uintptr(n), "engine-image")
 	defer func() { _ = f.Close() }()
-	s, err := statFD(f)
+	s, err = statFD(f)
 	if err != nil || s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFREG || s.Mode&0022 != 0 || s.Mode&0111 == 0 || s.Mode&06000 != 0 || s.Nlink != 1 {
 		return ErrUnsafe
 	}
@@ -224,7 +241,8 @@ func Start(config Config) (*Launcher, error) {
 		"GATEWAY_LAUNCHER_LOCK_FD=3",
 		"GATEWAY_LAUNCHER_READY_FD=4",
 		"GATEWAY_LAUNCHER_GATE_FD=5",
-		"GATEWAY_LAUNCHER_ORIGIN_REF="+c.Authority.OriginRef)
+		"GATEWAY_LAUNCHER_ORIGIN_REF="+c.Authority.OriginRef,
+		"GATEWAY_LAUNCHER_ENGINE_INCARNATION="+b.Incarnation)
 	cmd.Dir = "/"
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: c.EngineUID, Gid: c.EngineGID, Groups: []uint32{}}}
 	// ExtraFiles duplicates the SAME open lock description and clears CLOEXEC
@@ -243,7 +261,7 @@ func Start(config Config) (*Launcher, error) {
 		return nil, ErrStart
 	}
 	keep = true
-	l := &Launcher{a: a, binding: b, cmd: cmd, done: make(chan struct{}), readyDone: make(chan struct{}), readyRead: readyR}
+	l := &Launcher{a: a, binding: b, cmd: cmd, done: make(chan struct{}), readyDone: make(chan struct{}), readyRead: readyR, publications: make(chan publication), retired: make(chan struct{})}
 	b.PID = cmd.Process.Pid
 	b.BirthTicks, _, err = birth(b.PID)
 	l.binding = b
@@ -260,6 +278,9 @@ func Start(config Config) (*Launcher, error) {
 		l.mu.Unlock()
 		close(l.readyDone)
 	}()
+	// One lifetime worker owns all post-start durability. Callers can abandon
+	// their wait, but never its authority handle or in-flight publication.
+	go l.publish()
 	defer func() { _ = gateW.Close() }()
 	if err != nil || !fullBinding(b) {
 		return l, ErrEvidence
@@ -288,8 +309,69 @@ func (l *Launcher) AwaitReady(ctx context.Context) error {
 		return ErrNotReady
 	case <-l.readyDone:
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	return l.publication(ctx, true).err
+}
+
+// Unbuffered admission leaves at most one publication outstanding. Retries
+// wait on the same worker without spawning workers or queuing durable work.
+func (l *Launcher) publication(ctx context.Context, ready bool) publicationResult {
+	pending := ErrPending
+	var exited <-chan struct{}
+	if ready {
+		pending = ErrNotReady
+		exited = l.done
+	}
+	if ctx.Err() != nil {
+		return publicationResult{err: pending}
+	}
+	p := publication{ready: ready, result: make(chan publicationResult, 1)}
+	select {
+	case <-ctx.Done():
+		return publicationResult{err: pending}
+	case <-exited:
+		return publicationResult{err: pending}
+	case <-l.retired:
+		if ready {
+			return publicationResult{err: ErrNotReady}
+		}
+		return publicationResult{receipt: *l.receipt}
+	case l.publications <- p:
+	}
+	select {
+	case <-ctx.Done():
+		return publicationResult{err: pending}
+	case <-exited:
+		return publicationResult{err: pending}
+	case result := <-p.result:
+		if ctx.Err() != nil {
+			return publicationResult{err: pending}
+		}
+		return result
+	}
+}
+
+func (l *Launcher) publish() {
+	for p := range l.publications {
+		l.mu.Lock()
+		var result publicationResult
+		if p.ready {
+			result.err = l.publishReady()
+		} else {
+			result.receipt, result.err = l.publishRetirement()
+		}
+		finished := l.receipt != nil
+		l.mu.Unlock()
+		// A detached caller cannot block this worker; durable state is retained
+		// on the launcher and subsequent callers can read the exact same fact.
+		p.result <- result
+		if finished {
+			close(l.retired)
+			return
+		}
+	}
+}
+
+func (l *Launcher) publishReady() error {
 	select {
 	case <-l.done:
 		return ErrNotReady
@@ -338,8 +420,11 @@ func (l *Launcher) Wait(ctx context.Context) (Receipt, error) {
 		return Receipt{}, ErrPending
 	case <-l.done:
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	r := l.publication(ctx, false)
+	return r.receipt, r.err
+}
+
+func (l *Launcher) publishRetirement() (Receipt, error) {
 	if l.receipt != nil {
 		return *l.receipt, nil
 	}
