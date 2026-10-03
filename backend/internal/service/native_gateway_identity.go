@@ -88,6 +88,8 @@ func (s *OpenAIGatewayService) EraseGatewayCandidate(ctx context.Context, route 
 type gatewayNativeDispatch struct {
 	route   GatewayNativeRoute
 	account *Account
+	scope   GatewayNativeCredentialScope
+	custody *GatewayNativeCredentialCustody
 	entered atomic.Bool
 }
 
@@ -97,7 +99,8 @@ func HasGatewayNativeIdentity(a *Account) bool {
 	}
 	_, generation := a.Extra[GatewayGenerationExtraKey]
 	_, profile := a.Extra[GatewayProfileExtraKey]
-	return generation || profile
+	_, custody := a.Extra[GatewayCredentialScopeExtraKey]
+	return generation || profile || custody
 }
 
 func validateGatewayNativeShape(a *Account) error {
@@ -126,15 +129,23 @@ func validateGatewayNativeShape(a *Account) error {
 	if model, ok := a.Extra[GatewayModelExtraKey].(string); !ok || strings.TrimSpace(model) == "" {
 		return ErrGatewayNativeIdentity
 	}
-	if len(a.Credentials) != 2 || strings.TrimSpace(a.GetCredential("api_key")) == "" ||
-		a.GetCredential("api_key") != strings.TrimSpace(a.GetCredential("api_key")) || a.GetCredential("base_url") == "" {
+	envelope, envelopeOK := a.Credentials["api_key"].(string)
+	baseURL, baseURLOK := a.Credentials["base_url"].(string)
+	if len(a.Credentials) != 2 || !envelopeOK || !baseURLOK || envelope == "" ||
+		envelope != strings.TrimSpace(envelope) || baseURL == "" {
+		return ErrGatewayNativeIdentity
+	}
+	if _, _, _, err := gatewayNativeParseEnvelope(envelope); err != nil {
+		return ErrGatewayNativeIdentity
+	}
+	if _, err := GatewayNativeCredentialScopeForAccount(a); err != nil {
 		return ErrGatewayNativeIdentity
 	}
 	// Extra is an allowlist, so no WS, pool, header override, probe, quota reset,
 	// provider endpoint/protocol or model remapping knob can alter this profile.
 	for key := range a.Extra {
 		switch key {
-		case GatewayGenerationExtraKey, GatewayProfileExtraKey, GatewayModelExtraKey,
+		case GatewayGenerationExtraKey, GatewayProfileExtraKey, GatewayModelExtraKey, GatewayCredentialScopeExtraKey,
 			"openai_responses_mode", "openai_passthrough", "native_api_key_cancel_on_disconnect", "openai_preserve_compatible_reasoning":
 		default:
 			return ErrGatewayNativeIdentity
@@ -171,8 +182,20 @@ func GatewayNativeDescriptor(a *Account) (GatewayNativeRoute, error) {
 // This is an exact candidate query, never name/latest/ID-only recovery. Zero,
 // multiple, malformed or deleted candidates are quarantined by the facade.
 func (s *OpenAIGatewayService) ResolveGatewayCandidate(ctx context.Context, generation string) (*Account, error) {
+	a, err := s.ResolveGatewayCandidateMetadata(ctx, generation)
+	if err != nil || gatewayNativeCustody(ctx).ValidateEnvelope(a.GetCredential("api_key")) != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	return a, nil
+}
+
+// Safe control metadata remains available after key retirement so the owner can
+// disable and erase an exact candidate. This does not qualify activation or entry.
+func (s *OpenAIGatewayService) ResolveGatewayCandidateMetadata(ctx context.Context, generation string) (*Account, error) {
+	consumer, consumerErr := GatewayNativeConsumer(ctx)
+	custody := gatewayNativeCustody(ctx)
 	id, err := uuid.Parse(generation)
-	if err != nil || id == uuid.Nil || id.String() != generation || s.accountRepo == nil {
+	if consumerErr != nil || custody == nil || err != nil || id == uuid.Nil || id.String() != generation || s.accountRepo == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
 	accounts, err := s.accountRepo.FindByExtraField(ctx, GatewayGenerationExtraKey, generation)
@@ -183,7 +206,34 @@ func (s *OpenAIGatewayService) ResolveGatewayCandidate(ctx context.Context, gene
 	if _, err := GatewayNativeDescriptor(a); err != nil {
 		return nil, err
 	}
-	return a, nil
+	scope, err := GatewayNativeCredentialScopeForAccount(a)
+	_, _, _, envelopeErr := gatewayNativeParseEnvelope(a.GetCredential("api_key"))
+	if err != nil || scope.Consumer != consumer || envelopeErr != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	return snapshotGatewayNativeAccount(a), nil
+}
+
+// Snapshot accepted primitives before the next repository/transport wait. No
+// decrypted Account clone exists: both original and fresh comparisons remain
+// encrypted throughout Authorization construction and provider entry.
+func snapshotGatewayNativeAccount(a *Account) *Account {
+	snapshot := *a
+	snapshot.Credentials = make(map[string]any, len(a.Credentials))
+	for key, value := range a.Credentials {
+		snapshot.Credentials[key] = value
+	}
+	snapshot.Extra = make(map[string]any, len(a.Extra))
+	for key, value := range a.Extra {
+		snapshot.Extra[key] = value
+	}
+	scope, _ := GatewayNativeCredentialScopeForAccount(a)
+	snapshot.Extra[GatewayCredentialScopeExtraKey] = scope.Metadata()
+	if a.ExpiresAt != nil {
+		expires := *a.ExpiresAt
+		snapshot.ExpiresAt = &expires
+	}
+	return &snapshot
 }
 
 func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.Context, route GatewayNativeRoute, body []byte) (*OpenAIForwardResult, bool, error) {
@@ -197,11 +247,21 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	if _, ok := s.accountRepo.(GatewayNativeAccountLocker); !ok {
 		return nil, false, ErrGatewayNativeIdentity
 	}
+	consumer, err := GatewayNativeConsumer(ctx)
+	custody := gatewayNativeCustody(ctx)
+	if err != nil || custody == nil {
+		return nil, false, ErrGatewayNativeIdentity
+	}
 	a, err := s.accountRepo.GetByID(ctx, route.AccountID)
 	if err != nil || validateGatewayNativeRoute(route, a) != nil {
 		return nil, false, ErrGatewayNativeIdentity
 	}
-	state := &gatewayNativeDispatch{route: route, account: a}
+	scope, scopeErr := GatewayNativeCredentialScopeForAccount(a)
+	if scopeErr != nil || scope.Consumer != consumer || custody.ValidateEnvelope(a.GetCredential("api_key")) != nil {
+		return nil, false, ErrGatewayNativeIdentity
+	}
+	a = snapshotGatewayNativeAccount(a)
+	state := &gatewayNativeDispatch{route: route, account: a, scope: scope, custody: custody}
 	ctx = WithHTTPUpstreamRedirectsDisabled(context.WithValue(ctx, gatewayNativeContextKey{}, state))
 	// Restrict this private seam to a Responses request; never pass public route
 	// path suffixes or authentication and affinity headers into upstream routing.
@@ -261,10 +321,26 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		release()
 		return noop, ErrGatewayNativeIdentity
 	}
+	scope, err := GatewayNativeCredentialScopeForAccount(fresh)
+	consumer, consumerErr := GatewayNativeConsumer(request.Context())
+	if err != nil || consumerErr != nil || scope != state.scope || scope.Consumer != consumer || state.custody == nil {
+		release()
+		return noop, ErrGatewayNativeIdentity
+	}
+	// The ONLY decode boundary. The row stays encrypted, and no plaintext enters
+	// Account credentials, cache/history, readback or errors. Authentication fails
+	// before the entered CAS, so malformed/tampered/unavailable-key rows make zero
+	// upstream entries. Caller Authorization is replaced, never forwarded.
+	authorization, err := state.custody.authorization(fresh.GetCredential("api_key"), scope)
+	if err != nil {
+		release()
+		return noop, ErrGatewayNativeIdentity
+	}
 	if !state.entered.CompareAndSwap(false, true) {
 		release()
 		return noop, ErrGatewayNativeReplay
 	}
+	request.Header.Set("Authorization", authorization)
 	request.GetBody = nil
 	request.Header.Del("Idempotency-Key")
 	request.Header.Del("X-Idempotency-Key")

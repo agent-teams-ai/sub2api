@@ -52,6 +52,7 @@ func TestGatewayNativeResponses_PhysicalAccountAndTools(t *testing.T) {
 	a := &Account{ID: 17, CreatedAt: time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC), Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
 		Credentials: map[string]any{"api_key": "fixture-key", "base_url": upstream.URL},
 		Extra:       map[string]any{GatewayGenerationExtraKey: "33333333-3333-4333-8333-333333333333", GatewayProfileExtraKey: GatewayMiMoResponsesProfile, GatewayModelExtraKey: "mimo-test", "openai_responses_mode": "force_responses", "openai_passthrough": true, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+	nativeFixtureSealAccount(t, a)
 	route, err := GatewayNativeDescriptor(a)
 	require.NoError(t, err)
 	repo := &gatewayIdentityRepoFixture{row: a}
@@ -61,7 +62,7 @@ func TestGatewayNativeResponses_PhysicalAccountAndTools(t *testing.T) {
 		c, _ := gin.CreateTestContext(recorder)
 		c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(payload))
 		c.Request.Header.Set("X-Codex-Turn-State", "foreign")
-		_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, r, payload)
+		_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, r, payload)
 		return recorder, entered, err
 	}
 	t.Run("deleted integer reused for a different physical generation", func(t *testing.T) {

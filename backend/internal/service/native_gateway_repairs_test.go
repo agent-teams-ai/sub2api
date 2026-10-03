@@ -63,7 +63,7 @@ func nativeRepairForward(t *testing.T, profile, request, response string, stream
 		_, _ = io.WriteString(w, response)
 	}))
 	defer upstream.Close()
-	a := nativeReviewStreamAccount(upstream.URL, profile)
+	a := nativeReviewStreamAccount(t, upstream.URL, profile)
 	if profile == "" {
 		a = &Account{ID: 23, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: a.Credentials}
 	}
@@ -81,7 +81,7 @@ func nativeRepairForward(t *testing.T, profile, request, response string, stream
 	} else {
 		route, err := GatewayNativeDescriptor(a)
 		require.NoError(t, err)
-		got.result, got.entered, got.err = svc.ForwardGatewayRoute(context.Background(), c, route, []byte(request))
+		got.result, got.entered, got.err = svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, []byte(request))
 	}
 	got.body, got.entries, got.requests, got.outbound = rec.Body.String(), transport.entries.Load(), requests.Load(), outbound
 	return got

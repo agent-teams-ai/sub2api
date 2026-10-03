@@ -103,7 +103,7 @@ func TestGatewayNativeEF36LegacyRedirect(t *testing.T) {
 			client := upstream.Client()
 			// The real repository's private transport returns redirects unchanged.
 			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-			a := nativeReviewStreamAccount(upstream.URL, GatewayLegacyBridgeProfile)
+			a := nativeReviewStreamAccount(t, upstream.URL, GatewayLegacyBridgeProfile)
 			transport := &gatewayBoundaryReviewHTTP{gatewayIdentityRealHTTP: gatewayIdentityRealHTTP{client: client}}
 			svc := &OpenAIGatewayService{cache: nativeRepairPrivateCache{}, accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
 			rec := httptest.NewRecorder()
@@ -115,7 +115,7 @@ func TestGatewayNativeEF36LegacyRedirect(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewBufferString(request))
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
-			_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, route, []byte(request))
+			_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, []byte(request))
 			require.True(t, entered)
 			require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
 			require.EqualValues(t, 1, requests.Load())
