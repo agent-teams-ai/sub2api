@@ -1873,11 +1873,25 @@ func (s *stubAccountRepo) CreateWithAccountGroups(ctx context.Context, account *
 }
 
 func (s *stubAccountRepo) GetByID(ctx context.Context, id int64) (*service.Account, error) {
+	if id == 101 || id == 102 {
+		return &service.Account{ID: id, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive}, nil
+	}
 	return nil, service.ErrAccountNotFound
 }
 
 func (s *stubAccountRepo) GetByIDs(ctx context.Context, ids []int64) ([]*service.Account, error) {
-	return nil, errors.New("not implemented")
+	accounts := make([]*service.Account, 0, len(ids))
+	for _, id := range ids {
+		account, err := s.GetByID(ctx, id)
+		if errors.Is(err, service.ErrAccountNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
 }
 
 func (s *stubAccountRepo) ExistsByID(ctx context.Context, id int64) (bool, error) {

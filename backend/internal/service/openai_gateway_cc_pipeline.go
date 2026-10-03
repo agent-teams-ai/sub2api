@@ -16,7 +16,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -305,33 +304,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 			st.SawDone = true
 			break
 		}
-		if strict {
-			value := gjson.Parse(payload)
-			choices := value.Get("choices")
-			if !gjson.Valid(payload) || !value.IsObject() || value.Get("error").Exists() || !choices.IsArray() {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
-			}
-			if len(choices.Array()) == 0 && !value.Get("usage").IsObject() {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
-			}
-			for _, choice := range choices.Array() {
-				if len(choices.Array()) != 1 || choice.Get("index").Int() != 0 {
-					st.Err = ErrGatewayNativeEffectUnknown
-					return st
-				}
-				finish := choice.Get("finish_reason")
-				if finish.Exists() && finish.Type != gjson.Null && finish.String() != "" {
-					// Only complete text/tool turns qualify. length/filter are incomplete.
-					if finish.Type != gjson.String || (finish.String() != "stop" && finish.String() != "tool_calls") {
-						st.Err = ErrGatewayNativeEffectUnknown
-						return st
-					}
-					st.SawFinish = true
-				}
-			}
-		}
+
 		// 观察上游 CC chunk 回显的 model / service_tier（计费以回显为准）。
 		// CC chunk 无 type 字段，按 untyped payload 观察（上游约束：只有终止
 		// 事件与无类型 body 报告实际处理档位）。
@@ -354,6 +327,16 @@ func (s *OpenAIGatewayService) scanCCStream(
 				zap.String("request_id", requestID),
 			)
 			continue
+		}
+		if strict {
+			if !gatewayNativeLegacyChunk([]byte(payload), &chunk) || (st.SawFinish && len(chunk.Choices) > 0) {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
+			if len(chunk.Choices) == 1 {
+				finish := chunk.Choices[0].FinishReason
+				st.SawFinish = finish != nil && (*finish == "stop" || *finish == "tool_calls")
+			}
 		}
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
@@ -406,6 +389,9 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 	if err := json.Unmarshal(respBody, &ccResp); err != nil {
 		writeError(c, http.StatusBadGateway, "api_error", "Failed to parse upstream response")
 		return nil, OpenAIUsage{}, fmt.Errorf("parse chat completions response: %w", err)
+	}
+	if gatewayNativeReasoningScope(c) != "" && !gatewayNativeLegacyBuffered(respBody, &ccResp) {
+		return nil, OpenAIUsage{}, ErrGatewayNativeEffectUnknown
 	}
 	// 观察上游 CC JSON 回显的 model / service_tier（计费以回显为准）。
 	// CC JSON 无 type 字段，按 untyped payload 观察（上游约束）。

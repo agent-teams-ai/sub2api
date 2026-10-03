@@ -159,8 +159,13 @@ func GatewayNativeDescriptor(a *Account) (GatewayNativeRoute, error) {
 	if validateGatewayNativeShape(a) != nil || a.ID <= 0 || a.CreatedAt.IsZero() {
 		return GatewayNativeRoute{}, ErrGatewayNativeIdentity
 	}
-	return GatewayNativeRoute{a.ID, a.Extra[GatewayGenerationExtraKey].(string), a.CreatedAt,
-		a.Extra[GatewayProfileExtraKey].(string), a.GetCredential("base_url"), a.Extra[GatewayModelExtraKey].(string)}, nil
+	generation, generationOK := a.Extra[GatewayGenerationExtraKey].(string)
+	profile, profileOK := a.Extra[GatewayProfileExtraKey].(string)
+	model, modelOK := a.Extra[GatewayModelExtraKey].(string)
+	if !generationOK || !profileOK || !modelOK {
+		return GatewayNativeRoute{}, ErrGatewayNativeIdentity
+	}
+	return GatewayNativeRoute{a.ID, generation, a.CreatedAt, profile, a.GetCredential("base_url"), model}, nil
 }
 
 // This is an exact candidate query, never name/latest/ID-only recovery. Zero,
@@ -296,12 +301,15 @@ func gatewayNativeUnambiguousPolicyFields(body []byte) bool {
 		if !ok {
 			return false
 		}
-		switch key {
-		case "model", "store", "previous_response_id", "service_tier":
-			if seen[key] {
-				return false
+		for _, canonical := range []string{"model", "store", "previous_response_id", "service_tier"} {
+			// encoding/json matches struct fields with EqualFold, including
+			// Unicode aliases. Only canonical decoded names are safe here.
+			if strings.EqualFold(key, canonical) {
+				if key != canonical || seen[canonical] {
+					return false
+				}
+				seen[canonical] = true
 			}
-			seen[key] = true
 		}
 		var value json.RawMessage
 		if decoder.Decode(&value) != nil {

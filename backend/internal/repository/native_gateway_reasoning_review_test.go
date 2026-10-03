@@ -16,7 +16,7 @@ import (
 func TestGatewayNativeReviewReasoningDomains(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	defer client.Close()
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	nativeReviewReasoningDomains(t, NewGatewayCache(client))
 }
 

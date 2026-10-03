@@ -108,13 +108,15 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	// filter that removes the field therefore leaves this nil.
 	serviceTier := extractOpenAIServiceTierFromBody(chatBody)
 
-	logger.L().Debug("openai responses: forwarding via raw chat completions",
-		zap.Int64("account_id", account.ID),
-		zap.String("original_model", originalModel),
-		zap.String("billing_model", billingModel),
-		zap.String("upstream_model", upstreamModel),
-		zap.Bool("stream", clientStream),
-	)
+	if !HasGatewayNativeIdentity(account) {
+		logger.L().Debug("openai responses: forwarding via raw chat completions",
+			zap.Int64("account_id", account.ID),
+			zap.String("original_model", originalModel),
+			zap.String("billing_model", billingModel),
+			zap.String("upstream_model", upstreamModel),
+			zap.Bool("stream", clientStream),
+		)
+	}
 	SetOpsUpstreamModel(c, upstreamModel)
 
 	// Build and send upstream request via the shared CC pipeline
@@ -171,7 +173,22 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	}
-	c.JSON(http.StatusOK, responsesResp)
+	if gatewayNativeReasoningScope(c) != "" {
+		payload, err := json.Marshal(responsesResp)
+		if err != nil {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+		c.Header("Content-Type", "application/json")
+		c.Status(http.StatusOK)
+		if n, err := c.Writer.Write(payload); err != nil || n != len(payload) {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+		if gatewayNativeFlush(c.Writer) != nil {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+	} else {
+		c.JSON(http.StatusOK, responsesResp)
+	}
 
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
@@ -259,6 +276,10 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
+		if strictTerminal && !gatewayNativeLegacyToolDelta(chunk, state) {
+			deliveryFailed()
+			return
+		}
 		events := apicompat.ChatCompletionsChunkToResponsesEvents(chunk, state)
 		s.cacheReasoningItemsFromEvents(events, gatewayNativeReasoningScope(c))
 		writeEvents(events)
@@ -300,6 +321,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		}, fmt.Errorf("invalid tool call arguments from upstream: %w", err)
 	}
 
+	if strictTerminal && !gatewayNativeLegacyFinal(state) {
+		return nil, ErrGatewayNativeEffectUnknown
+	}
 	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
 	s.cacheReasoningItemsFromEvents(finalEvents, gatewayNativeReasoningScope(c))
 	writeEvents(finalEvents)
@@ -463,7 +487,7 @@ func (s *OpenAIGatewayService) setReasoningContent(itemID, content string, scope
 	} else {
 		err = s.cache.SetReasoningContent(ctx, itemID, content, responsesReasoningCacheTTL)
 	}
-	if err != nil {
+	if err != nil && (len(scope) == 0 || scope[0] == "") {
 		logger.L().Warn("openai responses chat fallback: cache reasoning content failed",
 			zap.Error(err),
 			zap.String("item_id", itemID),

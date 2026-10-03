@@ -52,7 +52,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	start := time.Now()
 	resp, err := s.doOpenAIUpstream(request, "", a)
 	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 	}
 	if err != nil {
 		if err == ErrGatewayNativeIdentity || err == ErrGatewayNativeReplay {
@@ -74,7 +74,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		}
 		result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(output, "usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(output, "usage.output_tokens").Int())}
 		c.Header("Content-Type", "application/json")
-		if _, err := c.Writer.Write(output); err != nil {
+		if n, err := c.Writer.Write(output); err != nil || n != len(output) {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+		if gatewayNativeFlush(c.Writer) != nil {
 			return nil, ErrGatewayNativeEffectUnknown
 		}
 		result.Duration = time.Since(start)
@@ -100,7 +103,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if total > gatewayNativeResponseLimit || event.Len()+len(raw) > gatewayNativeSSEFrameLimit {
 			return nil, ErrGatewayNativeEffectUnknown
 		}
-		event.Write(raw)
+		_, _ = event.Write(raw) // bytes.Buffer.Write cannot fail.
 		line := bytes.TrimSuffix(bytes.TrimSuffix(raw, []byte{'\n'}), []byte{'\r'})
 		if len(line) > 0 {
 			if bytes.HasPrefix(line, []byte("data:")) {

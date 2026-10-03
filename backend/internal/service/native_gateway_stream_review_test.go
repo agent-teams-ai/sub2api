@@ -195,9 +195,21 @@ func TestGatewayNativeReviewCompletionClosesLiveBody(t *testing.T) {
 				calls.Add(1)
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = io.WriteString(w, nativeReviewCompleted)
-				w.(http.Flusher).Flush()
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					t.Error("local HTTP peer has no flusher")
+					close(closed)
+					return
+				}
+				flusher.Flush()
 				if reset {
-					conn, _, err := w.(http.Hijacker).Hijack()
+					hijacker, ok := w.(http.Hijacker)
+					if !ok {
+						t.Error("local HTTP peer has no hijacker")
+						close(closed)
+						return
+					}
+					conn, _, err := hijacker.Hijack()
 					if err == nil {
 						_ = conn.Close()
 					}
@@ -230,7 +242,7 @@ func TestGatewayNativeReviewCompletionClosesLiveBody(t *testing.T) {
 			require.NoError(t, err)
 			resp, err := downstream.Client().Do(req)
 			require.NoError(t, err)
-			defer resp.Body.Close()
+			defer func() { require.NoError(t, resp.Body.Close()) }()
 			select {
 			case got := <-settled:
 				require.True(t, got.entered)
