@@ -68,8 +68,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	result := &OpenAIForwardResult{Stream: stream, Model: gjson.GetBytes(body, "model").String(), UpstreamEndpoint: "/v1/responses"}
 	if !stream {
 		output, err := io.ReadAll(io.LimitReader(resp.Body, gatewayNativeResponseLimit+1))
-		if err != nil || len(output) > gatewayNativeResponseLimit || !gjson.ValidBytes(output) ||
-			gjson.GetBytes(output, "status").String() != "completed" {
+		if err != nil || len(output) > gatewayNativeResponseLimit {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+		fields, ok := gatewayNativeCanonicalObject(output, "status")
+		if !ok || gjson.ParseBytes(fields["status"]).String() != "completed" {
 			return nil, ErrGatewayNativeEffectUnknown
 		}
 		result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(output, "usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(output, "usage.output_tokens").Int())}
@@ -124,15 +127,25 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			if bytes.Equal(payload, []byte("[DONE]")) {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
-			if !gjson.ValidBytes(payload) {
+			fields, ok := gatewayNativeCanonicalObject(payload, "type", "response")
+			if !ok {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
-			kind := gjson.GetBytes(payload, "type").String()
+			kind := gjson.ParseBytes(fields["type"]).String()
+			// Check only the protocol response object, never tool/user payloads.
+			var status string
+			if response := fields["response"]; response != nil {
+				responseFields, ok := gatewayNativeCanonicalObject(response, "status")
+				if !ok {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
+				status = gjson.ParseBytes(responseFields["status"]).String()
+			}
 			if kind == "error" || kind == "response.failed" || kind == "response.incomplete" {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
 			if kind == "response.completed" {
-				if gjson.GetBytes(payload, "response.status").String() != "completed" {
+				if status != "completed" {
 					return nil, ErrGatewayNativeEffectUnknown
 				}
 				completed = true

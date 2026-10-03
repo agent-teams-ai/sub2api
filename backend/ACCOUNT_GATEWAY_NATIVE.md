@@ -116,3 +116,47 @@ and repository `TestGatewayNativeReviewReasoningDomains`; run API contracts with
 `go test -tags=unit ./internal/server -run '^TestAPIContracts$' -count=1` from backend.
 Token/capacity policy, bootstrap, subscription authentication and live-provider/
 live-CI gates remain deferred. This handoff does not claim final qualification.
+
+## Independent fa16 F1–F4 repair handoff (2026-10-03)
+
+Target: `fa16ac726774ee434966b6de909a4aba83508e1c`. All 36 changed and 16
+supporting source fingerprints in `.spike-inputs/native-fa16-final.md` matched
+the initial workspace bytes. Linked Git metadata is inaccessible; HEAD is not
+independently certified here. The packet carries exact preimage/postimage hashes
+and a separate tests-only patch for main's unchanged-fa16 behavior reproduction.
+
+Only service files and this document change. The private legacy dispatch skips
+ordinary Fast transforms after default/omitted-tier admission. Ordinary global
+missing/all force-priority behavior remains exercised through the real
+SettingService and local HTTP transport; priority admission still denies entry.
+
+Native Responses checks decoded critical members at the buffered response root,
+SSE event root and nested protocol response object before terminal delivery.
+Duplicate/aliased status, type and response fields reject without rewriting
+unrelated tool/user payload bytes. Private legacy SSE joins data fields only at
+complete blank-line event boundaries, retains the configured line limit, bounds
+each frame to 1 MiB and rejects invalid UTF-8 and unfinished EOF events.
+Final private tool validation requires indices 0..len-1 before converter
+finalization; out-of-order calls and argument fragments may finish dense.
+
+Actual HTTP contract tests are in `native_gateway_fa16_findings_test.go`:
+`TestGatewayNativeFA16LegacyDefaultTier`,
+`TestGatewayNativeFA16ResponsesBufferedMembers`,
+`TestGatewayNativeFA16ResponsesStreamMembers`,
+`TestGatewayNativeFA16ResponsesPayloadBytes`,
+`TestGatewayNativeFA16LegacyCompleteEvents`, and
+`TestGatewayNativeFA16LegacyDenseTools`. Comments identify each fa16 breakage.
+These tests use only existing production seams and fa16 test fixtures.
+
+Worker light checks cover fixture JSON/SSE framing, delimiter/whitespace sanity,
+exact-source hash and ownership guards, and patch reproduction. Go/gofmt/lint,
+unchanged-fa16 behavioral BEFORE and patched AFTER tests, PostgreSQL 17.10 and
+Redis checks are **NOT RUN** here; Go/gofmt are unavailable. Main owns pinned
+formatting and actual qualification before PR2 integration. Run new tests with
+`go test -tags=unit ./internal/service -run '^TestGatewayNativeFA16' -count=1`;
+retain existing native Repair/Review and ordinary bridge/Fast regressions.
+
+This remains an unused, opt-in native boundary checkpoint. Earlier native
+repairs, SQL, API-contract fixtures, Axios, CI and consumer boundaries remain
+outside this patch. No live acceptance, credentials, provider calls, bootstrap,
+deployment, dependency changes, commit or push are included.

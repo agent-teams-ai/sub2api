@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -286,14 +287,57 @@ func (s *OpenAIGatewayService) scanCCStream(
 	strict := len(strictTerminal) > 0 && strictTerminal[0]
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
+	if strict {
+		// Retain the configured line cap and count original LF/CRLF frame bytes.
+		scanner.Split(gatewayNativeRawSSELine)
+	}
+	var data strings.Builder
+	haveData, frameBytes := false, 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		payload, ok := extractOpenAISSEDataLine(line)
-		if !ok {
-			continue
+		var payload string
+		if strict {
+			frameBytes += len(line)
+			if frameBytes > gatewayNativeSSEFrameLimit || !utf8.ValidString(line) || !strings.HasSuffix(line, "\n") {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if line != "" {
+				if line == "data" || strings.HasPrefix(line, "data:") {
+					value := ""
+					if line != "data" {
+						value = strings.TrimPrefix(line[5:], " ")
+					}
+					if haveData {
+						_ = data.WriteByte('\n')
+					}
+					_, _ = data.WriteString(value)
+					haveData = true
+				}
+				continue
+			}
+			// Dispatch a complete SSE event only at its blank-line boundary.
+			frameBytes = 0
+			if !haveData {
+				continue
+			}
+			payload = data.String()
+			data.Reset()
+			haveData = false
+		} else {
+			var ok bool
+			payload, ok = extractOpenAISSEDataLine(line)
+			if !ok {
+				continue
+			}
 		}
 		payload = strings.TrimSpace(payload)
 		if payload == "" {
+			if strict {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
 			continue
 		}
 		if payload == "[DONE]" {

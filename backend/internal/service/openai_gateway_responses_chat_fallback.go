@@ -93,13 +93,17 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	if err != nil {
 		return nil, fmt.Errorf("marshal chat completions fallback request: %w", err)
 	}
-	chatBody, err = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
-	if err != nil {
-		var blocked *OpenAIFastBlockedError
-		if errors.As(err, &blocked) {
-			writeOpenAIFastPolicyBlockedResponse(c, blocked)
+	// The private dispatch already admitted only default/omitted service_tier.
+	// Ordinary Fast settings must not upgrade that admission during conversion.
+	if gatewayNativeReasoningScope(c) == "" {
+		chatBody, err = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
+		if err != nil {
+			var blocked *OpenAIFastBlockedError
+			if errors.As(err, &blocked) {
+				writeOpenAIFastPolicyBlockedResponse(c, blocked)
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 	// /v1/responses 降级到 raw CC 的出站与 forwardAsRawChatCompletions 共用同一个
 	// 独立 Ollama Cloud token 钩子；chatReq.Model 已是模型映射后的 upstreamModel。

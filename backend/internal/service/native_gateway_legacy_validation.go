@@ -158,7 +158,10 @@ func gatewayNativeLegacyFinal(state *apicompat.ChatCompletionsToResponsesStreamS
 		return false
 	}
 	ids := make(map[string]bool)
-	for _, tool := range state.ToolCalls {
+	// The converter closes/collects indices 0..len-1. Allow fragments to arrive
+	// out of order, but reject gaps before it can silently omit a finished call.
+	for i := 0; i < len(state.ToolCalls); i++ {
+		tool := state.ToolCalls[i]
 		if !gatewayNativeLegacyTool(tool) || ids[tool.ID] {
 			return false
 		}
