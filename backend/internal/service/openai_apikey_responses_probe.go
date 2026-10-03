@@ -127,6 +127,9 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 		logger.LegacyPrintf("service.openai_probe", "probe_load_account_failed: account_id=%d err=%v", accountID, err)
 		return
 	}
+	if HasGatewayNativeIdentity(account) {
+		return
+	}
 	if account.Type != AccountTypeAPIKey {
 		return
 	}

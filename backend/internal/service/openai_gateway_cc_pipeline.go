@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -188,6 +189,11 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
 	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	if HasGatewayNativeIdentity(account) {
+		releaseUpstreamCtx()
+		upstreamCtx = ctx
+		releaseUpstreamCtx = func() {}
+	}
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	releaseUpstreamCtx()
 	if err != nil {
@@ -240,6 +246,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
+		if HasGatewayNativeIdentity(account) {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
 	return resp, nil
@@ -253,7 +262,8 @@ type ccStreamScanState struct {
 	// FirstTokenMs 为首个实际输出 chunk（排除 usage-only chunk）的到达时延。
 	FirstTokenMs *int
 	// SawDone 表示上游发出了 [DONE] 哨兵。
-	SawDone bool
+	SawDone   bool
+	SawFinish bool
 	// Err 为 scanner 读错误（客户端 context 取消不属于此类，会原样带出）。
 	// 非 nil 时调用方必须跳过 finalize 并返回 usage-incomplete 错误，避免
 	// 把上游截断伪装成正常收尾。
@@ -271,24 +281,74 @@ func (s *OpenAIGatewayService) scanCCStream(
 	requestID string,
 	startTime time.Time,
 	emit func(*apicompat.ChatCompletionsChunk),
+	strictTerminal ...bool,
 ) ccStreamScanState {
 	var st ccStreamScanState
+	strict := len(strictTerminal) > 0 && strictTerminal[0]
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
+	if strict {
+		// Retain the configured line cap and count original LF/CRLF frame bytes.
+		scanner.Split(gatewayNativeRawSSELine)
+	}
+	var data strings.Builder
+	haveData, frameBytes := false, 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		payload, ok := extractOpenAISSEDataLine(line)
-		if !ok {
-			continue
+		var payload string
+		if strict {
+			frameBytes += len(line)
+			if frameBytes > gatewayNativeSSEFrameLimit || !utf8.ValidString(line) || !strings.HasSuffix(line, "\n") {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if line != "" {
+				if line == "data" || strings.HasPrefix(line, "data:") {
+					value := ""
+					if line != "data" {
+						value = strings.TrimPrefix(line[5:], " ")
+					}
+					if haveData {
+						_ = data.WriteByte('\n')
+					}
+					_, _ = data.WriteString(value)
+					haveData = true
+				}
+				continue
+			}
+			// Dispatch a complete SSE event only at its blank-line boundary.
+			frameBytes = 0
+			if !haveData {
+				continue
+			}
+			payload = data.String()
+			data.Reset()
+			haveData = false
+		} else {
+			var ok bool
+			payload, ok = extractOpenAISSEDataLine(line)
+			if !ok {
+				continue
+			}
 		}
 		payload = strings.TrimSpace(payload)
 		if payload == "" {
+			if strict {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
 			continue
 		}
 		if payload == "[DONE]" {
+			if strict && !st.SawFinish {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
 			st.SawDone = true
 			break
 		}
+
 		// 观察上游 CC chunk 回显的 model / service_tier（计费以回显为准）。
 		// CC chunk 无 type 字段，按 untyped payload 观察（上游约束：只有终止
 		// 事件与无类型 body 报告实际处理档位）。
@@ -302,11 +362,25 @@ func (s *OpenAIGatewayService) scanCCStream(
 
 		var chunk apicompat.ChatCompletionsChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			if strict {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
 			logger.L().Warn(logPrefix+": failed to parse chat stream chunk",
 				zap.Error(err),
 				zap.String("request_id", requestID),
 			)
 			continue
+		}
+		if strict {
+			if !gatewayNativeLegacyChunk([]byte(payload), &chunk) || (st.SawFinish && len(chunk.Choices) > 0) {
+				st.Err = ErrGatewayNativeEffectUnknown
+				return st
+			}
+			if len(chunk.Choices) == 1 {
+				finish := chunk.Choices[0].FinishReason
+				st.SawFinish = finish != nil && (*finish == "stop" || *finish == "tool_calls")
+			}
 		}
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
@@ -315,6 +389,12 @@ func (s *OpenAIGatewayService) scanCCStream(
 		emit(&chunk)
 	}
 
+	if strict {
+		if scanner.Err() != nil || !st.SawDone || !st.SawFinish || c.Request.Context().Err() != nil {
+			st.Err = ErrGatewayNativeEffectUnknown
+		}
+		return st
+	}
 	if err := scanner.Err(); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			logger.L().Warn(logPrefix+": stream read error",
@@ -353,6 +433,9 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 	if err := json.Unmarshal(respBody, &ccResp); err != nil {
 		writeError(c, http.StatusBadGateway, "api_error", "Failed to parse upstream response")
 		return nil, OpenAIUsage{}, fmt.Errorf("parse chat completions response: %w", err)
+	}
+	if gatewayNativeReasoningScope(c) != "" && !gatewayNativeLegacyBuffered(respBody, &ccResp) {
+		return nil, OpenAIUsage{}, ErrGatewayNativeEffectUnknown
 	}
 	// 观察上游 CC JSON 回显的 model / service_tier（计费以回显为准）。
 	// CC JSON 无 type 字段，按 untyped payload 观察（上游约束）。

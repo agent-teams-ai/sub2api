@@ -1018,6 +1018,10 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	if service.HasGatewayNativeIdentity(&service.Account{Extra: req.Extra}) {
+		response.BadRequest(c, "reserved native identity")
+		return
+	}
 	if err := service.ValidateOpenAILongContextBillingExtra(req.Platform, req.Extra); err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -1224,6 +1228,9 @@ func (h *AccountHandler) Update(c *gin.Context) {
 // 当前请求。探测错误仅记录日志，不向上下文传播：探测失败时标记保持缺失，
 // 网关会按"现状即证据"默认走 Responses。
 func (h *AccountHandler) scheduleOpenAIResponsesProbe(account *service.Account) {
+	if service.HasGatewayNativeIdentity(account) {
+		return
+	}
 	if account == nil || account.Type != service.AccountTypeAPIKey ||
 		(account.Platform != service.PlatformOpenAI && !service.IsCNProvider(account.Platform)) {
 		return
@@ -1921,6 +1928,11 @@ func (h *AccountHandler) BatchClearError(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// Resolve and guard the whole list before launching any mutating worker.
+	if _, err := h.adminService.GetAccountsByIDs(ctx, req.AccountIDs); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
 	const maxConcurrency = 10
 	g, gctx := errgroup.WithContext(ctx)
