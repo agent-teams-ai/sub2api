@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -119,6 +120,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				data = append(data, "")
 			}
 			continue
+		}
+		// Comments and other forwarded SSE fields also belong to the UTF-8 frame.
+		if !utf8.Valid(event.Bytes()) {
+			return nil, ErrGatewayNativeEffectUnknown
 		}
 		completed := false
 		if len(data) > 0 {

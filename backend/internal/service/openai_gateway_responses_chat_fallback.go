@@ -134,7 +134,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if HasGatewayNativeIdentity(account) && resp.StatusCode >= 400 {
+	if HasGatewayNativeIdentity(account) && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "native_effect_unknown", "native upstream request failed")
 		return nil, ErrGatewayNativeEffectUnknown
 	}

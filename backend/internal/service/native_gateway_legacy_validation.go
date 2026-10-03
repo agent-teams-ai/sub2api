@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 )
@@ -11,7 +12,7 @@ import (
 // Inspect only protocol objects, never arbitrary nested user/tool payloads.
 // Decoded names use the same case folding as encoding/json struct fields.
 func gatewayNativeCanonicalObject(raw []byte, critical ...string) (map[string]json.RawMessage, bool) {
-	if !json.Valid(raw) {
+	if !utf8.Valid(raw) || !json.Valid(raw) {
 		return nil, false
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -86,17 +87,28 @@ func gatewayNativeLegacyChunk(raw []byte, chunk *apicompat.ChatCompletionsChunk)
 // Preserve sparse argument/name fragments, but never let the converter invent
 // an upstream tool identity or normalize an unsupported tool type to function.
 func gatewayNativeLegacyToolDelta(chunk *apicompat.ChatCompletionsChunk, state *apicompat.ChatCompletionsToResponsesStreamState) bool {
+	// Validate the whole chunk before conversion can announce or overwrite an ID.
+	identities := make(map[int]string, len(state.ToolCalls))
+	for index, tool := range state.ToolCalls {
+		if tool == nil {
+			return false
+		}
+		identities[index] = tool.ID
+	}
 	for _, choice := range chunk.Choices {
 		for _, tool := range choice.Delta.ToolCalls {
 			if tool.Index == nil || *tool.Index < 0 {
 				return false
 			}
-			prior, exists := state.ToolCalls[*tool.Index]
+			prior, exists := identities[*tool.Index]
 			if !exists && (tool.ID == "" || tool.Type != "function") {
 				return false
 			}
-			if exists && ((tool.ID != "" && tool.ID != prior.ID) || (tool.Type != "" && tool.Type != "function")) {
+			if exists && ((tool.ID != "" && tool.ID != prior) || (tool.Type != "" && tool.Type != "function")) {
 				return false
+			}
+			if !exists {
+				identities[*tool.Index] = tool.ID
 			}
 		}
 	}
