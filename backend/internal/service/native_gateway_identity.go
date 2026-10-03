@@ -182,6 +182,16 @@ func GatewayNativeDescriptor(a *Account) (GatewayNativeRoute, error) {
 // This is an exact candidate query, never name/latest/ID-only recovery. Zero,
 // multiple, malformed or deleted candidates are quarantined by the facade.
 func (s *OpenAIGatewayService) ResolveGatewayCandidate(ctx context.Context, generation string) (*Account, error) {
+	a, err := s.ResolveGatewayCandidateMetadata(ctx, generation)
+	if err != nil || gatewayNativeCustody(ctx).ValidateEnvelope(a.GetCredential("api_key")) != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	return a, nil
+}
+
+// Safe control metadata remains available after key retirement so the owner can
+// disable and erase an exact candidate. This does not qualify activation or entry.
+func (s *OpenAIGatewayService) ResolveGatewayCandidateMetadata(ctx context.Context, generation string) (*Account, error) {
 	consumer, consumerErr := GatewayNativeConsumer(ctx)
 	custody := gatewayNativeCustody(ctx)
 	id, err := uuid.Parse(generation)
@@ -197,7 +207,8 @@ func (s *OpenAIGatewayService) ResolveGatewayCandidate(ctx context.Context, gene
 		return nil, err
 	}
 	scope, err := GatewayNativeCredentialScopeForAccount(a)
-	if err != nil || scope.Consumer != consumer || custody.ValidateEnvelope(a.GetCredential("api_key")) != nil {
+	_, _, _, envelopeErr := gatewayNativeParseEnvelope(a.GetCredential("api_key"))
+	if err != nil || scope.Consumer != consumer || envelopeErr != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
 	return snapshotGatewayNativeAccount(a), nil

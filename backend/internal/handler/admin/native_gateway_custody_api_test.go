@@ -238,15 +238,41 @@ func TestGatewayNativeCustodyPrivateAPIPostgres(t *testing.T) {
 	// Regression: cleanup rounds birth precision, erases foreign scope, requires
 	// decryption after key loss, or an erased descriptor is revived by SQL restore.
 	t.Run("exact erase is key-independent and cannot revive", func(t *testing.T) {
-		status, _ := custodyAPIRequest(t, server.Client(), http.MethodPut, base+"/candidates/"+generation, tokenA,
-			gatewayNativeMutation{Descriptor: candidate.Descriptor, State: "inactive"})
-		require.Equal(t, http.StatusOK, status)
 		missing, err := service.NewGatewayNativeCredentialCustody("new-only", map[string][]byte{"new-only": nativeReviewSyntheticBytes(t, 32)})
 		require.NoError(t, err)
 		cleanup := compose(missing)
-		target := cleanup.URL + "/private/native/v1/candidates/" + generation + "/erase"
+		candidateURL := cleanup.URL + "/private/native/v1/candidates/" + generation
+		status, data := custodyAPIRequest(t, cleanup.Client(), http.MethodGet, candidateURL, tokenA, nil)
+		require.Equal(t, http.StatusOK, status)
+		require.NotContains(t, string(data), key)
+		var metadata GatewayNativeCandidate
+		require.NoError(t, json.Unmarshal(data, &metadata))
+		require.Equal(t, "active", metadata.State, "key is retired before deactivation")
+		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodGet, candidateURL, tokenB, nil)
+		require.Equal(t, http.StatusConflict, status)
+		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPut, candidateURL, tokenA,
+			gatewayNativeMutation{Descriptor: candidate.Descriptor, State: "active"})
+		require.Equal(t, http.StatusConflict, status, "metadata is not key availability proof")
 		bad := candidate.Descriptor
 		bad.CreatedAt = bad.CreatedAt.Add(time.Nanosecond)
+		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPut, candidateURL, tokenA,
+			gatewayNativeMutation{Descriptor: bad, State: "inactive"})
+		require.Equal(t, http.StatusConflict, status)
+		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPut, candidateURL, tokenB,
+			gatewayNativeMutation{Descriptor: candidate.Descriptor, State: "inactive"})
+		require.Equal(t, http.StatusConflict, status)
+		fresh, err := repo.GetByID(ctx, row.ID)
+		require.NoError(t, err)
+		require.Equal(t, service.StatusActive, fresh.Status, "rejected mutations do not deactivate")
+		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPut, candidateURL, tokenA,
+			gatewayNativeMutation{Descriptor: candidate.Descriptor, State: "inactive"})
+		require.Equal(t, http.StatusOK, status)
+		status, data = custodyAPIRequest(t, cleanup.Client(), http.MethodGet, candidateURL, tokenA, nil)
+		require.Equal(t, http.StatusOK, status)
+		require.NoError(t, json.Unmarshal(data, &metadata))
+		require.Equal(t, "inactive", metadata.State)
+		require.EqualValues(t, 1, entries.Load(), "cleanup makes no provider entry")
+		target := candidateURL + "/erase"
 		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPost, target, tokenA, gatewayNativeMutation{Descriptor: bad})
 		require.Equal(t, http.StatusConflict, status)
 		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPost, target, tokenB, gatewayNativeMutation{Descriptor: candidate.Descriptor})

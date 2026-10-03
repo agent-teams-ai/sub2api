@@ -96,7 +96,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		c.Next()
 	})
 	read := func(c *gin.Context, generation string) (*service.Account, bool) {
-		a, err := gateway.ResolveGatewayCandidate(c.Request.Context(), generation)
+		a, err := gateway.ResolveGatewayCandidateMetadata(c.Request.Context(), generation)
 		if err != nil {
 			fail(c)
 			return nil, false
@@ -186,6 +186,12 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		if !service.SameGatewayNativeDescriptor(req.Descriptor, d) {
 			fail(c)
 			return
+		}
+		if req.State == "active" {
+			if _, err := gateway.ResolveGatewayCandidate(c.Request.Context(), c.Param("generation")); err != nil {
+				fail(c)
+				return
+			}
 		}
 		nativeStatus := req.State
 		if nativeStatus == "inactive" {
