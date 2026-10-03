@@ -5,7 +5,9 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +40,34 @@ func nativeReviewGateway(repo service.AccountRepository, cache service.GatewayCa
 }
 func nativeReviewAdmin(repo service.AccountRepository, client *dbent.Client) service.AdminService {
 	return service.NewAdminService(nil, nil, nil, repo.(service.AdminAccountRepository), nil, nil, nil, nil, nil, nil, nil, nil, nil, client, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+}
+func nativeReviewSyntheticBytes(t *testing.T, size int) []byte {
+	t.Helper()
+	value := make([]byte, size)
+	_, err := rand.Read(value)
+	require.NoError(t, err)
+	return value
+}
+
+func nativeReviewSyntheticKey(t *testing.T) string {
+	t.Helper()
+	return base64.RawURLEncoding.EncodeToString(nativeReviewSyntheticBytes(t, 32))
+}
+
+func nativeReviewCustody(t *testing.T) *service.GatewayNativeCredentialCustody {
+	t.Helper()
+	custody, err := service.NewGatewayNativeCredentialCustody("fixture-k1", map[string][]byte{"fixture-k1": nativeReviewSyntheticBytes(t, 32)})
+	require.NoError(t, err)
+	return custody
+}
+func nativeReviewAuthorize(c *gin.Context) {
+	ctx, err := service.WithGatewayNativeConsumer(c.Request.Context(), "fixture-consumer")
+	if err != nil {
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
 }
 func nativeReviewHTTP(t *testing.T, client *http.Client, method, target string, body any) (int, []byte) {
 	t.Helper()
@@ -91,11 +121,11 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 	ordinary.POST("/accounts/:id/clear-error", handler.ClearError)
 	ordinary.POST("/accounts/batch-clear-error", handler.BatchClearError)
 	profile := GatewayNativeProfile{ID: service.GatewayMiMoResponsesProfile, BaseURL: "https://sandbox.invalid", Model: "mimo-test"}
-	RegisterGatewayNativeRoutes(router.Group(""), adminSvc, gateway, profile, func(c *gin.Context) { c.Next() }, func(*gin.Context, service.GatewayNativeRoute) error { return nil }, func(*gin.Context, bool, error) {})
+	RegisterGatewayNativeRoutes(router.Group(""), adminSvc, gateway, profile, nativeReviewAuthorize, func(*gin.Context, service.GatewayNativeRoute) error { return nil }, func(*gin.Context, bool, error) {}, nativeReviewCustody(t))
 	server := httptest.NewServer(router)
 	defer server.Close()
 	generation := "77777777-7777-4777-8777-777777777777"
-	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key": "sandbox-fixture"}
+	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key": nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/fixture"}
 	status, raw := nativeReviewHTTP(t, server.Client(), http.MethodPost, server.URL+"/private/native/v1/candidates", create)
 	require.Equal(t, http.StatusOK, status)
 	var candidate GatewayNativeCandidate
@@ -114,14 +144,15 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		require.Nil(t, stored.ProxyID)
 		require.Nil(t, stored.ParentAccountID)
 		require.Len(t, stored.Credentials, 2)
-		require.Len(t, stored.Extra, 7)
+		require.Len(t, stored.Extra, 8)
+		require.True(t, strings.HasPrefix(stored.GetCredential("api_key"), "gcn1.fixture-k1."))
 		require.NotContains(t, stored.Extra, "openai_long_context_billing_enabled")
 		require.NotContains(t, stored.Extra, service.UpstreamBillingProbeEnabledExtraKey)
 		require.NotContains(t, stored.Extra, "openai_responses_supported")
 		// Ordinary stock creation still applies its default, rather than adopting
 		// the private policy or losing the ordinary active/schedulable behavior.
 		ordinary, err := adminSvc.CreateAccount(ctx, &service.CreateAccountInput{Name: "normalizer baseline", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
-			Credentials: map[string]any{"api_key": "sandbox-fixture", "base_url": profile.BaseURL}, SkipDefaultGroupBind: true, Concurrency: 1})
+			Credentials: map[string]any{"api_key": nativeReviewSyntheticKey(t), "base_url": profile.BaseURL}, SkipDefaultGroupBind: true, Concurrency: 1})
 		require.NoError(t, err)
 		require.Equal(t, false, ordinary.Extra["openai_long_context_billing_enabled"])
 		require.Equal(t, service.StatusActive, ordinary.Status)
@@ -137,7 +168,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 			}
 			extra[key] = false
 			_, err := adminSvc.CreateAccount(service.WithGatewayNativeControl(ctx), &service.CreateAccountInput{Name: "forbidden", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
-				Credentials: map[string]any{"api_key": "sandbox-fixture", "base_url": profile.BaseURL}, Extra: extra, SkipDefaultGroupBind: true})
+				Credentials: map[string]any{"api_key": nativeReviewSyntheticKey(t), "base_url": profile.BaseURL}, Extra: extra, SkipDefaultGroupBind: true})
 			require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
 		}
 		var rows, groups int
@@ -148,19 +179,19 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 	})
 	var birth time.Time
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT created_at FROM accounts WHERE id=$1", candidate.Descriptor.AccountID).Scan(&birth))
-	t.Run("legacy bridge profile POST persists seven extras through the actual repository", func(t *testing.T) {
+	t.Run("legacy bridge profile POST persists eight extras through the actual repository", func(t *testing.T) {
 		bridge := GatewayNativeProfile{ID: service.GatewayLegacyBridgeProfile, BaseURL: "https://sandbox.invalid", Model: "mimo-test"}
 		routes := gin.New()
-		RegisterGatewayNativeRoutes(routes.Group(""), adminSvc, gateway, bridge, func(c *gin.Context) { c.Next() }, func(*gin.Context, service.GatewayNativeRoute) error { return nil }, func(*gin.Context, bool, error) {})
+		RegisterGatewayNativeRoutes(routes.Group(""), adminSvc, gateway, bridge, nativeReviewAuthorize, func(*gin.Context, service.GatewayNativeRoute) error { return nil }, func(*gin.Context, bool, error) {}, nativeReviewCustody(t))
 		fixture := httptest.NewServer(routes)
 		defer fixture.Close()
-		status, data := nativeReviewHTTP(t, fixture.Client(), http.MethodPost, fixture.URL+"/private/native/v1/candidates", map[string]any{"generation": "99999999-9999-4999-8999-999999999999", "profile": bridge.ID, "name": "Bridge candidate", "api_key": "sandbox-fixture"})
+		status, data := nativeReviewHTTP(t, fixture.Client(), http.MethodPost, fixture.URL+"/private/native/v1/candidates", map[string]any{"generation": "99999999-9999-4999-8999-999999999999", "profile": bridge.ID, "name": "Bridge candidate", "api_key": nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/bridge"})
 		require.Equal(t, http.StatusOK, status)
 		var got GatewayNativeCandidate
 		require.NoError(t, json.Unmarshal(data, &got))
 		stored, err := repo.GetByID(ctx, got.Descriptor.AccountID)
 		require.NoError(t, err)
-		require.Len(t, stored.Extra, 7)
+		require.Len(t, stored.Extra, 8)
 		require.NotContains(t, stored.Extra, "openai_long_context_billing_enabled")
 		require.Equal(t, bridge.ID, stored.Extra[service.GatewayProfileExtraKey])
 		require.Equal(t, service.StatusDisabled, stored.Status)
@@ -184,7 +215,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		require.GreaterOrEqual(t, status, 400)
 		require.Equal(t, 1, countCandidates())
 	})
-	ordinaryRow := &service.Account{Name: "ordinary", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusError, Schedulable: true, Concurrency: 1, Credentials: map[string]any{"api_key": "ordinary-fixture", "base_url": "https://sandbox.invalid"}, Extra: map[string]any{}}
+	ordinaryRow := &service.Account{Name: "ordinary", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusError, Schedulable: true, Concurrency: 1, Credentials: map[string]any{"api_key": nativeReviewSyntheticKey(t), "base_url": "https://sandbox.invalid"}, Extra: map[string]any{}}
 	require.NoError(t, repo.Create(ctx, ordinaryRow))
 	t.Run("ordinary SQL and current repository writers retain billing defaults", func(t *testing.T) {
 		// Unlike CreateAccount, these writers never call the Go create normalizer.
@@ -198,7 +229,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		assertDefault(ordinaryRow.ID, map[string]any{"openai_long_context_billing_enabled": false})
 		var rawID int64
 		require.NoError(t, db.QueryRowContext(ctx, `INSERT INTO accounts(name,platform,type,credentials,extra,status,schedulable,concurrency)
-   VALUES ('raw billing fixture','openai','apikey','{"api_key":"sandbox-fixture","base_url":"https://sandbox.invalid"}'::jsonb,'{}'::jsonb,'disabled',false,1) RETURNING id`).Scan(&rawID))
+   VALUES ('raw billing fixture','openai','apikey',jsonb_build_object('api_key',$1::text,'base_url','https://sandbox.invalid'),'{}'::jsonb,'disabled',false,1) RETURNING id`, nativeReviewSyntheticKey(t)).Scan(&rawID))
 		assertDefault(rawID, map[string]any{"openai_long_context_billing_enabled": false})
 		_, err := db.ExecContext(ctx, "UPDATE accounts SET extra=$1::jsonb WHERE id=$2", `{"ordinary_fixture":true}`, rawID)
 		require.NoError(t, err)
@@ -246,10 +277,10 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		fresh, err := repo.GetByID(ctx, original.ID)
 		require.NoError(t, err)
 		require.Equal(t, original.Extra, fresh.Extra)
-		require.Len(t, fresh.Extra, 7)
+		require.Len(t, fresh.Extra, 8)
 		require.NotContains(t, fresh.Extra, "openai_long_context_billing_enabled")
 	}
-	t.Run("private SQL update preserves the exact seven extras", func(t *testing.T) {
+	t.Run("private SQL update preserves the exact eight extras", func(t *testing.T) {
 		_, err := db.ExecContext(ctx, "UPDATE accounts SET extra=extra WHERE id=$1", original.ID)
 		require.NoError(t, err)
 		assertPrivateExtra()
@@ -401,10 +432,16 @@ func TestGatewayNativeReviewReasoningHTTPRedis(t *testing.T) {
 	}))
 	defer upstream.Close()
 	a := &service.Account{ID: 17, CreatedAt: time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC), Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive,
-		Credentials: map[string]any{"api_key": "sandbox-fixture", "base_url": upstream.URL}, Extra: map[string]any{service.GatewayGenerationExtraKey: g1, service.GatewayProfileExtraKey: service.GatewayLegacyBridgeProfile, service.GatewayModelExtraKey: "mimo-test", "openai_responses_mode": "force_chat_completions", "openai_passthrough": false, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+		Credentials: map[string]any{"api_key": nativeReviewSyntheticKey(t), "base_url": upstream.URL}, Extra: map[string]any{service.GatewayGenerationExtraKey: g1, service.GatewayProfileExtraKey: service.GatewayLegacyBridgeProfile, service.GatewayModelExtraKey: "mimo-test", "openai_responses_mode": "force_chat_completions", "openai_passthrough": false, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+	custody := nativeReviewCustody(t)
+	scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "owner/fixture", Account: "account/reasoning", Generation: g1, Purpose: service.GatewayCredentialPurpose}
+	envelope, err := custody.Seal(scope, nativeReviewSyntheticKey(t))
+	require.NoError(t, err)
+	a.Credentials["api_key"] = envelope
+	a.Extra[service.GatewayCredentialScopeExtraKey] = scope.Metadata()
 	repo := &nativeReviewReasoningRepo{row: a}
 	gateway := nativeReviewGateway(repo, cache, &nativeReviewRealHTTP{client: upstream.Client()})
-	ordinary := &service.Account{ID: 19, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Credentials: a.Credentials, Extra: map[string]any{"openai_responses_mode": "force_chat_completions", "openai_preserve_compatible_reasoning": true}}
+	ordinary := &service.Account{ID: 19, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Credentials: map[string]any{"api_key": nativeReviewSyntheticKey(t), "base_url": upstream.URL}, Extra: map[string]any{"openai_responses_mode": "force_chat_completions", "openai_preserve_compatible_reasoning": true}}
 	router := gin.New()
 	router.POST("/ordinary", func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
@@ -415,6 +452,14 @@ func TestGatewayNativeReviewReasoningHTTPRedis(t *testing.T) {
 	})
 	router.POST("/managed/:generation", func(c *gin.Context) {
 		a.Extra[service.GatewayGenerationExtraKey] = c.Param("generation")
+		scope.Generation = c.Param("generation")
+		envelope, err := custody.Seal(scope, nativeReviewSyntheticKey(t))
+		require.NoError(t, err)
+		a.Credentials["api_key"] = envelope
+		a.Extra[service.GatewayCredentialScopeExtraKey] = scope.Metadata()
+		ctx, err := service.WithGatewayNativeConsumer(c.Request.Context(), scope.Consumer)
+		require.NoError(t, err)
+		c.Request = c.Request.WithContext(service.WithGatewayNativeCustody(ctx, custody))
 		route, err := service.GatewayNativeDescriptor(a)
 		if err != nil {
 			c.Status(400)

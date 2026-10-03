@@ -19,15 +19,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func nativeReviewStreamAccount(base, profile string) *Account {
+func nativeReviewStreamAccount(t *testing.T, base, profile string) *Account {
 	mode, pass := "force_responses", true
 	if profile == GatewayLegacyBridgeProfile {
 		mode, pass = "force_chat_completions", false
 	}
-	return &Account{ID: 17, CreatedAt: time.Date(2026, 10, 3, 0, 0, 0, 123000, time.UTC), Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
+	a := &Account{ID: 17, CreatedAt: time.Date(2026, 10, 3, 0, 0, 0, 123000, time.UTC), Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
 		Credentials: map[string]any{"api_key": "sandbox-fixture", "base_url": base},
 		Extra: map[string]any{GatewayGenerationExtraKey: "99999999-9999-4999-8999-999999999999", GatewayProfileExtraKey: profile, GatewayModelExtraKey: "mimo-test",
 			"openai_responses_mode": mode, "openai_passthrough": pass, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+	if profile != "" {
+		nativeFixtureSealAccount(t, a)
+	}
+	return a
 }
 
 const nativeReviewCCDelta = "data: {\"id\":\"sandbox\",\"model\":\"mimo-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"fixture\"},\"finish_reason\":null}]}\n\n"
@@ -75,7 +79,7 @@ func TestGatewayNativeReviewLegacyStrictTerminal(t *testing.T) {
 				_, _ = io.WriteString(w, tc.stream)
 			}))
 			defer upstream.Close()
-			a := nativeReviewStreamAccount(upstream.URL, GatewayLegacyBridgeProfile)
+			a := nativeReviewStreamAccount(t, upstream.URL, GatewayLegacyBridgeProfile)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: &gatewayIdentityRealHTTP{client: upstream.Client()}, cfg: rawChatCompletionsTestConfig()}
@@ -88,7 +92,7 @@ func TestGatewayNativeReviewLegacyStrictTerminal(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", nil)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, entered, err := svc.ForwardGatewayRoute(ctx, c, route, []byte(`{"model":"mimo-test","input":"sandbox","stream":true,"store":false,"service_tier":"default"}`))
+			_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, ctx), c, route, []byte(`{"model":"mimo-test","input":"sandbox","stream":true,"store":false,"service_tier":"default"}`))
 			require.True(t, entered)
 			require.EqualValues(t, 1, calls.Load())
 			if tc.success {
@@ -163,14 +167,14 @@ func TestGatewayNativeReviewResponsesSSEFrames(t *testing.T) {
 				_, _ = io.WriteString(w, tc.wire)
 			}))
 			defer upstream.Close()
-			a := nativeReviewStreamAccount(upstream.URL, GatewayMiMoResponsesProfile)
+			a := nativeReviewStreamAccount(t, upstream.URL, GatewayMiMoResponsesProfile)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: &gatewayIdentityRealHTTP{client: upstream.Client()}, cfg: rawChatCompletionsTestConfig()}
 			rec := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(rec)
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", nil)
-			_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, route, []byte(`{"model":"mimo-test","stream":true,"store":false}`))
+			_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, []byte(`{"model":"mimo-test","stream":true,"store":false}`))
 			require.True(t, entered)
 			require.EqualValues(t, 1, calls.Load())
 			if tc.success {
@@ -220,7 +224,7 @@ func TestGatewayNativeReviewCompletionClosesLiveBody(t *testing.T) {
 				close(closed)
 			}))
 			defer upstream.Close()
-			a := nativeReviewStreamAccount(upstream.URL, GatewayMiMoResponsesProfile)
+			a := nativeReviewStreamAccount(t, upstream.URL, GatewayMiMoResponsesProfile)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: &gatewayIdentityRealHTTP{client: upstream.Client()}, cfg: rawChatCompletionsTestConfig()}
@@ -231,7 +235,7 @@ func TestGatewayNativeReviewCompletionClosesLiveBody(t *testing.T) {
 			settled := make(chan outcome, 1)
 			router := gin.New()
 			router.POST("/sandbox", func(c *gin.Context) {
-				_, entered, err := svc.ForwardGatewayRoute(c.Request.Context(), c, route, []byte(`{"model":"mimo-test","stream":true}`))
+				_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, c.Request.Context()), c, route, []byte(`{"model":"mimo-test","stream":true}`))
 				settled <- outcome{entered, err}
 			})
 			downstream := httptest.NewServer(router)
@@ -272,14 +276,14 @@ func TestGatewayNativeReviewCompletionDeliveryFailure(t *testing.T) {
 		_, _ = io.WriteString(w, nativeReviewCompleted)
 	}))
 	defer upstream.Close()
-	a := nativeReviewStreamAccount(upstream.URL, GatewayMiMoResponsesProfile)
+	a := nativeReviewStreamAccount(t, upstream.URL, GatewayMiMoResponsesProfile)
 	route, err := GatewayNativeDescriptor(a)
 	require.NoError(t, err)
 	svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: &gatewayIdentityRealHTTP{client: upstream.Client()}, cfg: rawChatCompletionsTestConfig()}
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(&nativeReviewWriteFailure{ResponseRecorder: rec, failOn: "response.completed"})
 	c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", nil)
-	_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, route, []byte(`{"model":"mimo-test","stream":true}`))
+	_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, []byte(`{"model":"mimo-test","stream":true}`))
 	require.True(t, entered)
 	require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
 	require.Empty(t, rec.Body.String())
@@ -303,7 +307,7 @@ func TestGatewayNativeReviewCompletionFlushFailure(t *testing.T) {
 				}
 			}))
 			defer upstream.Close()
-			a := nativeReviewStreamAccount(upstream.URL, profile)
+			a := nativeReviewStreamAccount(t, upstream.URL, profile)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: a}, httpUpstream: &gatewayIdentityRealHTTP{client: upstream.Client()}, cfg: rawChatCompletionsTestConfig()}
@@ -311,7 +315,7 @@ func TestGatewayNativeReviewCompletionFlushFailure(t *testing.T) {
 			c, _ := gin.CreateTestContext(rec)
 			c.Writer = nativeReviewFlushFailure{c.Writer}
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", nil)
-			_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, route, []byte(`{"model":"mimo-test","stream":true}`))
+			_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, []byte(`{"model":"mimo-test","stream":true}`))
 			require.True(t, entered)
 			require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
 			require.EqualValues(t, 1, calls.Load())

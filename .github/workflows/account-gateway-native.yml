@@ -62,3 +62,28 @@ jobs:
           test "$(sed -n '/^--- PASS: TestGatewayNativeReviewPrivateHTTPPostgres /p' /tmp/native-pg.log | wc -l)" -eq 1
           go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeReviewReasoningHTTPRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis.log
           test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningHTTPRedis /p' /tmp/native-redis.log | wc -l)" -eq 1
+
+      - name: Encrypted native custody and actual backup restore
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_CUSTODY_PG_DSN: postgres://native_contract_test@127.0.0.1:5432/native_custody_ci?sslmode=disable
+          GATEWAY_NATIVE_CUSTODY_RESTORE_PG_DSN: postgres://native_contract_test@127.0.0.1:5432/native_custody_restore_ci?sslmode=disable
+          GATEWAY_NATIVE_CUSTODY_API_PG_DSN: postgres://native_contract_test@127.0.0.1:5432/native_custody_api_ci?sslmode=disable
+        run: |
+          set -o pipefail
+          for db in native_custody_ci native_custody_restore_ci native_custody_api_ci; do
+            docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test "$db"
+          done
+          mkdir -p "$RUNNER_TEMP/native-custody-pg-bin"
+          printf '#!/bin/sh\nexec docker exec %s pg_dump "$@"\n' "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/native-custody-pg-bin/pg_dump"
+          chmod 755 "$RUNNER_TEMP/native-custody-pg-bin/pg_dump"
+          printf '#!/bin/sh\nexec docker exec -i %s psql "$@"\n' "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/native-custody-pg-bin/psql"
+          chmod 755 "$RUNNER_TEMP/native-custody-pg-bin/psql"
+          export PATH="$RUNNER_TEMP/native-custody-pg-bin:$PATH"
+          pg_dump --version
+          go test -tags gatewaycustody ./internal/repository -run '^TestGatewayNativeCustodyPostgresAndRestore$' -count=1 -v -timeout 180s | tee /tmp/native-custody-restore.log
+          test "$(sed -n '/^--- PASS: TestGatewayNativeCustodyPostgresAndRestore /p' /tmp/native-custody-restore.log | wc -l)" -eq 1
+          ! grep -Fq -- '--- SKIP:' /tmp/native-custody-restore.log
+          go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeCustodyPrivateAPIPostgres$' -count=1 -v -timeout 180s | tee /tmp/native-custody-api.log
+          test "$(sed -n '/^--- PASS: TestGatewayNativeCustodyPrivateAPIPostgres /p' /tmp/native-custody-api.log | wc -l)" -eq 1
+          ! grep -Fq -- '--- SKIP:' /tmp/native-custody-api.log

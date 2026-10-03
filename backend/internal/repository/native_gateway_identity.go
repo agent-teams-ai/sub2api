@@ -47,13 +47,18 @@ func (r *accountRepository) LockGatewayNativeAccount(ctx context.Context, id int
 // Exact-owner cleanup survives lost acknowledgement: the retained descriptor
 // still matches after erasure. It never replaces credentials or revives a row.
 func (r *accountRepository) EraseGatewayNativeAccount(ctx context.Context, route service.GatewayNativeRoute) error {
+	consumer, err := service.GatewayNativeConsumer(ctx)
+	if err != nil || route.CreatedAt.IsZero() || route.CreatedAt.Nanosecond()%1000 != 0 {
+		return service.ErrGatewayNativeIdentity
+	}
 	result, err := r.sql.ExecContext(ctx, `UPDATE accounts
  SET credentials = credentials - 'api_key', deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW()
  WHERE id = $1 AND created_at = $2 AND extra ->> 'gateway_generation_v1' = $3
  AND extra ->> 'gateway_profile_v1' = $4 AND credentials ->> 'base_url' = $5
  AND extra ->> 'gateway_model_v1' = $6 AND status = 'disabled' AND schedulable = false
+ AND extra -> 'gateway_credential_scope_v1' ->> 'consumer' = $7
  AND NOT EXISTS (SELECT 1 FROM account_groups g WHERE g.account_id = accounts.id)`,
-		route.AccountID, route.CreatedAt, route.Generation, route.Profile, route.BaseURL, route.Model)
+		route.AccountID, route.CreatedAt, route.Generation, route.Profile, route.BaseURL, route.Model, consumer)
 	if err != nil {
 		return service.ErrGatewayNativeIdentity
 	}

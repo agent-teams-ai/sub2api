@@ -66,6 +66,7 @@ func TestGatewayNativeIdentity_ActualForwardBoundary(t *testing.T) {
 		Credentials: map[string]any{"api_key": "fixture-key", "base_url": upstream.URL},
 		Extra: map[string]any{GatewayGenerationExtraKey: "11111111-1111-4111-8111-111111111111", GatewayProfileExtraKey: GatewayLegacyBridgeProfile, GatewayModelExtraKey: "mimo-test",
 			"openai_responses_mode": "force_chat_completions", "openai_passthrough": false, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+	nativeFixtureSealAccount(t, a)
 	route, err := GatewayNativeDescriptor(a)
 	require.NoError(t, err)
 	repo := &gatewayIdentityRepoFixture{row: a}
@@ -75,7 +76,7 @@ func TestGatewayNativeIdentity_ActualForwardBoundary(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
 		c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(payload))
-		_, entered, err := svc.ForwardGatewayRoute(context.Background(), c, r, payload)
+		_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, r, payload)
 		return recorder, entered, err
 	}
 	t.Run("same integer foreign generation denies before forwarding", func(t *testing.T) {
@@ -117,10 +118,10 @@ func TestGatewayNativeIdentity_ActualForwardBoundary(t *testing.T) {
 		require.Contains(t, rec.Body.String(), `"type":"custom_tool_call"`)
 	})
 	t.Run("same native context refuses a second transport", func(t *testing.T) {
-		state := &gatewayNativeDispatch{route: route, account: a}
+		state := &gatewayNativeDispatch{route: route, account: a, scope: nativeFixtureScope(a), custody: nativeFixtureCustody(t)}
 		state.entered.Store(true)
-		request, _ := http.NewRequestWithContext(context.WithValue(context.Background(), gatewayNativeContextKey{}, state), http.MethodPost, upstream.URL+"/v1/chat/completions", bytes.NewReader(body))
-		request.Header.Set("Authorization", "Bearer fixture-key")
+		request, _ := http.NewRequestWithContext(context.WithValue(nativeFixtureContext(t, context.Background()), gatewayNativeContextKey{}, state), http.MethodPost, upstream.URL+"/v1/chat/completions", bytes.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
 		_, err := svc.doOpenAIUpstream(request, "", a)
 		require.ErrorIs(t, err, ErrGatewayNativeReplay)
 		require.EqualValues(t, 1, dispatches.Load())
@@ -145,7 +146,8 @@ func TestGatewayNativeIdentity_ControlAndInertCreation(t *testing.T) {
 		GatewayProfileExtraKey: GatewayMiMoResponsesProfile, GatewayModelExtraKey: "fixture-model",
 		"openai_responses_mode": "force_responses", "openai_passthrough": true,
 		"native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}
-	input.Extra = extra
+	fixture := nativeFixtureSealAccount(t, &Account{Credentials: input.Credentials, Extra: extra})
+	input.Credentials, input.Extra = fixture.Credentials, fixture.Extra
 	a, err := buildAccountForCreate(input, extra)
 	require.NoError(t, err)
 	require.Equal(t, "disabled", a.Status)

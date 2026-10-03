@@ -41,7 +41,7 @@ func TestGatewayNativeFA16LegacyDefaultTier(t *testing.T) {
 						_, _ = io.WriteString(w, nativeRepairText)
 					}))
 					defer upstream.Close()
-					a := nativeReviewStreamAccount(upstream.URL, GatewayLegacyBridgeProfile)
+					a := nativeReviewStreamAccount(t, upstream.URL, GatewayLegacyBridgeProfile)
 					if !private {
 						a = &Account{ID: 23, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: a.Credentials}
 					}
@@ -68,7 +68,7 @@ func TestGatewayNativeFA16LegacyDefaultTier(t *testing.T) {
 					if private {
 						route, descriptorErr := GatewayNativeDescriptor(a)
 						require.NoError(t, descriptorErr)
-						_, entered, err = svc.ForwardGatewayRoute(ctx, c, route, []byte(request))
+						_, entered, err = svc.ForwardGatewayRoute(nativeFixtureContext(t, ctx), c, route, []byte(request))
 					} else {
 						_, err = svc.forwardResponsesViaRawChatCompletions(ctx, c, a, []byte(request))
 					}
