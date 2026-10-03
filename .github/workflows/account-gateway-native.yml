@@ -1,0 +1,64 @@
+name: Account gateway native qualification
+on:
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/account-gateway-native.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: account-gateway-native-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
+        env:
+          POSTGRES_USER: native_contract_test
+          POSTGRES_DB: native_review_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U native_contract_test -d native_review_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis_repository:
+        image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+        ports:
+          - 127.0.0.1:6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis_http:
+        image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+        ports:
+          - 127.0.0.1:6380:6379
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: backend/go.sum
+      - name: Native boundary and ordinary regressions
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_TEST_REDIS_ADDR: 127.0.0.1:6379
+        run: |
+          set -o pipefail
+          go test -tags unit ./internal/service ./internal/repository ./internal/handler/admin -run GatewayNative -skip '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v
+          go test -tags unit ./internal/repository -run '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis-repository.log
+          test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningRealRedis /p' /tmp/native-redis-repository.log | wc -l)" -eq 1
+          go test -tags unit ./internal/service ./internal/handler/admin ./internal/pkg/apicompat -run 'RawChat|Responses.*Chat|Chat.*Responses|CCStream|GatewayNativeReviewOrdinary|BatchDelete' -count=1
+      - name: Actual private HTTP, migrations, PostgreSQL and Redis
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_TEST_PG_DSN: postgres://native_contract_test@127.0.0.1:5432/native_review_ci?sslmode=disable
+          GATEWAY_NATIVE_TEST_HTTP_REDIS_ADDR: 127.0.0.1:6380
+        run: |
+          set -o pipefail
+          go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeReviewPrivateHTTPPostgres$' -count=1 -v -timeout 180s | tee /tmp/native-pg.log
+          test "$(sed -n '/^--- PASS: TestGatewayNativeReviewPrivateHTTPPostgres /p' /tmp/native-pg.log | wc -l)" -eq 1
+          go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeReviewReasoningHTTPRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis.log
+          test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningHTTPRedis /p' /tmp/native-redis.log | wc -l)" -eq 1

@@ -179,6 +179,9 @@ func (a *Account) EffectiveLoadFactor() int {
 }
 
 func (a *Account) IsSchedulable() bool {
+	if HasGatewayNativeIdentity(a) {
+		return false
+	}
 	if !a.IsActive() || !a.Schedulable {
 		return false
 	}

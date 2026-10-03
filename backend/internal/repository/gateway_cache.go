@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -486,4 +487,39 @@ func (c *gatewayCache) ReleaseLiveController(ctx context.Context, callHash, owne
 func (c *gatewayCache) MarkLiveCallClosed(ctx context.Context, callHash string, ttl time.Duration) (bool, error) {
 	result, err := markLiveCallClosedScript.Run(ctx, c.rdb, []string{liveCallKey(callHash)}, int64(ttl.Seconds())).Int()
 	return result == 1, err
+}
+
+// Ordinary reasoningContentPrefix + arbitrary IDs can never address this domain.
+const gatewayNativeReasoningPrefix = "gateway_native_reasoning_v1:"
+
+func gatewayNativeReasoningBackendKey(generation, itemID string) (string, error) {
+	id, err := uuid.Parse(generation)
+	if err != nil || id == uuid.Nil || id.String() != generation || itemID == "" {
+		return "", service.ErrGatewayNativeIdentity
+	}
+	return gatewayNativeReasoningPrefix + generation + ":" + itemID, nil
+}
+func (c *gatewayCache) SetGatewayNativeReasoningContent(ctx context.Context, generation, itemID, content string, ttl time.Duration) error {
+	key, err := gatewayNativeReasoningBackendKey(generation, itemID)
+	if err != nil {
+		return err
+	}
+	if content == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = reasoningContentDefaultTTL
+	}
+	return c.rdb.Set(ctx, key, content, ttl).Err()
+}
+func (c *gatewayCache) GetGatewayNativeReasoningContent(ctx context.Context, generation, itemID string) (string, error) {
+	key, err := gatewayNativeReasoningBackendKey(generation, itemID)
+	if err != nil {
+		return "", err
+	}
+	content, err := c.rdb.Get(ctx, key).Result()
+	if err == redis.Nil || (err == nil && content == "") {
+		return "", service.ErrReasoningContentNotFound
+	}
+	return content, err
 }

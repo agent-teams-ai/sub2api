@@ -119,6 +119,9 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 	skippedShadows := 0
 	exportable := make([]service.Account, 0, len(accounts))
 	for i := range accounts {
+		if service.HasGatewayNativeIdentity(&accounts[i]) {
+			continue
+		}
 		if accounts[i].IsCredentialShadow() {
 			skippedShadows++
 			continue

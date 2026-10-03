@@ -19,6 +19,9 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	if HasGatewayNativeIdentity(account) && ctx.Value(gatewayNativeContextKey{}) == nil {
+		return nil, ErrGatewayNativeIdentity
+	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
