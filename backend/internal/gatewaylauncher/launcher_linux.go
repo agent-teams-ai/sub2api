@@ -77,24 +77,24 @@ func checkEngine(path string) error {
 			continue
 		}
 		next, e := syscall.Openat(int(d.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
-		d.Close()
+		_ = d.Close()
 		if e != nil {
 			return ErrUnsafe
 		}
 		d = os.NewFile(uintptr(next), "engine-parent")
 		s, e := statFD(d)
 		if e != nil || s.Uid != 0 || s.Mode&0022 != 0 {
-			d.Close()
+			_ = d.Close()
 			return ErrUnsafe
 		}
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	n, err := syscall.Openat(int(d.Fd()), filepath.Base(path), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return ErrStart
 	}
 	f := os.NewFile(uintptr(n), "engine-image")
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	s, err := statFD(f)
 	if err != nil || s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFREG || s.Mode&0022 != 0 || s.Mode&0111 == 0 || s.Mode&06000 != 0 || s.Nlink != 1 {
 		return ErrUnsafe
@@ -211,8 +211,8 @@ func Start(config Config) (*Launcher, error) {
 	}
 	gateR, gateW, err := os.Pipe()
 	if err != nil {
-		readyR.Close()
-		readyW.Close()
+		_ = readyR.Close()
+		_ = readyW.Close()
 		j.Current.Phase = "start-failed"
 		if e := a.write(j); e != nil {
 			return nil, e
@@ -231,11 +231,11 @@ func Start(config Config) (*Launcher, error) {
 	// on child FD 3. No reopen and no independently acquired child lock.
 	cmd.ExtraFiles = []*os.File{a.lock, readyW, gateR}
 	err = cmd.Start()
-	readyW.Close()
-	gateR.Close()
+	_ = readyW.Close()
+	_ = gateR.Close()
 	if err != nil {
-		readyR.Close()
-		gateW.Close()
+		_ = readyR.Close()
+		_ = gateW.Close()
 		j.Current.Phase = "start-failed"
 		if e := a.write(j); e != nil {
 			return nil, e
@@ -260,7 +260,7 @@ func Start(config Config) (*Launcher, error) {
 		l.mu.Unlock()
 		close(l.readyDone)
 	}()
-	defer gateW.Close()
+	defer func() { _ = gateW.Close() }()
 	if err != nil || !fullBinding(b) {
 		return l, ErrEvidence
 	}
@@ -346,14 +346,14 @@ func (l *Launcher) Wait(ctx context.Context) (Receipt, error) {
 	if !fullBinding(l.binding) {
 		return Receipt{}, ErrEvidence
 	}
-	l.readyRead.Close()
+	_ = l.readyRead.Close()
 	if err := l.a.checkLock(); err != nil {
 		return Receipt{}, err
 	}
 	if l.a.lock != nil {
 		// Child exit is observed. Drop our reference and try a NEW description:
 		// flock on the original description cannot detect retained duplicates.
-		l.a.lock.Close()
+		_ = l.a.lock.Close()
 		l.a.lock = nil
 	}
 	if err := l.a.acquire(false); err != nil {
@@ -429,7 +429,7 @@ func ReadReceipt(c AuthorityConfig, expected Binding) (Receipt, error) {
 		return Receipt{}, err
 	}
 	s, err := statFD(f)
-	f.Close()
+	_ = f.Close()
 	if err != nil {
 		return Receipt{}, ErrUnsafe
 	}

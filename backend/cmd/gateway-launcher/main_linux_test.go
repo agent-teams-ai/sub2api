@@ -17,13 +17,13 @@ func TestParseErrorDoesNotEchoArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	original := os.Stderr
 	os.Stderr = w
-	defer func() { os.Stderr = original; w.Close() }()
+	defer func() { os.Stderr = original; _ = w.Close() }()
 	marker := "SYNTHETIC-ARGV-DO-NOT-PRINT"
 	code := run([]string{"-unknown=" + marker})
-	w.Close()
+	_ = w.Close()
 	output, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)

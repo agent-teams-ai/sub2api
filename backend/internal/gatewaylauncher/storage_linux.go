@@ -105,14 +105,14 @@ func openAuthority(path string) (*authority, error) {
 		prefix += "/" + part
 		next, e := syscall.Openat(int(d.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		if e != nil {
-			d.Close()
+			_ = d.Close()
 			return nil, ErrUnsafe
 		}
-		d.Close()
+		_ = d.Close()
 		d = os.NewFile(uintptr(next), "protected-directory")
 		s, e := statFD(d)
 		if e != nil || s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFDIR || s.Mode&0022 != 0 || (prefix == path && s.Mode&0777 != 0700) {
-			d.Close()
+			_ = d.Close()
 			return nil, ErrUnsafe
 		}
 	}
@@ -128,7 +128,7 @@ func (a *authority) openFile(name string, flags int) (*os.File, error) {
 	f := os.NewFile(uintptr(fd), "protected-record")
 	s, err := statFD(f)
 	if err != nil || !validFile(s) {
-		f.Close()
+		_ = f.Close()
 		return nil, ErrUnsafe
 	}
 	return f, nil
@@ -139,7 +139,7 @@ func (a *authority) checkDirectory() error {
 	if err != nil {
 		return err
 	}
-	defer b.dir.Close()
+	defer func() { _ = b.dir.Close() }()
 	s, err := statFD(a.dir)
 	t, e := statFD(b.dir)
 	if err != nil || e != nil || s.Dev != t.Dev || s.Ino != t.Ino {
@@ -156,7 +156,7 @@ func (a *authority) checkLock() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	s, err := statFD(f)
 	if err != nil || uint64(s.Dev) != a.device || s.Ino != a.inode {
 		return ErrBinding
@@ -176,7 +176,7 @@ func (a *authority) acquire(create bool) error {
 		return err
 	}
 	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
+		_ = f.Close()
 		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
 			return ErrBusy
 		}
@@ -184,13 +184,13 @@ func (a *authority) acquire(create bool) error {
 	}
 	s, err := statFD(f)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return ErrUnsafe
 	}
 	a.lock = f
 	a.device, a.inode = uint64(s.Dev), s.Ino
 	if err = a.checkLock(); err != nil {
-		f.Close()
+		_ = f.Close()
 		a.lock = nil
 		return err
 	}
@@ -199,7 +199,7 @@ func (a *authority) acquire(create bool) error {
 		err = a.dir.Sync()
 	}
 	if err != nil {
-		a.lock.Close()
+		_ = a.lock.Close()
 		a.lock = nil
 		return ErrStorage
 	}
@@ -210,11 +210,11 @@ func (a *authority) close() {
 	// Closing our reference is safe: the child's inherited reference shares
 	// this open description. NEVER call LOCK_UN, truncate or unlink the lock.
 	if a.lock != nil {
-		a.lock.Close()
+		_ = a.lock.Close()
 		a.lock = nil
 	}
 	if a.dir != nil {
-		a.dir.Close()
+		_ = a.dir.Close()
 		a.dir = nil
 	}
 }
@@ -229,7 +229,7 @@ func (a *authority) read() (journal, bool, error) {
 		return j, false, ErrUnsafe
 	}
 	f := os.NewFile(uintptr(fd), "protected-record")
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	s, err := statFD(f)
 	if err != nil || !validFile(s) || s.Size > maxJournalBytes {
 		return j, false, ErrUnsafe
@@ -280,7 +280,8 @@ func (a *authority) write(j journal) error {
 	if err != nil {
 		return err
 	}
-	defer syscall.Unlinkat(int(a.dir.Fd()), name)
+	// Failed cleanup retains the bounded staging slot and denies later publication.
+	defer func() { _ = syscall.Unlinkat(int(a.dir.Fd()), name) }()
 	_, err = f.Write(data)
 	if err == nil {
 		err = f.Sync()

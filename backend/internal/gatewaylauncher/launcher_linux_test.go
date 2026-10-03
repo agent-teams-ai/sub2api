@@ -38,7 +38,11 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Skip("NOT_RUN: cannot create isolated /run fixture")
 	}
-	t.Cleanup(func() { os.RemoveAll(root) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Error(err)
+		}
+	})
 	if err = os.Chmod(root, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +65,7 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	image := filepath.Join(root, "synthetic-engine")
 	w, err := os.OpenFile(image, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0755)
 	if err != nil {
@@ -110,7 +114,7 @@ func trackLauncher(t *testing.T, l *Launcher) {
 		select {
 		case <-l.done:
 		default:
-			l.cmd.Process.Kill()
+			_ = l.cmd.Process.Kill()
 		}
 		ctx, cancel := deadline(t)
 		defer cancel()
@@ -120,7 +124,7 @@ func trackLauncher(t *testing.T, l *Launcher) {
 			t.Error("synthetic child cleanup unobserved")
 			return
 		}
-		l.Wait(ctx)
+		_, _ = l.Wait(ctx)
 		l.mu.Lock()
 		l.a.close()
 		l.mu.Unlock()
@@ -169,7 +173,7 @@ func probeLock(t *testing.T, c Config, busy bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if busy {
 		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
@@ -262,7 +266,7 @@ func TestSyntheticProcess(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err != nil || l.AwaitReady(ctx) != nil {
 			cancel()
-			l.cmd.Process.Kill()
+			_ = l.cmd.Process.Kill()
 			os.Exit(70)
 		}
 		cancel()
@@ -316,7 +320,7 @@ func TestSyntheticProcess(t *testing.T) {
 	gate := os.NewFile(5, "synthetic-gate")
 	var g [1]byte
 	n, err := gate.Read(g[:])
-	gate.Close()
+	_ = gate.Close()
 	if err != nil || n != 1 || g[0] != 'G' {
 		os.Exit(70)
 	}
@@ -328,7 +332,7 @@ func TestSyntheticProcess(t *testing.T) {
 	if _, err = ready.Write([]byte("R")); err != nil {
 		os.Exit(70)
 	}
-	ready.Close()
+	_ = ready.Close()
 	for {
 		if _, err = os.Stat(filepath.Join(root, "exchange", "stop")); err == nil {
 			os.Exit(0)
@@ -380,8 +384,8 @@ func runSupervisor(t *testing.T, f fixture, mode, result string) *exec.Cmd {
 	}
 	t.Cleanup(func() {
 		if p.ProcessState == nil {
-			p.Process.Kill()
-			p.Wait()
+			_ = p.Process.Kill()
+			_ = p.Wait()
 		}
 	})
 	return p
@@ -410,7 +414,7 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 	t.Cleanup(func() {
 		n, state, err := birth(old.Binding.PID)
 		if err == nil && n == old.Binding.BirthTicks && state != 'Z' {
-			syscall.Kill(old.Binding.PID, syscall.SIGKILL)
+			_ = syscall.Kill(old.Binding.PID, syscall.SIGKILL)
 		}
 	})
 	if err := p.Process.Kill(); err != nil {
@@ -475,7 +479,7 @@ func TestRacingSupervisors(t *testing.T) {
 	}
 	a := exactBinding(t, filepath.Join(f.root, "race-a.json"))
 	b := exactBinding(t, filepath.Join(f.root, "race-b.json"))
-	if !((a.Status == "started" && b.Status == "busy") || (b.Status == "started" && a.Status == "busy")) {
+	if (a.Status != "started" || b.Status != "busy") && (b.Status != "started" || a.Status != "busy") {
 		t.Fatalf("race outcomes: %s/%s", a.Status, b.Status)
 	}
 	winner := a
@@ -485,7 +489,7 @@ func TestRacingSupervisors(t *testing.T) {
 	t.Cleanup(func() {
 		n, state, err := birth(winner.Binding.PID)
 		if err == nil && n == winner.Binding.BirthTicks && state != 'Z' {
-			syscall.Kill(winner.Binding.PID, syscall.SIGKILL)
+			_ = syscall.Kill(winner.Binding.PID, syscall.SIGKILL)
 		}
 	})
 	probeLock(t, f.config, true)
@@ -517,35 +521,67 @@ func TestUnsafeAuthority(t *testing.T) {
 			}
 			switch name {
 			case "directory-mode":
-				os.Chmod(f.config.Authority.Directory, 0755)
+				if err := os.Chmod(f.config.Authority.Directory, 0755); err != nil {
+					t.Fatal(err)
+				}
 			case "directory-owner":
-				os.Chown(f.config.Authority.Directory, int(fixtureUID), int(fixtureGID))
+				if err := os.Chown(f.config.Authority.Directory, int(fixtureUID), int(fixtureGID)); err != nil {
+					t.Fatal(err)
+				}
 			case "directory-symlink":
 				old := f.config.Authority.Directory + "-real"
-				os.Rename(f.config.Authority.Directory, old)
-				os.Symlink(old, f.config.Authority.Directory)
+				if err := os.Rename(f.config.Authority.Directory, old); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(old, f.config.Authority.Directory); err != nil {
+					t.Fatal(err)
+				}
 			case "lock-symlink":
-				os.Remove(lock)
-				os.Symlink("/dev/null", lock)
+				if err := os.Remove(lock); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("/dev/null", lock); err != nil {
+					t.Fatal(err)
+				}
 			case "lock-mode":
-				os.Chmod(lock, 0666)
+				if err := os.Chmod(lock, 0666); err != nil {
+					t.Fatal(err)
+				}
 			case "lock-owner":
-				os.Chown(lock, int(fixtureUID), int(fixtureGID))
+				if err := os.Chown(lock, int(fixtureUID), int(fixtureGID)); err != nil {
+					t.Fatal(err)
+				}
 			case "lock-hardlink":
-				os.Link(lock, filepath.Join(f.config.Authority.Directory, "second-link"))
+				if err := os.Link(lock, filepath.Join(f.config.Authority.Directory, "second-link")); err != nil {
+					t.Fatal(err)
+				}
 			case "metadata-symlink":
-				os.Symlink("/dev/null", metadata)
+				if err := os.Symlink("/dev/null", metadata); err != nil {
+					t.Fatal(err)
+				}
 			case "metadata-mode":
-				os.WriteFile(metadata, []byte("{}"), 0644)
+				if err := os.WriteFile(metadata, []byte("{}"), 0644); err != nil {
+					t.Fatal(err)
+				}
 			case "staging-symlink":
-				os.Symlink("/dev/null", filepath.Join(f.config.Authority.Directory, stagingName))
+				if err := os.Symlink("/dev/null", filepath.Join(f.config.Authority.Directory, stagingName)); err != nil {
+					t.Fatal(err)
+				}
 			case "ancestor-mode":
-				os.Chmod(f.root, 0777)
+				if err := os.Chmod(f.root, 0777); err != nil {
+					t.Fatal(err)
+				}
 			case "engine-symlink":
-				os.Rename(f.config.EnginePath, f.config.EnginePath+"-real")
-				os.Symlink(f.config.EnginePath+"-real", f.config.EnginePath)
+				if err := os.Rename(f.config.EnginePath, f.config.EnginePath+"-real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(f.config.EnginePath+"-real", f.config.EnginePath); err != nil {
+					t.Fatal(err)
+				}
 			case "engine-mode":
-				os.Chmod(f.config.EnginePath, 0777)
+				if err := os.Chmod(f.config.EnginePath, 0777); err != nil {
+					t.Fatal(err)
+				}
 			case "root-engine-uid":
 				f.config.EngineUID = 0
 			case "sentinel-engine-uid":
@@ -656,10 +692,10 @@ func TestFailedDirectoryFsync(t *testing.T) {
 		if l.a.dir == opath {
 			l.a.dir = original
 		}
-		opath.Close()
+		_ = opath.Close()
 	}()
 	if e := opath.Sync(); !errors.Is(e, syscall.EBADF) {
-		opath.Close()
+		_ = opath.Close()
 		t.Fatalf("actual fsync failure not established: %v", e)
 	}
 	l.a.dir = opath
@@ -690,7 +726,7 @@ func TestFailedDirectoryFsync(t *testing.T) {
 		t.Fatalf("failed fsync certified retirement: %v", err)
 	}
 	l.a.dir = original
-	opath.Close()
+	_ = opath.Close()
 	if _, err = l.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -877,8 +913,8 @@ func TestRetainedHolderAfterChildExit(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if p.ProcessState == nil {
-			p.Process.Kill()
-			p.Wait()
+			_ = p.Process.Kill()
+			_ = p.Wait()
 		}
 	})
 	waitFile(t, filepath.Join(f.root, "exchange", "retainer.json"))
