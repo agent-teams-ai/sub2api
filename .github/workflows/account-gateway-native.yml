@@ -119,7 +119,9 @@ jobs:
               --cap-add SYS_ADMIN --cap-add CHECKPOINT_RESTORE --security-opt seccomp=unconfined \
               -v "$fixture_dir/$suite.test:/fixture.test:ro" "$image" \
               /fixture.test -test.v -test.timeout=3m "-test.run=$selection" | tee "$fixture_dir/$suite.log"
-            ! grep -Fq -- '--- SKIP:' "$fixture_dir/$suite.log"
+            if grep -Fq -- '--- SKIP:' "$fixture_dir/$suite.log"; then
+              exit 1
+            fi
             test "$(grep -c '^--- PASS:' "$fixture_dir/$suite.log")" -gt 1
           done
           go test -tags integration -race -c -o "$fixture_dir/pg.test" ./internal/gatewaybootstrap
@@ -131,5 +133,7 @@ jobs:
             -e 'GATEWAY_NATIVE_BOOTSTRAP_PG_DSN=postgres://native_contract_test@127.0.0.1:5432/native_bootstrap_ci?sslmode=disable' \
             "$image" /fixture.test -test.v -test.timeout=3m \
             '-test.run=^TestNativeProtectedReadyEnrollmentAndShutdown$' | tee "$fixture_dir/pg.log"
-          ! grep -Fq -- '--- SKIP:' "$fixture_dir/pg.log"
+          if grep -Fq -- '--- SKIP:' "$fixture_dir/pg.log"; then
+            exit 1
+          fi
           grep -q '^--- PASS: TestNativeProtectedReadyEnrollmentAndShutdown ' "$fixture_dir/pg.log"
