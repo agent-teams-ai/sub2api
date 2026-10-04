@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/gatewaylauncher"
@@ -69,10 +68,14 @@ func TestEmittedBindingPreservesKernelIdentity(t *testing.T) {
 // Use the real command, with no inherited authority/config or fixture hooks.
 func TestClosedDiagnosticPipeReturnsBootstrapFailure(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "account-gateway")
-	build := exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"), "build", "-o", binary, ".")
+	goBinary, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command(goBinary, "build", "-o", binary, ".")
 	build.Env = []string{
 		"GOTOOLCHAIN=local", "GOENV=off", "GOPROXY=off", "GOSUMDB=off", "GOVCS=*:off",
-		"GOFLAGS=-mod=readonly -buildvcs=false", "PATH=" + runtime.GOROOT() + "/bin:/usr/bin:/bin",
+		"GOFLAGS=-mod=readonly -buildvcs=false", "PATH=" + filepath.Dir(goBinary) + ":/usr/bin:/bin",
 	}
 	// Only existing compiler/cache paths; never copy ambient credential env.
 	for _, name := range []string{"HOME", "GOCACHE", "GOMODCACHE", "GOPATH", "TMPDIR"} {
