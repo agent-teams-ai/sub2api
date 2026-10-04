@@ -90,10 +90,14 @@ func (l *GatewayNativeLifetime) Cancel() {
 		return
 	}
 	l.sealed = true
-	body := l.body
+	body, returned := l.body, l.returned
 	l.mu.Unlock()
 	l.cancel()
-	l.interrupt()
+	// An in-flight forward needs its I/O interrupted. After Forward returns,
+	// leave the HTTP writer deadline intact so net/http can finish its framing.
+	if !returned {
+		l.interrupt()
+	}
 	if body != nil {
 		body.startClose()
 	}

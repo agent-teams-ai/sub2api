@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -18,13 +19,14 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
 	}
-	if r.URL.Path != transportsPath && r.URL.Path != transportsPath+"/cancel" && r.URL.Path != transportsPath+"/read" && r.URL.Path != transportsPath+"/ack" {
+	owner := r.URL.Path == transportsPath+"/read-owner" || r.URL.Path == transportsPath+"/cancel-owner" || r.URL.Path == transportsPath+"/ack-owner"
+	if r.URL.Path != transportsPath && r.URL.Path != transportsPath+"/cancel" && r.URL.Path != transportsPath+"/read" && r.URL.Path != transportsPath+"/ack" && !owner {
 		http.NotFound(raw, r)
 		return
 	}
 	peer, err := h.cfg.Authorize(r)
 	if err != nil || !identifier.MatchString(peer.ConsumerID) ||
-		r.URL.Path == transportsPath && peer.Role != "execution" || r.URL.Path != transportsPath && peer.Role != "cleanup" {
+		(r.URL.Path == transportsPath || owner) && peer.Role != "execution" || r.URL.Path != transportsPath && !owner && peer.Role != "cleanup" {
 		http.Error(raw, "private native transport denied", http.StatusForbidden)
 		return
 	}
@@ -39,6 +41,20 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path != transportsPath {
+		if owner {
+			var input ownerClosureRequest
+			if strictJSON(data, &input) != nil {
+				http.Error(raw, "private native transport denied", http.StatusBadRequest)
+				return
+			}
+			result, err := h.ownerClosure(r.Context(), peer.ConsumerID, strings.TrimPrefix(r.URL.Path, transportsPath+"/"), input.Proof)
+			if err != nil {
+				http.Error(raw, "private native transport denied", http.StatusConflict)
+				return
+			}
+			writeReceipt(raw, result)
+			return
+		}
 		var input cleanupRequest
 		if strictJSON(data, &input) != nil {
 			http.Error(raw, "private native transport denied", http.StatusBadRequest)

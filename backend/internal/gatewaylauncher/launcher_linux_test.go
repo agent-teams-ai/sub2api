@@ -4,6 +4,8 @@ package gatewaylauncher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -377,6 +379,31 @@ func TestSyntheticProcess(t *testing.T) {
 	if err != nil || n != 1 || g[0] != 'G' {
 		os.Exit(70)
 	}
+	if mode == "bootstrap" {
+		// Parent closes its original and replaces the pathname after Start,
+		// before this real child reads the captured description.
+		for {
+			if _, err := os.Stat(filepath.Join(root, "exchange", "read-bootstrap")); err == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		file := os.NewFile(6, "synthetic-bootstrap")
+		var st syscall.Stat_t
+		flags, flagErr := unix.FcntlInt(6, unix.F_GETFL, 0)
+		fdflags, fdErr := unix.FcntlInt(6, unix.F_GETFD, 0)
+		if syscall.Fstat(6, &st) != nil || flagErr != nil || fdErr != nil || flags&unix.O_ACCMODE != unix.O_RDONLY || fdflags&unix.FD_CLOEXEC != 0 || st.Uid != 0 || st.Mode&0777 != 0600 {
+			os.Exit(70)
+		}
+		data, err := io.ReadAll(io.NewSectionReader(file, 0, 65537))
+		if err != nil || len(data) > 65536 {
+			os.Exit(70)
+		}
+		_, writeErr := file.Write([]byte("fixture-write-denied"))
+		_ = file.Close()
+		hash := sha256.Sum256(data)
+		writeSynthetic(filepath.Join(root, "exchange", "bootstrap.json"), map[string]any{"sha256": hex.EncodeToString(hash[:]), "readonly": writeErr != nil, "nonCloexec": fdflags == 0})
+	}
 	writeSynthetic(filepath.Join(root, "exchange", "engine.json"), engineReport{
 		uint64(st.Dev), st.Ino, fdFlags, accessMode & syscall.O_ACCMODE, shared,
 		os.IsPermission(metadataErr), os.Geteuid(), os.Getegid(), groups, os.Getenv("SYNTHETIC_VALUE"), os.Getenv("GATEWAY_LAUNCHER_ENGINE_INCARNATION"),
@@ -391,6 +418,134 @@ func TestSyntheticProcess(t *testing.T) {
 			os.Exit(0)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestBootstrapDescriptorCapturedForRealChild(t *testing.T) {
+	f := newFixture(t)
+	c := fixtureConfig(f.root, "bootstrap")
+	path := filepath.Join(f.root, "protected", "bootstrap.json")
+	original := []byte(`{"fixture":"synthetic-config-never-in-receipt"}`)
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	c.BootstrapFile = file
+	l, err := Start(c)
+	trackLauncher(t, l)
+	if err != nil || l == nil {
+		t.Fatal("bootstrap exec failed", err)
+	}
+	// The captured file, rather than the caller's numeric FD/path/offset, is
+	// authoritative. A replaced path has different synthetic configuration.
+	if _, err = file.Seek(int64(len(original)), io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(path, path+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte(`{"fixture":"replacement"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = replacement.Close() }()
+	if err = os.WriteFile(filepath.Join(f.root, "exchange", "read-bootstrap"), []byte("go"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var observed struct {
+		SHA256     string `json:"sha256"`
+		Readonly   bool   `json:"readonly"`
+		NonCloexec bool   `json:"nonCloexec"`
+	}
+	if json.Unmarshal(waitFile(t, filepath.Join(f.root, "exchange", "bootstrap.json")), &observed) != nil {
+		t.Fatal("missing child config read")
+	}
+	hash := sha256.Sum256(original)
+	if observed.SHA256 != hex.EncodeToString(hash[:]) || !observed.Readonly || !observed.NonCloexec {
+		t.Fatal("captured readonly FD 6 changed")
+	}
+	ctx, cancel := deadline(t)
+	defer cancel()
+	if l.AwaitReady(ctx) != nil {
+		t.Fatal("bootstrap readiness failed")
+	}
+	probeLock(t, c, true)
+	stopEngine(t, f.root)
+	receipt, err := l.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(receipt)
+	journal, err := os.ReadFile(filepath.Join(c.Authority.Directory, journalName))
+	if err != nil || strings.Contains(string(encoded), "synthetic-config-never-in-receipt") || strings.Contains(string(journal), "synthetic-config-never-in-receipt") {
+		t.Fatal("bootstrap configuration escaped into durable evidence")
+	}
+	probeLock(t, c, false)
+}
+
+func TestBootstrapUnsafeDescriptorDeniedBeforeExec(t *testing.T) {
+	for _, kind := range []string{"writable", "unowned", "permissions", "overcap", "empty", "closed"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newFixture(t)
+			path := filepath.Join(f.root, "protected", "bootstrap.json")
+			data := []byte(`{"fixture":true}`)
+			if kind == "empty" {
+				data = nil
+			}
+			if kind == "overcap" {
+				data = make([]byte, 65537)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "unowned" {
+				if err := os.Chown(path, int(fixtureUID), int(fixtureGID)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "permissions" {
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			flags := os.O_RDONLY
+			if kind == "writable" {
+				flags = os.O_RDWR
+			}
+			file, err := os.OpenFile(path, flags, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = file.Close() }()
+			if kind == "closed" {
+				_ = file.Close()
+			}
+			c := f.config
+			c.BootstrapFile = file
+			l, err := Start(c)
+			trackLauncher(t, l)
+			if l != nil || !errors.Is(err, ErrConfig) {
+				t.Fatal("unsafe bootstrap reached exec", err)
+			}
+			if _, err := os.Stat(filepath.Join(f.root, "exchange", "engine.json")); !os.IsNotExist(err) {
+				t.Fatal("unsafe bootstrap child ran")
+			}
+			if kind != "closed" {
+				if _, err := file.Stat(); err != nil {
+					t.Fatal("Start closed caller-owned file")
+				}
+			}
+		})
 	}
 }
 

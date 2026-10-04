@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -38,6 +40,42 @@ type Config struct {
 	Env        []string
 	EngineUID  uint32
 	EngineGID  uint32
+	// Optional server-only configuration, inherited as FD 6. The caller owns
+	// this file; Start captures a duplicate without closing or reopening it.
+	BootstrapFile *os.File
+}
+
+// Bound the one fixed-purpose bootstrap descriptor before any authority wait.
+// SyscallConn pins the caller's open file while duplicating: concurrent Close
+// cannot turn a recycled numeric FD into captured authority. No pathname lookup.
+func captureBootstrap(f *os.File) (*os.File, error) {
+	if f == nil {
+		return nil, nil
+	}
+	raw, err := f.SyscallConn()
+	if err != nil {
+		return nil, ErrConfig
+	}
+	fd := -1
+	var captureErr error
+	err = raw.Control(func(n uintptr) {
+		fd, captureErr = unix.FcntlInt(n, unix.F_DUPFD_CLOEXEC, 0)
+	})
+	if err != nil || captureErr != nil || fd < 0 {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+		return nil, ErrConfig
+	}
+	owned := os.NewFile(uintptr(fd), "native-bootstrap")
+	s, err := statFD(owned)
+	flags, flagsErr := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil || flagsErr != nil || flags&unix.O_ACCMODE != unix.O_RDONLY || flags&unix.O_PATH != 0 ||
+		s.Uid != 0 || s.Mode&syscall.S_IFMT != syscall.S_IFREG || s.Mode&07777 != 0600 || s.Nlink != 1 || s.Size < 1 || s.Size > 64*1024 {
+		_ = owned.Close()
+		return nil, ErrConfig
+	}
+	return owned, nil
 }
 
 // Launcher retains the parent lock reference until positively observed child
@@ -161,6 +199,11 @@ func snapshot(c Config) (Config, error) {
 	if err := checkEngine(c.EnginePath); err != nil {
 		return Config{}, err
 	}
+	var err error
+	c.BootstrapFile, err = captureBootstrap(c.BootstrapFile)
+	if err != nil {
+		return Config{}, err
+	}
 	return c, nil
 }
 
@@ -172,6 +215,9 @@ func Start(config Config) (*Launcher, error) {
 	c, err := snapshot(config)
 	if err != nil {
 		return nil, err
+	}
+	if c.BootstrapFile != nil {
+		defer func() { _ = c.BootstrapFile.Close() }()
 	}
 	a, err := openAuthority(c.Authority.Directory)
 	if err != nil {
@@ -248,6 +294,9 @@ func Start(config Config) (*Launcher, error) {
 	// ExtraFiles duplicates the SAME open lock description and clears CLOEXEC
 	// on child FD 3. No reopen and no independently acquired child lock.
 	cmd.ExtraFiles = []*os.File{a.lock, readyW, gateR}
+	if c.BootstrapFile != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, c.BootstrapFile)
+	}
 	err = cmd.Start()
 	_ = readyW.Close()
 	_ = gateR.Close()

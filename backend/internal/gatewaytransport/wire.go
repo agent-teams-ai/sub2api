@@ -127,6 +127,11 @@ type cleanupRequest struct {
 	Cleanup CleanupLease `json:"cleanup"`
 }
 
+// Original-owner closure carries no delegated cleanup lease or dispatch input.
+type ownerClosureRequest struct {
+	Proof Proof `json:"proof"`
+}
+
 func parseInstant(s string) (time.Time, error) {
 	if len(s) > 64 || !instant.MatchString(s) || strings.HasPrefix(s, "0000-") {
 		return time.Time{}, errDenied
