@@ -87,3 +87,49 @@ jobs:
           go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeCustodyPrivateAPIPostgres$' -count=1 -v -timeout 180s | tee /tmp/native-custody-api.log
           test "$(sed -n '/^--- PASS: TestGatewayNativeCustodyPrivateAPIPostgres /p' /tmp/native-custody-api.log | wc -l)" -eq 1
           ! grep -Fq -- '--- SKIP:' /tmp/native-custody-api.log
+
+      - name: Protected bootstrap and original transport closure
+        working-directory: backend
+        run: |
+          set -o pipefail
+          fixture_dir="$RUNNER_TEMP/native-bootstrap"
+          mkdir -p "$fixture_dir"
+          image='postgres@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317'
+          go build -o "$fixture_dir/gateway-native" ./cmd/gateway-native
+          go test -tags unit -race ./internal/service -run '^TestNEWTESTNativeLifetime' -count=1 -v | tee "$fixture_dir/lifetime.log"
+          if grep -Fq -- '--- SKIP:' "$fixture_dir/lifetime.log"; then
+            exit 1
+          fi
+          for critical in \
+            TestNEWTESTNativeLifetimeDelayedCancelPreservesCompletedHTTP \
+            TestNEWTESTNativeLifetimeHeldBodyCancel \
+            TestNEWTESTNativeLifetimeRealBodyCloseErrorIsRetained \
+            TestNEWTESTNativeLifetimeBlockedCloseDoesNotBlockCancel \
+            TestNEWTESTNativeLifetimeOvercapAndSealedEntry \
+            TestNEWTESTNativeLifetimeOriginalWriterBlockedWrite \
+            TestNEWTESTNativeLifetimeSecondCallDoesNotReenterHTTP \
+            TestNEWTESTNativeLifetimeActualSSEParser; do
+            test "$(grep -c "^--- PASS: $critical " "$fixture_dir/lifetime.log")" -eq 1
+          done
+          for suite in bootstrap transport launcher; do
+            go test -tags unit -race -c -o "$fixture_dir/$suite.test" "./internal/gateway$suite"
+            selection='.'
+            if [ "$suite" = launcher ]; then selection='^TestBootstrap'; fi
+            docker run --rm --network none --memory 768m --cpus 2 --pids-limit 256 \
+              --cap-add SYS_ADMIN --cap-add CHECKPOINT_RESTORE --security-opt seccomp=unconfined \
+              -v "$fixture_dir/$suite.test:/fixture.test:ro" "$image" \
+              /fixture.test -test.v -test.timeout=3m "-test.run=$selection" | tee "$fixture_dir/$suite.log"
+            ! grep -Fq -- '--- SKIP:' "$fixture_dir/$suite.log"
+            test "$(grep -c '^--- PASS:' "$fixture_dir/$suite.log")" -gt 1
+          done
+          go test -tags integration -race -c -o "$fixture_dir/pg.test" ./internal/gatewaybootstrap
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test native_bootstrap_ci
+          docker run --rm --network "container:${{ job.services.postgres.id }}" \
+            --memory 768m --cpus 2 --pids-limit 256 \
+            --cap-add SYS_ADMIN --cap-add CHECKPOINT_RESTORE --security-opt seccomp=unconfined \
+            -v "$fixture_dir/pg.test:/fixture.test:ro" \
+            -e 'GATEWAY_NATIVE_BOOTSTRAP_PG_DSN=postgres://native_contract_test@127.0.0.1:5432/native_bootstrap_ci?sslmode=disable' \
+            "$image" /fixture.test -test.v -test.timeout=3m \
+            '-test.run=^TestNativeProtectedReadyEnrollmentAndShutdown$' | tee "$fixture_dir/pg.log"
+          ! grep -Fq -- '--- SKIP:' "$fixture_dir/pg.log"
+          grep -q '^--- PASS: TestNativeProtectedReadyEnrollmentAndShutdown ' "$fixture_dir/pg.log"

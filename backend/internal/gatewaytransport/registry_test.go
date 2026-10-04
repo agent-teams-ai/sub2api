@@ -301,7 +301,7 @@ func TestNEWTESTPrivateHTTPConcurrentDuplicatesAndConsumerBodyRejected(t *testin
 				t.Error(err)
 				return
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			_, _ = io.Copy(io.Discard, resp.Body)
 			if resp.StatusCode != 202 {
 				t.Error("duplicate/readback denied", resp.StatusCode)
@@ -318,7 +318,7 @@ func TestNEWTESTPrivateHTTPConcurrentDuplicatesAndConsumerBodyRejected(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 400 || callbacks.Load() != 1 {
 		t.Fatal("body consumer reached callback")
 	}
@@ -401,7 +401,7 @@ func TestNEWTESTConstructorAbsentAuthorityDenied(t *testing.T) {
 	if _, err := New(context.Background(), Config{}); err == nil {
 		t.Fatal("absent private composition accepted")
 	}
-	if _, err := New(nil, Config{}); err == nil {
+	if _, err := New(nil, Config{}); err == nil { //nolint:staticcheck // Deliberately verify rejection of a nil bootstrap context.
 		t.Fatal("nil bootstrap context accepted")
 	}
 }

@@ -9,6 +9,10 @@
 // FD 4. GATEWAY_LAUNCHER_ENGINE_INCARNATION contains the supervisor-generated
 // canonical UUID also persisted in the original binding and retirement receipt.
 // This handshake is local bootstrap readiness, never a provider probe.
+// Optional Config.BootstrapFile is a readonly root-owned 0600 regular file,
+// 1..65536 bytes, captured without pathname reopen and inherited as FD 6.
+// Start owns only its duplicate; the caller retains ownership of its original.
+// Configuration bytes never enter environment, journal or retirement receipt.
 // The engine must run in the foreground, create no surviving descendants, and
 // stop its transport before exiting. Stock sub2api main is NOT this bootstrap.
 //

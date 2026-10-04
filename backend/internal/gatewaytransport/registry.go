@@ -40,9 +40,93 @@ type Config struct {
 	VerifyDispatch                             func(context.Context, string, Proof, time.Time) error
 	AuthorizeCleanup                           func(context.Context, string, Proof, CleanupLease) error
 	AcknowledgeClosure                         func(context.Context, string, Proof, CleanupLease, Receipt) error
+	AuthorizeOwnerClosure                      func(context.Context, string, Proof) error
+	AcknowledgeOwnerClosure                    func(context.Context, string, Proof, Receipt) error
 	MaxEntries                                 int
 	CallbackTimeout, IOTimeout, CleanupTimeout time.Duration
 	EnvelopeBytes, CallbackBytes               int64
+}
+
+// ownerClosure is separate from delegated cleanup. Exact original proof remains
+// closure authority after worker expiry; it is never another dispatch permit.
+// Each call rechecks the optional trusted authority, including idempotent ACKs.
+func (h *Handler) ownerClosure(ctx context.Context, consumer, action string, p Proof) (Receipt, error) {
+	if !p.valid() || h.cfg.AuthorizeOwnerClosure == nil || (action != "read-owner" && action != "cancel-owner" && action != "ack-owner") {
+		return Receipt{}, errDenied
+	}
+	ownerCtx, cancel := context.WithTimeout(ctx, h.cfg.CleanupTimeout)
+	defer cancel()
+	if h.cfg.AuthorizeOwnerClosure(ownerCtx, consumer, p) != nil || ownerCtx.Err() != nil {
+		return Receipt{}, errDenied
+	}
+	key := transportKey{requestKey{consumer, p.ExecutionRef, p.RequestRef}, p.Native}
+	h.mu.Lock()
+	e := h.entries[key]
+	if ownerCtx.Err() != nil || e == nil || e.native != p.Native || e.request.Worker != p.Worker || (e.proof != nil && *e.proof != p) {
+		h.mu.Unlock()
+		return Receipt{}, errDenied
+	}
+	if e.life.Snapshot().Sealed {
+		e.sealed = true
+	}
+	if e.proof == nil {
+		// Only a sealed original lost-ACK reservation can recover its durable
+		// proof. Never set admitted/entered or reopen its cancellation latch.
+		if !e.sealed {
+			h.mu.Unlock()
+			return Receipt{}, errDenied
+		}
+		copy := p
+		e.proof = &copy
+	}
+	h.mu.Unlock()
+	if action == "cancel-owner" {
+		h.seal(e)
+	}
+	r := h.receipt(consumer, e)
+	if action == "ack-owner" {
+		if r.Phase != "closed" || h.cfg.AcknowledgeOwnerClosure == nil ||
+			h.cfg.AcknowledgeOwnerClosure(ownerCtx, consumer, p, r) != nil || ownerCtx.Err() != nil {
+			return Receipt{}, errDenied
+		}
+		h.mu.Lock()
+		e.acknowledged = true
+		h.mu.Unlock()
+		r = h.receipt(consumer, e)
+	}
+	return r, nil
+}
+
+// Stop seals every retained lifetime and waits only for positive local closure.
+// The host closes its listener first. Timeout/error is not a closure receipt.
+func (h *Handler) Stop(ctx context.Context) error {
+	h.mu.Lock()
+	h.stopping = true
+	entries := make([]*reservation, 0, len(h.entries))
+	for _, e := range h.entries {
+		entries = append(entries, e)
+	}
+	h.mu.Unlock()
+	for _, e := range entries {
+		h.seal(e)
+	}
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	defer h.callback.CloseIdleConnections()
+	for {
+		all := true
+		for _, e := range entries {
+			all = all && closed(e.life.Snapshot())
+		}
+		if all {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errDenied
+		case <-tick.C:
+		}
+	}
 }
 
 type requestKey struct{ consumer, execution, request string }
@@ -82,6 +166,7 @@ type Handler struct {
 	mu       sync.Mutex
 	entries  map[transportKey]*reservation
 	requests map[requestKey]transportKey
+	stopping bool
 	callback *http.Client
 }
 
@@ -124,6 +209,9 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	digest := sha256.Sum256(input.Payload)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.stopping {
+		return nil, false, errDenied
+	}
 	if full, exists := h.requests[key]; exists {
 		existing := h.entries[full]
 		if existing == nil {
