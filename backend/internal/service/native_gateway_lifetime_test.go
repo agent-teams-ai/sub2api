@@ -24,6 +24,116 @@ type NEWTESTLifetimeHTTP struct {
 	concurrency atomic.Int64
 }
 
+// Regression: cancellation pauses after sealing, Forward finishes, then the
+// stale cancellation must not truncate net/http's final response framing.
+func TestNEWTESTNativeLifetimeDelayedCancelPreservesCompletedHTTP(t *testing.T) {
+	const terminal = "data: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, terminal)
+	}))
+	defer upstream.Close()
+	var interrupted atomic.Int32
+	observed := make(chan GatewayNativeLifetimeSnapshot, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancelContext := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancelContext()
+		started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		defer func() {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		}()
+		life, err := NewGatewayNativeLifetime(ctx, func() {
+			cancelContext()
+			close(started)
+			<-release
+		}, func() {
+			interrupted.Add(1)
+			if err := http.NewResponseController(w).SetWriteDeadline(time.Now()); err != nil {
+				t.Error(err)
+			}
+		}, 4096)
+		if err != nil || !life.Admit(time.Now().Add(time.Minute)) {
+			t.Error("fixture admission failed")
+			return
+		}
+		var entered atomic.Bool
+		ctx = WithGatewayNativeLifetime(ctx, life)
+		if !gatewayNativeEntered(ctx, &entered) {
+			t.Error("fixture entry failed")
+			return
+		}
+		wrapped, err := NewGatewayNativeLifetimeUpstream(&NEWTESTLifetimeHTTP{client: upstream.Client()})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		resp, err := wrapped.Do(req, "", 1, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, copyErr := io.Copy(w, resp.Body)
+		closeErr := resp.Body.Close()
+		if copyErr != nil || closeErr != nil {
+			t.Error("fixture forwarding or physical Close failed", copyErr, closeErr)
+			return
+		}
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Error("fixture HTTP flush failed", err)
+			return
+		}
+		life.success()
+		go func() { life.Cancel(); close(done) }()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Error("fixture cancellation did not start")
+			return
+		}
+		life.finish()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("fixture cancellation did not return")
+			return
+		}
+		observed <- life.Snapshot()
+	}))
+	defer server.Close()
+	client := *server.Client()
+	client.Timeout = 10 * time.Second
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil || closeErr != nil || string(data) != terminal {
+		t.Fatalf("completed HTTP framing truncated: read=%v close=%v body=%q", readErr, closeErr, data)
+	}
+	if interrupted.Load() != 0 {
+		t.Fatal("completed writer interrupted by delayed cancellation")
+	}
+	select {
+	case s := <-observed:
+		if !s.ContextDone || !s.Sealed || !s.Entered || !s.ForwardingReturned || !s.BodyKnown || !s.BodyClosed || s.CloseFailed || !s.Completed {
+			t.Fatalf("wrong completed closure facts: %+v", s)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completed closure facts not observed")
+	}
+}
+
 func (u *NEWTESTLifetimeHTTP) Do(r *http.Request, _ string, _ int64, concurrency int) (*http.Response, error) {
 	u.concurrency.Store(int64(concurrency))
 	return u.client.Do(r)
@@ -118,7 +228,9 @@ func TestNEWTESTNativeLifetimeRealBodyCloseErrorIsRetained(t *testing.T) {
 	life, _ := NewGatewayNativeLifetime(ctx, cancel, func() {}, 4096)
 	life.attach(resp)
 	life.Cancel()
-	if resp.Body.Close() == nil || resp.Body.Close() == nil {
+	firstCloseErr := resp.Body.Close()
+	secondCloseErr := resp.Body.Close()
+	if firstCloseErr == nil || secondCloseErr == nil {
 		t.Fatal("cached physical close failure lost")
 	}
 	life.finish()

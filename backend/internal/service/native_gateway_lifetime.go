@@ -14,6 +14,7 @@ import (
 // and an interrupt for the ORIGINAL net/http writer, before Gin wraps it.
 type GatewayNativeLifetime struct {
 	mu                                                        sync.Mutex
+	writerMu                                                  sync.Mutex
 	ctx                                                       context.Context
 	cancel                                                    context.CancelFunc
 	interrupt                                                 func()
@@ -90,14 +91,21 @@ func (l *GatewayNativeLifetime) Cancel() {
 		return
 	}
 	l.sealed = true
-	body, returned := l.body, l.returned
+	body := l.body
 	l.mu.Unlock()
 	l.cancel()
 	// An in-flight forward needs its I/O interrupted. After Forward returns,
 	// leave the HTTP writer deadline intact so net/http can finish its framing.
+	// Order the decision AND action with finish, without holding the observer
+	// mutex across the writer callback or waiting for Forward/physical Close.
+	l.writerMu.Lock()
+	l.mu.Lock()
+	returned := l.returned
+	l.mu.Unlock()
 	if !returned {
 		l.interrupt()
 	}
+	l.writerMu.Unlock()
 	if body != nil {
 		body.startClose()
 	}
@@ -108,6 +116,7 @@ func (l *GatewayNativeLifetime) Cancel() {
 func (l *GatewayNativeLifetime) NoForward() { l.finish() }
 
 func (l *GatewayNativeLifetime) finish() {
+	l.writerMu.Lock()
 	l.mu.Lock()
 	l.returned = true
 	if !l.entered {
@@ -115,6 +124,7 @@ func (l *GatewayNativeLifetime) finish() {
 	}
 	stop := l.stop
 	l.mu.Unlock()
+	l.writerMu.Unlock()
 	if stop != nil {
 		stop()
 	}
