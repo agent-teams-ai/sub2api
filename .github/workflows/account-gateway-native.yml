@@ -137,3 +137,18 @@ jobs:
             exit 1
           fi
           grep -q '^--- PASS: TestNativeProtectedReadyEnrollmentAndShutdown ' "$fixture_dir/pg.log"
+
+
+      - name: Foreground native service entry command
+        working-directory: backend
+        run: |
+          set -o pipefail
+          go build -o "$RUNNER_TEMP/account-gateway" ./cmd/account-gateway
+          go vet ./cmd/account-gateway
+          go test ./cmd/account-gateway -count=1 -v | tee "$RUNNER_TEMP/account-gateway-entry.log"
+          if grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/account-gateway-entry.log"; then
+            exit 1
+          fi
+          for critical in TestEmittedBindingPreservesKernelIdentity TestClosedDiagnosticPipeReturnsBootstrapFailure; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/account-gateway-entry.log")" -eq 1
+          done
