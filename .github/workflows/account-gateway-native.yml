@@ -97,7 +97,9 @@ jobs:
           image='postgres@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317'
           go build -o "$fixture_dir/gateway-native" ./cmd/gateway-native
           go test -tags unit -race ./internal/service -run '^TestNEWTESTNativeLifetime' -count=1 -v | tee "$fixture_dir/lifetime.log"
-          ! grep -Fq -- '--- SKIP:' "$fixture_dir/lifetime.log"
+          if grep -Fq -- '--- SKIP:' "$fixture_dir/lifetime.log"; then
+            exit 1
+          fi
           for critical in \
             TestNEWTESTNativeLifetimeDelayedCancelPreservesCompletedHTTP \
             TestNEWTESTNativeLifetimeHeldBodyCancel \
