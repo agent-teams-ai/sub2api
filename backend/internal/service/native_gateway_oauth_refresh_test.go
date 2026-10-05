@@ -23,6 +23,7 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	var mode atomic.Int32
 	var tokenCalls, jwksCalls, destinationCalls atomic.Int32
+	var receivedHeaders atomic.Bool
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { destinationCalls.Add(1) }))
 	defer destination.Close()
 	refresh := gatewayOAuthGuardFixtureOpaque()
@@ -67,6 +68,13 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 			delete(response, "refresh_token")
 		case 8:
 			response["expires_in"] = "malformed"
+		case 9:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"access_token":`))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
 		case 7:
 			_, _ = w.Write([]byte(`{"access_token":"a","Access_token":"b"}`))
 			return
@@ -107,7 +115,7 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mode int32
-	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"body deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}} {
+	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"header deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}} {
 		t.Run(tc.name, func(t *testing.T) {
 			mode.Store(tc.mode)
 			budget := 100 * time.Millisecond
@@ -131,6 +139,57 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	}
 	require.Equal(t, int32(9), tokenCalls.Load())
 	require.Equal(t, int32(2), jwksCalls.Load(), "only complete ID tokens require fixed trusted verification")
+	// These scenarios observe service/repository context contracts using actual
+	// signed HTTP and custody. Durable SQL publication is proved only by real PG.
+	for _, tc := range []struct {
+		name     string
+		mode     int32
+		deadline time.Duration
+	}{{"completion context expires at prepared deadline", 0, 400 * time.Millisecond}, {"post-header body stall retains unknown old custody", 9, 8 * time.Second}} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode.Store(tc.mode)
+			receivedHeaders.Store(false)
+			scope := GatewayNativeCredentialScope{Consumer: "consumer", Owner: "owner", Account: "account", Generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Purpose: GatewayOAuthBundlePurpose}
+			ctx, err := WithGatewayNativeConsumer(context.Background(), scope.Consumer)
+			require.NoError(t, err)
+			ctx, err = WithGatewayNativeOAuthOwner(ctx, scope.Owner)
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(ctx, 9*time.Second)
+			defer cancel()
+			old := GatewayNativeOAuthBundle{AccessToken: gatewayOAuthGuardFixtureOpaque(), RefreshToken: refresh, IDToken: goodID, SensitiveMetadata: json.RawMessage(`{"private":"old-custody"}`)}
+			envelope, err := custody.SealOAuthBundle(scope, old)
+			require.NoError(t, err)
+			in := GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 1, CreatedAt: time.Now().Truncate(time.Microsecond), ExpectedVersion: 1, Operation: "bounded-refresh", Intent: "rotate"}
+			observer := &refreshContextObserver{prepared: GatewayNativeOAuthRefreshPrepared{Outcome: GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "prepared"}, Fence: 1, Deadline: time.Now().Add(tc.deadline), Claimed: true, Envelope: envelope, Issuer: GatewayOAuthIssuer, Subject: "reserved-subject"}}
+			refreshService, err := NewGatewayNativeOAuthRefresh(observer, custody, verifier, &refreshHeaderObserver{RoundTripper: transport, received: &receivedHeaders})
+			require.NoError(t, err)
+			beforeCalls := tokenCalls.Load()
+			start := time.Now()
+			out, err := refreshService.Refresh(ctx, in)
+			require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+			require.Equal(t, "unknown", out.State)
+			require.True(t, receivedHeaders.Load(), "actual HTTP response headers precede stalled work")
+			require.True(t, observer.cleanupLive, "ambiguity recording has its own bounded live context")
+			if tc.mode == 0 {
+				require.True(t, observer.completionCalled, "signed response must reach completion")
+				require.True(t, observer.completionDeadline.Equal(observer.prepared.Deadline))
+				require.Less(t, time.Since(start), 2*time.Second)
+			} else {
+				require.False(t, observer.completionCalled, "partial body cannot publish")
+				require.GreaterOrEqual(t, time.Since(start), 4*time.Second)
+				require.Less(t, time.Since(start), 6*time.Second, "fixed production timeout bounds post-header body reads")
+			}
+			require.Equal(t, envelope, observer.prepared.Envelope)
+			retained, err := custody.openOAuthVersion(observer.prepared.Envelope, scope, 1)
+			require.NoError(t, err)
+			require.Equal(t, old, retained)
+			replayed, err := refreshService.Refresh(ctx, in)
+			require.NoError(t, err)
+			require.Equal(t, out, replayed)
+			require.Equal(t, beforeCalls+1, tokenCalls.Load(), "unknown never re-enters provider")
+			require.Zero(t, destinationCalls.Load())
+		})
+	}
 	// Negative control: dropping the production redirect policy really contacts
 	// the destination before the eventual fixed-origin check rejects its response.
 	mode.Store(3)
@@ -138,6 +197,49 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	_, err = s.exchange(context.Background(), refresh, GatewayOAuthIssuer, "reserved-subject")
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 	require.Equal(t, int32(1), destinationCalls.Load())
+}
+
+type refreshHeaderObserver struct {
+	http.RoundTripper
+	received *atomic.Bool
+}
+
+func (o *refreshHeaderObserver) RoundTrip(r *http.Request) (*http.Response, error) {
+	response, err := o.RoundTripper.RoundTrip(r)
+	if err == nil && r.URL.String() == openai.TokenURL {
+		o.received.Store(true)
+	}
+	return response, err
+}
+
+// A context observer holds completion until cancellation; it does not emulate
+// SQL publication, version validation or transaction expiry.
+type refreshContextObserver struct {
+	prepared           GatewayNativeOAuthRefreshPrepared
+	completionCalled   bool
+	completionDeadline time.Time
+	cleanupLive        bool
+}
+
+func (o *refreshContextObserver) PrepareGatewayNativeOAuthRefresh(context.Context, GatewayNativeOAuthRefreshIntent) (GatewayNativeOAuthRefreshPrepared, error) {
+	return o.prepared, nil
+}
+func (o *refreshContextObserver) EnterGatewayNativeOAuthRefresh(context.Context, GatewayNativeOAuthRefreshIntent, int64) (bool, error) {
+	o.prepared.Claimed = false
+	o.prepared.Outcome.State = "entered"
+	return true, nil
+}
+func (o *refreshContextObserver) CompleteGatewayNativeOAuthRefresh(ctx context.Context, _ GatewayNativeOAuthRefreshIntent, _ int64, _ string) (GatewayNativeOAuthRefreshOutcome, error) {
+	o.completionCalled = true
+	o.completionDeadline, _ = ctx.Deadline()
+	<-ctx.Done()
+	return GatewayNativeOAuthRefreshOutcome{}, ctx.Err()
+}
+func (o *refreshContextObserver) UnknownGatewayNativeOAuthRefresh(ctx context.Context, _ GatewayNativeOAuthRefreshIntent, _ int64) error {
+	_, bounded := ctx.Deadline()
+	o.cleanupLive = ctx.Err() == nil && bounded
+	o.prepared.Outcome.State = "unknown"
+	return nil
 }
 
 // This sentinel has no successful behavior and prevents a transport-only test

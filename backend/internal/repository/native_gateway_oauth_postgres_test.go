@@ -24,7 +24,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -736,6 +736,89 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	for _, secret := range []string{originalBundle.AccessToken, originalBundle.RefreshToken, originalBundle.IDToken, "f2-sensitive-metadata"} {
 		require.NotContains(t, string(dump), secret)
 	}
+	t.Run("publication held past entered deadline rolls back at commit", func(t *testing.T) {
+		lateVerifier, lateTransport, lateBundleFor := oauthPGRefreshFixture(t, func(w http.ResponseWriter, r *http.Request, bundleFor func(string) service.GatewayNativeOAuthBundle) {
+			b := bundleFor("subject-late-commit")
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": b.AccessToken, "refresh_token": b.RefreshToken, "id_token": b.IDToken, "token_type": "Bearer", "expires_in": 3600})
+		})
+		lateEnrollment, err := service.NewGatewayNativeOAuthEnrollment(lateVerifier, custody, repo, key)
+		require.NoError(t, err)
+		lateCtx, lateScope := oauthPGScope(t, "consumer-f2", "owner-f2", "late-commit-account")
+		staged, err := lateEnrollment.Stage(lateCtx, lateScope, "stage-late-commit", lateBundleFor("subject-late-commit"))
+		require.NoError(t, err)
+		var created time.Time
+		var oldCredentials []byte
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT created_at,credentials FROM accounts WHERE id=$1`, staged.AccountID).Scan(&created, &oldCredentials))
+		late := service.GatewayNativeOAuthRefreshIntent{Scope: lateScope, AccountID: staged.AccountID, CreatedAt: created, ExpectedVersion: 1, Operation: "refresh-late-commit", Intent: "rotate"}
+		held := &oauthRefreshHeldCommit{GatewayNativeOAuthRefreshRepository: refreshRepo, db: db, t: t}
+		lateRefresh, err := service.NewGatewayNativeOAuthRefresh(held, custody, lateVerifier, lateTransport)
+		require.NoError(t, err)
+		out, err := lateRefresh.Refresh(lateCtx, late)
+		require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+		require.Equal(t, "unknown", out.State)
+		require.True(t, held.validPublicationBeforeDeadline)
+		var commitErr *pq.Error
+		require.ErrorAs(t, held.commitErr, &commitErr)
+		require.Equal(t, pq.ErrorCode("23514"), commitErr.Code)
+		require.Equal(t, "refresh publication deadline expired", commitErr.Message)
+		var retained []byte
+		var version int64
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials,gateway_oauth_credential_version(credentials) FROM accounts WHERE id=$1`, staged.AccountID).Scan(&retained, &version))
+		require.JSONEq(t, string(oldCredentials), string(retained))
+		require.Equal(t, int64(1), version)
+		// A safe returned status alone cannot prove the completion journal rolled
+		// back. Read the durable attempt after service recovery independently.
+		var state string
+		var resultVersion sql.NullInt64
+		var publicationXID sql.NullString
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT state,result_version,publication_xid::text
+ FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2`, late.Scope.Consumer, late.Operation).Scan(&state, &resultVersion, &publicationXID))
+		require.Equal(t, "unknown", state)
+		require.False(t, resultVersion.Valid)
+		require.False(t, publicationXID.Valid)
+	})
+}
+
+// Deliberately defeat caller cancellation to exercise the SQL commit guard:
+// both valid UPDATEs execute while authority is live, then the transaction holds.
+// The envelope comes from the actual signed transport and versioned custody.
+type oauthRefreshHeldCommit struct {
+	service.GatewayNativeOAuthRefreshRepository
+	db                             *sql.DB
+	t                              *testing.T
+	validPublicationBeforeDeadline bool
+	commitErr                      error
+}
+
+func (r *oauthRefreshHeldCommit) CompleteGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64, envelope string) (service.GatewayNativeOAuthRefreshOutcome, error) {
+	r.t.Helper()
+	holdCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	tx, err := r.db.BeginTx(holdCtx, nil)
+	require.NoError(r.t, err)
+	defer tx.Rollback()
+	var id int64
+	require.NoError(r.t, tx.QueryRowContext(holdCtx, `SELECT id FROM accounts WHERE id=$1 AND created_at=$2 FOR UPDATE`, in.AccountID, in.CreatedAt).Scan(&id))
+	var deadline time.Time
+	require.NoError(r.t, tx.QueryRowContext(holdCtx, `UPDATE gateway_oauth_refresh_attempts SET state='completed',result_version=expected_version+1,publication_xid=pg_current_xact_id()
+ WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state='entered' AND deadline>clock_timestamp() RETURNING deadline`, in.Scope.Consumer, in.Operation, fence).Scan(&deadline))
+	credentials, err := json.Marshal(map[string]string{"oauth_bundle": envelope, "credential_version": fmt.Sprint(in.ExpectedVersion + 1)})
+	require.NoError(r.t, err)
+	result, err := tx.ExecContext(holdCtx, `UPDATE accounts SET credentials=$1::jsonb,updated_at=clock_timestamp()
+ WHERE id=$2 AND created_at=$3 AND gateway_oauth_credential_version(credentials)=$4`, string(credentials), in.AccountID, in.CreatedAt, in.ExpectedVersion)
+	require.NoError(r.t, err)
+	rows, err := result.RowsAffected()
+	require.NoError(r.t, err)
+	require.Equal(r.t, int64(1), rows)
+	require.NoError(r.t, tx.QueryRowContext(holdCtx, `SELECT clock_timestamp()<$1`, deadline).Scan(&r.validPublicationBeforeDeadline))
+	require.True(r.t, r.validPublicationBeforeDeadline)
+	_, err = tx.ExecContext(holdCtx, `SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM ($1::timestamptz-clock_timestamp())))+0.1)`, deadline)
+	require.NoError(r.t, err)
+	var expired bool
+	require.NoError(r.t, tx.QueryRowContext(holdCtx, `SELECT clock_timestamp()>=$1`, deadline).Scan(&expired))
+	require.True(r.t, expired)
+	r.commitErr = tx.Commit()
+	return service.GatewayNativeOAuthRefreshOutcome{}, r.commitErr
 }
 
 type oauthRefreshLostACK struct {

@@ -110,7 +110,7 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	}
 	// SQL publishes whole ciphertext and version atomically; a lost ACK is read
 	// back by the same operation without decrypting or entering a second time.
-	outcome, err := s.repository.CompleteGatewayNativeOAuthRefresh(ctx, in, prepared.Fence, envelope)
+	outcome, err := s.repository.CompleteGatewayNativeOAuthRefresh(callCtx, in, prepared.Fence, envelope)
 	if err != nil {
 		readCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		readback, readErr := s.repository.PrepareGatewayNativeOAuthRefresh(readCtx, in)

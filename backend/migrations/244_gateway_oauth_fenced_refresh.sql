@@ -97,6 +97,11 @@ CREATE TRIGGER gateway_oauth_refresh_attempt_guard BEFORE INSERT OR UPDATE OR DE
 -- guard below requires this transaction's exact completed fenced attempt.
 CREATE FUNCTION public.gateway_oauth_refresh_publication_complete() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ -- UPDATE-time checks cannot authorize a transaction held beyond its entered
+ -- deadline. Recheck at the deferred publication boundary before commit.
+ IF NEW.state='completed' AND NEW.deadline<=clock_timestamp() THEN
+  RAISE EXCEPTION 'refresh publication deadline expired' USING ERRCODE='23514';
+ END IF;
  IF NEW.state='completed' AND NOT EXISTS(SELECT 1 FROM accounts a
   WHERE a.id=NEW.account_id AND a.created_at=NEW.native_created_at
    AND public.gateway_oauth_credential_version(a.credentials)>=NEW.result_version) THEN
