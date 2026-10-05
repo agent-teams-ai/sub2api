@@ -6,13 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 // Reservation and inert native birth are one atomic transaction. PostgreSQL's
 // unique principal constraint serializes cross-consumer/owner contenders. No
-// reconnect, replacement, refresh writer or inferred owner is implemented.
+// reconnect, promotion or inferred owner is implemented. F2 refresh uses a separate ledger.
 func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (out service.GatewayNativeOAuthOutcome, retErr error) {
 	deny := func() (service.GatewayNativeOAuthOutcome, error) {
 		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayNativeIdentity
@@ -160,3 +162,210 @@ func (r *accountRepository) ReplayGatewayNativeOAuth(ctx context.Context, s serv
 	}
 	return out, true, nil
 }
+
+// The native SQL repository is the sole F2 writer. All mutations lock the same
+// physical account first, then its attempt; no reservation spine is updated.
+func (r *accountRepository) gatewayRefreshTx(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent) (*sql.Tx, error) {
+	if !in.Authorized(ctx) {
+		return nil, service.ErrGatewayNativeIdentity
+	}
+	db, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return nil, service.ErrGatewayNativeIdentity
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, service.ErrGatewayNativeIdentity
+	}
+	var id int64
+	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, in.AccountID).Scan(&id) != nil {
+		tx.Rollback()
+		return nil, service.ErrGatewayNativeIdentity
+	}
+	return tx, nil
+}
+func gatewayRefreshRead(ctx context.Context, tx *sql.Tx, in service.GatewayNativeOAuthRefreshIntent) (service.GatewayNativeOAuthRefreshPrepared, bool, error) {
+	var out service.GatewayNativeOAuthRefreshPrepared
+	var id, version int64
+	var birth time.Time
+	var owner, account, generation, intent string
+	err := tx.QueryRowContext(ctx, `SELECT account_id,native_created_at,owner_ref,account_ref,generation,intent_ref,
+ expected_version,fence,state,deadline,COALESCE(result_version,0),operation_ref
+ FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2 FOR UPDATE`, in.Scope.Consumer, in.Operation).
+		Scan(&id, &birth, &owner, &account, &generation, &intent, &version, &out.Fence, &out.Outcome.State, &out.Deadline, &out.Outcome.Version, &out.Outcome.Operation)
+	if err == sql.ErrNoRows {
+		return out, false, nil
+	}
+	if err != nil {
+		return out, false, service.ErrGatewayNativeIdentity
+	}
+	if id != in.AccountID || !birth.Equal(in.CreatedAt) || owner != in.Scope.Owner || account != in.Scope.Account || generation != in.Scope.Generation || intent != in.Intent || version != in.ExpectedVersion {
+		return service.GatewayNativeOAuthRefreshPrepared{}, false, service.ErrGatewayOAuthConflict
+	}
+	return out, true, nil
+}
+func (r *accountRepository) PrepareGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent) (service.GatewayNativeOAuthRefreshPrepared, error) {
+	var empty service.GatewayNativeOAuthRefreshPrepared
+	tx, err := r.gatewayRefreshTx(ctx, in)
+	if err != nil {
+		return empty, err
+	}
+	defer tx.Rollback()
+	out, found, err := gatewayRefreshRead(ctx, tx, in)
+	if err != nil {
+		return empty, err
+	}
+	if found {
+		// SQL time decides expiry. ENTERED is terminal for replay even if the engine
+		// died before the provider call; absence of an ACK never proves non-entry.
+		if out.Outcome.State == "entered" {
+			_, err = tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='unknown'
+    WHERE consumer=$1 AND operation_ref=$2 AND state='entered' AND deadline<=clock_timestamp()`, in.Scope.Consumer, in.Operation)
+			if err != nil {
+				return empty, service.ErrGatewayNativeIdentity
+			}
+			out, _, err = gatewayRefreshRead(ctx, tx, in)
+			if err != nil {
+				return empty, err
+			}
+		}
+		if out.Outcome.State != "prepared" {
+			if tx.Commit() != nil {
+				return empty, service.ErrGatewayNativeIdentity
+			}
+			return out, nil
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET fence=fence+1,deadline=clock_timestamp()+interval '15 seconds'
+   WHERE consumer=$1 AND operation_ref=$2 AND state='prepared' AND deadline<=clock_timestamp()`, in.Scope.Consumer, in.Operation)
+		if err != nil {
+			return empty, service.ErrGatewayNativeIdentity
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return empty, service.ErrGatewayNativeIdentity
+		}
+		out.Claimed = n == 1
+	} else {
+		_, err = tx.ExecContext(ctx, `INSERT INTO gateway_oauth_refresh_attempts
+   (account_id,native_created_at,consumer,owner_ref,account_ref,generation,operation_ref,intent_ref,expected_version,fence,state,deadline)
+   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT COALESCE(max(fence),0)+1 FROM gateway_oauth_refresh_attempts WHERE account_id=$1),'prepared',clock_timestamp()+interval '15 seconds')`, in.AccountID, in.CreatedAt, in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Operation, in.Intent, in.ExpectedVersion)
+		if err != nil {
+			return empty, service.ErrGatewayOAuthConflict
+		}
+		out.Claimed = true
+	}
+	claimed := out.Claimed
+	out, _, err = gatewayRefreshRead(ctx, tx, in)
+	if err != nil {
+		return empty, err
+	}
+	out.Claimed = claimed
+	if claimed {
+		err = tx.QueryRowContext(ctx, `SELECT a.credentials->>'oauth_bundle',r.issuer,r.subject
+   FROM accounts a JOIN gateway_oauth_identity_reservations r ON r.account_id=a.id
+   WHERE a.id=$1 AND a.created_at=$2 AND gateway_oauth_credential_version(a.credentials)=$3`, in.AccountID, in.CreatedAt, in.ExpectedVersion).
+			Scan(&out.Envelope, &out.Issuer, &out.Subject)
+		if err != nil {
+			return empty, service.ErrGatewayNativeIdentity
+		}
+	}
+	if tx.Commit() != nil {
+		return empty, service.ErrGatewayNativeIdentity
+	}
+	return out, nil
+}
+func (r *accountRepository) EnterGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) (bool, error) {
+	tx, err := r.gatewayRefreshTx(ctx, in)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	out, found, err := gatewayRefreshRead(ctx, tx, in)
+	if err != nil {
+		return false, err
+	}
+	if !found || out.Fence != fence || out.Outcome.State != "prepared" {
+		return false, service.ErrGatewayOAuthConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='entered'
+  WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state='prepared' AND deadline>clock_timestamp()`, in.Scope.Consumer, in.Operation, fence)
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	if tx.Commit() != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	return n == 1, nil
+}
+func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64, envelope string) (service.GatewayNativeOAuthRefreshOutcome, error) {
+	var empty service.GatewayNativeOAuthRefreshOutcome
+	tx, err := r.gatewayRefreshTx(ctx, in)
+	if err != nil {
+		return empty, err
+	}
+	defer tx.Rollback()
+	out, found, err := gatewayRefreshRead(ctx, tx, in)
+	if err != nil {
+		return empty, err
+	}
+	if !found || out.Fence != fence {
+		return empty, service.ErrGatewayOAuthConflict
+	}
+	if out.Outcome.State == "completed" {
+		return out.Outcome, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='completed',result_version=expected_version+1,publication_xid=pg_current_xact_id()
+  WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state='entered' AND deadline>clock_timestamp()`, in.Scope.Consumer, in.Operation, fence)
+	if err != nil {
+		return empty, service.ErrGatewayNativeIdentity
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return empty, service.ErrGatewayOAuthConflict
+	}
+	credentials, _ := json.Marshal(map[string]string{"oauth_bundle": envelope, "credential_version": strconv.FormatInt(in.ExpectedVersion+1, 10)})
+	result, err = tx.ExecContext(ctx, `UPDATE accounts SET credentials=$1::jsonb,updated_at=clock_timestamp()
+  WHERE id=$2 AND created_at=$3 AND gateway_oauth_credential_version(credentials)=$4`, string(credentials), in.AccountID, in.CreatedAt, in.ExpectedVersion)
+	if err != nil {
+		return empty, service.ErrGatewayNativeIdentity
+	}
+	n, err = result.RowsAffected()
+	if err != nil || n != 1 {
+		return empty, service.ErrGatewayOAuthConflict
+	}
+	if tx.Commit() != nil {
+		return empty, service.ErrGatewayNativeIdentity
+	}
+	return service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: in.ExpectedVersion + 1}, nil
+}
+func (r *accountRepository) UnknownGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) error {
+	tx, err := r.gatewayRefreshTx(ctx, in)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	out, found, err := gatewayRefreshRead(ctx, tx, in)
+	if err != nil {
+		return err
+	}
+	if !found || out.Fence != fence {
+		return service.ErrGatewayOAuthConflict
+	}
+	if out.Outcome.State == "completed" || out.Outcome.State == "unknown" {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='unknown'
+  WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state IN ('prepared','entered')`, in.Scope.Consumer, in.Operation, fence)
+	if err != nil || tx.Commit() != nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	return nil
+}
+
+var _ service.GatewayNativeOAuthRefreshRepository = (*accountRepository)(nil)

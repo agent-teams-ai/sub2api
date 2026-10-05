@@ -19,13 +19,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
 const GatewayOAuthIssuer = "https://auth.openai.com"
 const gatewayOAuthJWKS = GatewayOAuthIssuer + "/.well-known/jwks.json"
-const gatewayOAuthAudience = "app_EMoamEEZ73f0CkXaXp7hrann"
+const gatewayOAuthAudience = openai.ClientID
 const GatewayOAuthStagingProfile = "openai-oidc-oauth-staging-v1"
 const GatewayOAuthBundlePurpose = "provider-oauth-bundle-v1"
 const gatewayOAuthBundleLimit = 65536
