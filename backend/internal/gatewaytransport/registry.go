@@ -162,13 +162,22 @@ type Receipt struct {
 }
 
 type Handler struct {
-	cfg      Config
-	mu       sync.Mutex
-	entries  map[transportKey]*reservation
-	requests map[requestKey]transportKey
-	stopping bool
-	callback *http.Client
+	cfg        Config
+	mu         sync.Mutex
+	entries    map[transportKey]*reservation
+	requests   map[requestKey]transportKey
+	stopping   bool
+	callback   *http.Client
+	executions chan struct{}
+	controls   chan struct{}
 }
+
+// Local HTTP work bounds, not account occupancy or memory qualification. The
+// 32 execution handlers and 8 shared management/cleanup/owner handlers fit
+// within bootstrap's existing 128-connection listener. Retained registry
+// evidence has its independent MaxEntries bound and is never released here.
+const privateExecutionHandlers = 32
+const privateControlHandlers = 8
 
 func New(ctx context.Context, cfg Config) (*Handler, error) {
 	p := cfg.Profile
@@ -197,8 +206,9 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	}
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 16384,
 		DialContext: (&net.Dialer{Timeout: cfg.CallbackTimeout}).DialContext, TLSHandshakeTimeout: cfg.CallbackTimeout, ResponseHeaderTimeout: cfg.CallbackTimeout}
-	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 // Reserve before callback/claim. The secondary request identity prevents a new

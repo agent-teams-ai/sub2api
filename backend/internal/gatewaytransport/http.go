@@ -30,6 +30,16 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		http.Error(raw, "private native transport denied", http.StatusForbidden)
 		return
 	}
+	slots := h.controls
+	if r.URL.Path == transportsPath {
+		slots = h.executions
+	}
+	if !h.acquireHTTP(raw, r, slots) {
+		return
+	}
+	// Includes envelope reads, callback, Forward/physical Close and all writes.
+	// Local handler release never acknowledges upstream or durable closure.
+	defer func() { <-slots }()
 	controller := http.NewResponseController(raw)
 	if controller.SetReadDeadline(time.Now().Add(h.cfg.IOTimeout)) != nil || controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout)) != nil {
 		http.Error(raw, "private native transport denied", http.StatusServiceUnavailable)
@@ -132,6 +142,39 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	e.sealed = true
 	h.mu.Unlock()
+}
+
+// Management uses the SAME reserved control budget as transport cleanup and
+// owner read/cancel/ack. Authentication precedes admission and body buffering;
+// the existing management router still establishes protected consumer scope.
+func (h *Handler) ManagementHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, err := h.cfg.Authorize(r)
+		if err != nil || peer.Role != "management" || !identifier.MatchString(peer.ConsumerID) {
+			http.Error(w, "private native transport denied", http.StatusForbidden)
+			return
+		}
+		if !h.acquireHTTP(w, r, h.controls) {
+			return
+		}
+		defer func() { <-h.controls }()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) acquireHTTP(w http.ResponseWriter, r *http.Request, slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		// Do not let net/http drain a held rejected body before sending the
+		// rejection. No envelope read, registry reservation or callback occurs.
+		r.Close = true
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
+		http.Error(w, "private native transport busy", http.StatusServiceUnavailable)
+		return false
+	}
 }
 
 func (h *Handler) finishNoEntry(e *reservation) { e.life.NoForward() }

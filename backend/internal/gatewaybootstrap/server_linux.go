@@ -149,7 +149,8 @@ func Run(ctx context.Context, options Options) error {
 	repo := repository.NewAccountRepository(client, db, nil)
 	// These are the proven private HTTP integration constructor arguments:
 	// group-free admin, no cache/scheduler/probe/refresh/ordinary limiter.
-	svcCfg := &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}}
+	svcCfg := &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}},
+		Gateway: config.GatewayConfig{OpenAIResponseHeaderTimeout: 5}}
 	upstream := options.Upstream
 	if upstream == nil {
 		upstream = repository.NewHTTPUpstream(svcCfg)
@@ -223,7 +224,7 @@ func Run(ctx context.Context, options Options) error {
 }
 
 func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gateway *service.OpenAIGatewayService, custody *service.GatewayNativeCredentialCustody,
-	transport http.Handler, auth func(*http.Request) (gatewaytransport.Peer, error)) http.Handler {
+	transport *gatewaytransport.Handler, auth func(*http.Request) (gatewaytransport.Peer, error)) http.Handler {
 	router := gin.New()
 	authorizeCandidate := func(c *gin.Context) {
 		peer, err := auth(c.Request)
@@ -242,6 +243,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 	admin.RegisterGatewayNativeRoutes(router.Group(""), adminSvc, gateway,
 		admin.GatewayNativeProfile{ID: service.GatewayMiMoResponsesProfile, BaseURL: profile.BaseURL, Model: profile.Model}, authorizeCandidate,
 		func(*gin.Context, service.GatewayNativeRoute) error { return ErrDenied }, func(*gin.Context, bool, error) {}, custody)
+	management := transport.ManagementHandler(router)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" || len(r.RequestURI) > 2048 ||
 			r.Header.Get("Content-Encoding") != "" {
@@ -250,7 +252,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 		}
 		switch {
 		case r.URL.Path == "/private/native/v1/candidates" || strings.HasPrefix(r.URL.Path, "/private/native/v1/candidates/"):
-			router.ServeHTTP(w, r)
+			management.ServeHTTP(w, r)
 		case r.URL.Path == "/private/native/v1/transports" || strings.HasPrefix(r.URL.Path, "/private/native/v1/transports/"):
 			transport.ServeHTTP(w, r)
 		default:

@@ -3,11 +3,16 @@
 package gatewaytransport
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +31,11 @@ const fixtureExecutionToken = "example-fixture-literal"
 const fixtureCallbackToken = "fixture-callback"
 const fixtureCleanupToken = "fixture-cleanup"
 const fixtureForeignToken = "fixture-foreign"
+
+// Assert the specified source bounds over HTTP, independently of the
+// implementation's channel capacities (changing those must change the result).
+const fixtureExecutionAdmissionCap = 32
+const fixtureControlAdmissionCap = 8
 
 const (
 	ownerExecution   = "11111111-1111-4111-8111-111111111111"
@@ -89,14 +99,17 @@ func ownerReserve(t *testing.T, h *Handler, r Request) *reservation {
 }
 
 type ownerHTTPResult struct {
-	code    int
-	receipt Receipt
-	err     error
+	code     int
+	receipt  Receipt
+	err      error
+	body     []byte
+	duration time.Duration
 }
 
 // No testing.Fatal in the forwarding goroutine; cancellation can interrupt
 // the stream, but control responses must arrive and decode without ambiguity.
 func ownerPOST(client *http.Client, origin, path, token string, input any) ownerHTTPResult {
+	start := time.Now()
 	raw, err := json.Marshal(input)
 	if err != nil {
 		return ownerHTTPResult{err: err}
@@ -113,7 +126,7 @@ func ownerPOST(client *http.Client, origin, path, token string, input any) owner
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
-	result := ownerHTTPResult{code: resp.StatusCode, err: err}
+	result := ownerHTTPResult{code: resp.StatusCode, err: err, body: data, duration: time.Since(start)}
 	if len(data) > 65536 {
 		result.err = errors.New("fixture response exceeded cap")
 	} else if err == nil && resp.StatusCode == http.StatusAccepted {
@@ -164,8 +177,10 @@ func (b *ownerCloseFailure) Close() error {
 	return errors.New("fixture physical close failure")
 }
 
-func TestOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
-	for _, mode := range []string{"completed", "held", "closeFailed"} {
+func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
+	// Regression: partial provider output stalls forever despite server IdleTimeout;
+	// timeout is mistaken for completion or releases unknown occupied evidence.
+	for _, mode := range []string{"completed", "held", "closeFailed", "idle", "idleCloseFailed"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, acks atomic.Int32
 			providerEntered := make(chan struct{}, 1)
@@ -180,7 +195,7 @@ func TestOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				default:
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
-				if mode == "held" {
+				if mode == "held" || mode == "idle" || mode == "idleCloseFailed" {
 					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
 				} else {
 					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
@@ -213,7 +228,7 @@ func TestOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					service.GatewayModelExtraKey: "fixture-model", service.GatewayCredentialScopeExtraKey: scope.Metadata(), "openai_responses_mode": "force_responses", "openai_passthrough": true,
 					"native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
 			repo := &ownerFixtureRepo{row: row}
-			u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: upstream.Client(), closeFails: mode == "closeFailed"})
+			u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: upstream.Client(), closeFails: mode == "closeFailed" || mode == "idleCloseFailed"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -354,6 +369,16 @@ func TestOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				if mode == "completed" && (result.err != nil || result.code != 200) {
 					t.Fatal("actual completed stream failed", result.code, result.err)
 				}
+				if (mode == "idle" || mode == "idleCloseFailed") && bytes.Contains(result.body, []byte("response.completed")) {
+					t.Fatal("read-idle delivered a false completed event")
+				}
+				if mode == "idle" || mode == "idleCloseFailed" {
+					// Distinguish the native 1s read-idle from this client's
+					// independent 3s timeout and the handler's 5s I/O deadline.
+					if result.duration < 800*time.Millisecond || result.duration >= 2*time.Second || !bytes.Contains(result.body, []byte("response.created")) {
+						t.Fatal("partial stream did not return at native read-idle before client/absolute timeout", result.duration)
+					}
+				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("native forward did not return")
 			}
@@ -377,11 +402,19 @@ func TestOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 				code, receipt = call("/read-owner", fixtureExecutionToken, request)
 			}
-			if mode == "closeFailed" && !receipt.Lifetime.CloseFailed {
+			if (mode == "closeFailed" || mode == "idleCloseFailed") && !receipt.Lifetime.CloseFailed {
 				t.Fatal("physical Close failure observation lost")
 			}
+			if mode == "idle" || mode == "idleCloseFailed" {
+				if receipt.Effect != "effect_unknown" || receipt.Lifetime.Completed || receipt.Acknowledged || acks.Load() != 0 || !receipt.Lifetime.ContextDone {
+					t.Fatal("read-idle changed unknown effect or acknowledged occupancy before closure ACK")
+				}
+				if mode == "idleCloseFailed" && receipt.Phase == "closed" {
+					t.Fatal("failed Close certified closure after read-idle")
+				}
+			}
 			code, receipt = call("/ack-owner", fixtureExecutionToken, request)
-			if mode == "closeFailed" {
+			if mode == "closeFailed" || mode == "idleCloseFailed" {
 				if code != 409 || acks.Load() != 0 {
 					t.Fatal("failed physical Close acknowledged")
 				}
@@ -434,3 +467,292 @@ func TestOwnerClosureMissingPortsAndSealedLostAck(t *testing.T) {
 		t.Fatal("missing ACK authority allowed closure")
 	}
 }
+
+// Controlled storage plus real private HTTP, callback and TLS provider. No DB
+// claim/occupancy qualification is inferred from these boundary tests.
+func ownerIngressFixture(t *testing.T, provider http.Handler) (*Handler, *httptest.Server, *atomic.Int32, <-chan Proof) {
+	t.Helper()
+	upstream := httptest.NewTLSServer(provider)
+	t.Cleanup(upstream.Close)
+	custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": []byte(strings.Repeat("K", 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "fixture-owner", Account: ownerAccount, Generation: ownerGeneration, Purpose: service.GatewayCredentialPurpose}
+	envelope, err := custody.Seal(scope, fixtureProviderKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := &service.Account{ID: 7, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, CreatedAt: ownerRequest().Descriptor.CreatedAt,
+		Credentials: map[string]any{"api_key": envelope, "base_url": upstream.URL}, Extra: map[string]any{
+			service.GatewayGenerationExtraKey: ownerGeneration, service.GatewayProfileExtraKey: service.GatewayMiMoResponsesProfile,
+			service.GatewayModelExtraKey: "fixture-model", service.GatewayCredentialScopeExtraKey: scope.Metadata(),
+			"openai_responses_mode": "force_responses", "openai_passthrough": true,
+			"native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+	u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: upstream.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := service.NewOpenAIGatewayService(&ownerFixtureRepo{row: row}, nil, nil, nil, nil, nil, nil,
+		&config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+		nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	admits := &atomic.Int32{}
+	proofs := make(chan Proof, 1)
+	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admits.Add(1)
+		var input admitRequest
+		if r.URL.Path != "/private/native/v1/admit" || r.Header.Get("Authorization") != "Bearer "+fixtureCallbackToken || json.NewDecoder(r.Body).Decode(&input) != nil {
+			t.Error("invalid authenticated callback")
+			w.WriteHeader(400)
+			return
+		}
+		reply := ownerReply(input)
+		proofs <- reply.Dispatch.Closure
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(reply)
+	}))
+	t.Cleanup(callback.Close)
+	cfg := Config{Gateway: gateway, Custody: custody, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, "fixture-qualification"},
+		Profile: QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "fixture-model", BaseURL: upstream.URL, QualificationRef: "fixture-qualification",
+			RequestBytes: 4096, OutputBytes: 8 << 20, Tokens: 100, ProviderTokenUpperBound: 200},
+		MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken,
+		CallbackTimeout: time.Second, IOTimeout: 15 * time.Second, CleanupTimeout: time.Second,
+		Authorize: func(r *http.Request) (Peer, error) {
+			switch r.Header.Get("Authorization") {
+			case "Bearer " + fixtureExecutionToken:
+				return Peer{"fixture-consumer", "execution"}, nil
+			case "Bearer " + fixtureCleanupToken:
+				return Peer{"fixture-consumer", "cleanup"}, nil
+			case "Bearer " + gatewayIngressGuardFixture1:
+				return Peer{"fixture-consumer", "management"}, nil
+			}
+			return Peer{}, errDenied
+		},
+		VerifyEnrollment:      func(context.Context, Enrollment) error { return nil },
+		VerifyDispatch:        func(context.Context, string, Proof, time.Time) error { return nil },
+		AuthorizeCleanup:      func(context.Context, string, Proof, CleanupLease) error { return errDenied },
+		AcknowledgeClosure:    func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied },
+		AuthorizeOwnerClosure: func(context.Context, string, Proof) error { return nil },
+		AcknowledgeOwnerClosure: func(_ context.Context, _ string, _ Proof, r Receipt) error {
+			if !closed(r.Lifetime) {
+				return errDenied
+			}
+			return nil
+		},
+	}
+	h, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(h)
+	// Real kernel socket bounds make downstream backpressure deterministic;
+	// this is fixture listener configuration, not a production handler hook.
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			if err := conn.(*net.TCPConn).SetWriteBuffer(1024); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	server.Start()
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = h.Stop(ctx)
+	})
+	return h, server, admits, proofs
+}
+
+// Expect: 100-continue observes the REAL first request body Read. No body is
+// supplied, so accepted handlers remain blocked before decode/reserve/callback.
+func ownerHeldBody(t *testing.T, origin, path, token string, want int) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(origin, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: fixture\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n", transportsPath+path, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "POST"})
+	if err != nil {
+		t.Fatal("held body did not receive immediate admission decision", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != want {
+		t.Fatalf("held %s: got %d want %d", path, resp.StatusCode, want)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn
+}
+
+// Regression: body buffering precedes execution admission, so authenticated
+// slow bodies exhaust the listener and cleanup cannot get a bounded response.
+func TestGatewayNativeIngressHeldBodiesReserveControlAndReleaseOnAbort(t *testing.T) {
+	var upstreams atomic.Int32
+	h, server, admits, _ := ownerIngressFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreams.Add(1)
+		w.WriteHeader(500)
+	}))
+	var held []net.Conn
+	for i := 0; i < fixtureExecutionAdmissionCap; i++ {
+		held = append(held, ownerHeldBody(t, server.URL, "", fixtureExecutionToken, 100))
+	}
+	ownerHeldBody(t, server.URL, "", fixtureExecutionToken, 503)
+	// Wrong-purpose credentials remain forbidden, including at saturation.
+	ownerHeldBody(t, server.URL, "/read", fixtureExecutionToken, 403)
+	for i := 0; i < fixtureControlAdmissionCap; i++ {
+		ownerHeldBody(t, server.URL, "/read", fixtureCleanupToken, 100)
+	}
+	ownerHeldBody(t, server.URL, "/read", fixtureCleanupToken, 503)
+	ownerHeldBody(t, server.URL, "/read-owner", fixtureExecutionToken, 503)
+	management := httptest.NewServer(h.ManagementHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("saturated management entered handler")
+	})))
+	defer management.Close()
+	req, _ := http.NewRequest("POST", management.URL, strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer "+gatewayIngressGuardFixture1)
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatal("management did not share the bounded reserved control budget")
+	}
+	_ = held[0].Close()
+	by := time.Now().Add(2 * time.Second)
+	for {
+		result := ownerPOST(&http.Client{Timeout: time.Second}, server.URL, "", fixtureExecutionToken, map[string]string{})
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.code == 400 {
+			break // Invalid envelope is read only AFTER the aborted slot releases.
+		}
+		if result.code != 503 || time.Now().After(by) {
+			t.Fatal("aborted held execution did not release its handler slot", result.code)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if admits.Load() != 0 || upstreams.Load() != 0 || len(h.entries) != 0 {
+		t.Fatal("pre-body saturation created callback/claim/upstream or retained occupancy")
+	}
+}
+
+// Regression: releasing execution admission after body decode/first flush lets
+// blocked downstream output multiply executions and starve exact cleanup.
+func TestGatewayNativeIngressBlockedOutputRetainsSlotAndAllowsCleanup(t *testing.T) {
+	var upstreams atomic.Int32
+	providerReady := make(chan struct{}, 1)
+	h, server, admits, proofs := ownerIngressFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreams.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		frame := ": " + strings.Repeat("x", 16380) + "\n\n"
+		// More than the unread downstream TCP window; remain alive without a
+		// terminal event. Cleanup must interrupt the actual blocked HTTP writer.
+		for i := 0; i < 440; i++ {
+			if _, err := io.WriteString(w, frame); err != nil {
+				return
+			}
+			if http.NewResponseController(w).Flush() != nil {
+				return
+			}
+			if i == 64 {
+				providerReady <- struct{}{}
+			}
+		}
+		<-r.Context().Done()
+	}))
+	input := ownerRequest()
+	input.Descriptor.BaseURL = h.cfg.Profile.BaseURL
+	input.Admission.Limits.OutputBytes = 8 << 20
+	raw, _ := json.Marshal(input)
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.(*net.TCPConn).SetReadBuffer(1024); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: fixture\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", transportsPath, fixtureExecutionToken, len(raw), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "POST"})
+	if err != nil || response.StatusCode != 200 {
+		t.Fatal("live private stream did not start", err)
+	}
+	// Leave response.Body unread throughout saturation and cleanup.
+	var proof Proof
+	select {
+	case proof = <-proofs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sole authenticated admit missing")
+	}
+	select {
+	case <-providerReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("controlled provider did not fill unread downstream output")
+	}
+	for i := 1; i < fixtureExecutionAdmissionCap; i++ {
+		ownerHeldBody(t, server.URL, "", fixtureExecutionToken, 100)
+	}
+	ownerHeldBody(t, server.URL, "", fixtureExecutionToken, 503)
+	client := &http.Client{Timeout: 2 * time.Second}
+	request := ownerClosureRequest{Proof: proof}
+	read := ownerPOST(client, server.URL, "/read-owner", fixtureExecutionToken, request)
+	if read.err != nil || read.code != 202 || read.receipt.Phase != "entered" || read.receipt.Lifetime.ForwardingReturned {
+		t.Fatal("blocked output released lifetime or starved control", read.code, read.err, read.receipt)
+	}
+	ack := ownerPOST(client, server.URL, "/ack-owner", fixtureExecutionToken, request)
+	if ack.err != nil || ack.code != 409 {
+		t.Fatal("blocked output falsely acknowledged closure")
+	}
+	cancel := ownerPOST(client, server.URL, "/cancel-owner", fixtureExecutionToken, request)
+	if cancel.err != nil || cancel.code != 202 {
+		t.Fatal("reserved control could not cancel blocked writer")
+	}
+	by := time.Now().Add(2 * time.Second)
+	for {
+		read = ownerPOST(client, server.URL, "/read-owner", fixtureExecutionToken, request)
+		if read.err != nil || read.code != 202 {
+			t.Fatal("exact closure readback unavailable")
+		}
+		if read.receipt.Phase == "closed" {
+			break
+		}
+		if time.Now().After(by) {
+			t.Fatal("cancellation did not interrupt the blocked writer and close provider body")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if read.receipt.Effect != "effect_unknown" || read.receipt.Acknowledged || admits.Load() != 1 || upstreams.Load() != 1 {
+		t.Fatal("local handler cleanup certified durable occupancy/effect or replayed inference")
+	}
+	// Closed but unacknowledged evidence stays retained after the HTTP slot frees.
+	if len(h.entries) != 1 {
+		t.Fatal("handler release evicted unacknowledged closure")
+	}
+	result := ownerPOST(client, server.URL, "", fixtureExecutionToken, map[string]string{})
+	if result.err != nil || result.code != 400 {
+		t.Fatal("forward return did not release execution slot", result.code, result.err)
+	}
+}
+
+func gatewayIngressGuardFixtureOpaque() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("synthetic fixture entropy unavailable")
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+var gatewayIngressGuardFixture1 = gatewayIngressGuardFixtureOpaque()

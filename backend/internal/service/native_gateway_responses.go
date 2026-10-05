@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -33,12 +34,18 @@ func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error
 const gatewayNativeResponseLimit = 8 << 20
 const gatewayNativeSSEFrameLimit = 1 << 20
 
+// Actual provider body-read inactivity on the owned private Responses path.
+// Independent of the approved absolute lifetime and downstream write deadline.
+const gatewayNativeUpstreamReadIdle = time.Second
+
 func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
 	target, err := s.gatewayNativeTargetURL(a)
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
-	request, err := http.NewRequestWithContext(WithHTTPUpstreamProfile(ctx, HTTPUpstreamProfileOpenAI), http.MethodPost, target, bytes.NewReader(body))
+	upstreamCtx, stopUpstream := context.WithCancel(ctx)
+	defer stopUpstream()
+	request, err := http.NewRequestWithContext(WithHTTPUpstreamProfile(upstreamCtx, HTTPUpstreamProfileOpenAI), http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
@@ -65,10 +72,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		// Never read, export or log a vendor error body or return failover metadata.
 		return nil, ErrGatewayNativeEffectUnknown
 	}
+	var reader io.Reader = resp.Body
+	if life := gatewayNativeLifetime(ctx); life != nil {
+		reader = &gatewayNativeIdleReader{reader: resp.Body, cancel: func() {
+			// Cancel the real HTTP request to interrupt its blocked Read BEFORE
+			// requesting physical Close. Cancellation alone proves no closure.
+			stopUpstream()
+			life.Cancel()
+		}}
+	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 	result := &OpenAIForwardResult{Stream: stream, Model: gjson.GetBytes(body, "model").String(), UpstreamEndpoint: "/v1/responses"}
 	if !stream {
-		output, err := io.ReadAll(io.LimitReader(resp.Body, gatewayNativeResponseLimit+1))
+		output, err := io.ReadAll(io.LimitReader(reader, gatewayNativeResponseLimit+1))
 		if err != nil || len(output) > gatewayNativeResponseLimit {
 			return nil, ErrGatewayNativeEffectUnknown
 		}
@@ -94,7 +110,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	c.Header("Cache-Control", "no-cache")
 	// One bounded event at a time; no producer goroutine, unbounded queue, history,
 	// error-body cache or stream reconstruction. Cancellation uses the request ctx.
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, gatewayNativeResponseLimit+1))
+	scanner := bufio.NewScanner(io.LimitReader(reader, gatewayNativeResponseLimit+1))
 	// Include original LF/CRLF bytes in each token for bounds and forwarding.
 	scanner.Split(gatewayNativeRawSSELine)
 	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
@@ -174,6 +190,71 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		data = nil
 	}
 	return nil, ErrGatewayNativeEffectUnknown
+}
+
+// The forwarding goroutine is the sole reader. One timer per pending Read,
+// no reader goroutine/queue. The lock orders timeout against Read return: a
+// timer that loses that race cannot cancel later downstream work or reads.
+type gatewayNativeIdleReader struct {
+	reader  io.Reader
+	cancel  func()
+	mu      sync.Mutex
+	expired bool
+}
+
+func (r *gatewayNativeIdleReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	r.mu.Lock()
+	if r.expired {
+		r.mu.Unlock()
+		return 0, ErrGatewayNativeEffectUnknown
+	}
+	pending := true
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(gatewayNativeUpstreamReadIdle, func() {
+		defer close(timerDone)
+		r.mu.Lock()
+		if !pending {
+			r.mu.Unlock()
+			return
+		}
+		r.expired = true
+		r.mu.Unlock()
+		r.cancel()
+	})
+	r.mu.Unlock()
+	var n int
+	var err error
+	for {
+		n, err = r.reader.Read(p)
+		if n != 0 || err != nil {
+			break
+		}
+		// A zero-byte nil-error read is not provider progress and cannot reset
+		// the pending read-idle clock.
+		r.mu.Lock()
+		expired := r.expired
+		r.mu.Unlock()
+		if expired {
+			break
+		}
+	}
+	r.mu.Lock()
+	pending = false
+	stopped := timer.Stop()
+	expired := r.expired
+	r.mu.Unlock()
+	if !stopped {
+		// Join an already fired callback before another Read can arm a timer.
+		// Only cancellation is joined, never physical body Close.
+		<-timerDone
+	}
+	if expired {
+		return 0, ErrGatewayNativeEffectUnknown
+	}
+	return n, err
 }
 
 func gatewayNativeRawSSELine(data []byte, atEOF bool) (int, []byte, error) {
