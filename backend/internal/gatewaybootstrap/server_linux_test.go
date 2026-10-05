@@ -5,8 +5,11 @@ package gatewaybootstrap
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -120,6 +123,160 @@ func TestDedicatedHTTPRolesAndBypassDenial(t *testing.T) {
 			t.Fatal("control credential echoed")
 		}
 	}
+	t.Run("native runtime management boundary", func(t *testing.T) {
+		for _, check := range []struct {
+			name, method, path, credential string
+			want                           int
+		}{
+			{"missing", "GET", "/private/native/v1/runtime", "", 403},
+			{"unknown", "GET", "/private/native/v1/runtime", "Bearer " + nativeRuntimeUnknownFixture(), 403},
+			{"execution", "GET", "/private/native/v1/runtime", "Bearer " + c.Peers[1].Credential, 403},
+			{"cleanup", "GET", "/private/native/v1/runtime", "Bearer " + c.Peers[2].Credential, 403},
+			{"callback authority", "GET", "/private/native/v1/runtime", "Bearer " + c.Authority.Credential, 403},
+			{"malformed", "GET", "/private/native/v1/runtime", "bearer " + c.Peers[0].Credential, 403},
+			{"duplicate", "GET", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 403},
+			{"management", "GET", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 200},
+			{"POST", "POST", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"PUT", "PUT", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"PATCH", "PATCH", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"DELETE", "DELETE", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"HEAD", "HEAD", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"OPTIONS", "OPTIONS", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"TRACE", "TRACE", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+			{"query", "GET", "/private/native/v1/runtime?sample=1", "Bearer " + c.Peers[0].Credential, 400},
+			{"empty query", "GET", "/private/native/v1/runtime?", "Bearer " + c.Peers[0].Credential, 400},
+			{"encoding", "GET", "/private/native/v1/runtime", "Bearer " + c.Peers[0].Credential, 400},
+			{"escaped path", "GET", "/private/native/v1/%72untime", "Bearer " + c.Peers[0].Credential, 400},
+			{"suffix", "GET", "/private/native/v1/runtime/extra", "Bearer " + c.Peers[0].Credential, 404},
+			{"public", "GET", "/v1/runtime", "Bearer " + c.Peers[0].Credential, 404},
+		} {
+			t.Run(check.name, func(t *testing.T) {
+				req, err := http.NewRequest(check.method, server.URL+check.path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if check.credential != "" {
+					req.Header.Set("Authorization", check.credential)
+				}
+				if check.name == "duplicate" {
+					req.Header.Add("Authorization", check.credential)
+				}
+				if check.name == "encoding" {
+					req.Header.Set("Content-Encoding", "gzip")
+				}
+				resp, err := server.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				data, err := io.ReadAll(io.LimitReader(resp.Body, 1025))
+				if err != nil || len(data) > 1024 || resp.StatusCode != check.want {
+					t.Fatalf("runtime status/body: status=%d bytes=%d err=%v", resp.StatusCode, len(data), err)
+				}
+				keys := []string{"heapAllocBytes", "heapInuseBytes", "sysBytes", "numGC", "numGoroutine"}
+				if check.want != http.StatusOK {
+					for _, key := range append(keys, "credential", "fixture-consumer", "fixture-model") {
+						if bytes.Contains(data, []byte(key)) {
+							t.Fatalf("denied response leaked %s", key)
+						}
+					}
+					return
+				}
+				if resp.Header.Get("Content-Type") != "application/json; charset=utf-8" || resp.Header.Get("Cache-Control") != "no-store" {
+					t.Fatal("runtime response media/cache contract")
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(data, &fields); err != nil || len(fields) != len(keys) {
+					t.Fatalf("runtime fixed JSON shape: %s err=%v", data, err)
+				}
+				values := make(map[string]uint64, len(keys))
+				for _, key := range keys {
+					bits := 64
+					if key == "numGC" {
+						bits = 32
+					}
+					value, err := strconv.ParseUint(string(fields[key]), 10, bits)
+					if err != nil {
+						t.Fatalf("runtime %s must be a finite unsigned integer: %s", key, fields[key])
+					}
+					values[key] = value
+				}
+				if values["heapAllocBytes"] == 0 || values["heapInuseBytes"] < values["heapAllocBytes"] ||
+					values["sysBytes"] < values["heapInuseBytes"] || values["numGoroutine"] == 0 {
+					t.Fatalf("runtime counters inconsistent with this running HTTP process: %s", data)
+				}
+			})
+		}
+	})
+	t.Run("native runtime shares eight control slots", func(t *testing.T) {
+		entered, release := make(chan struct{}, 8), make(chan struct{})
+		held := httptest.NewServer(transport.ManagementHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			entered <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusNoContent)
+		})))
+		defer held.Close()
+		released := false
+		defer func() {
+			if !released {
+				close(release)
+			}
+		}()
+		results := make(chan error, 8)
+		for i := 0; i < 8; i++ {
+			go func() {
+				req, _ := http.NewRequest("GET", held.URL, nil)
+				req.Header.Set("Authorization", "Bearer "+c.Peers[0].Credential)
+				resp, err := held.Client().Do(req)
+				if err == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode != http.StatusNoContent {
+						err = fmt.Errorf("held control status %d", resp.StatusCode)
+					}
+				}
+				results <- err
+			}()
+		}
+		for i := 0; i < 8; i++ {
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("shared control fixture failed to fill eight slots")
+			}
+		}
+		req, _ := http.NewRequest("GET", server.URL+"/private/native/v1/runtime", nil)
+		req.Header.Set("Authorization", "Bearer "+c.Peers[0].Credential)
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusServiceUnavailable || bytes.Contains(data, []byte("heapAllocBytes")) {
+			t.Fatalf("runtime did not share bounded control admission: status=%d err=%v", resp.StatusCode, err)
+		}
+		// Release and join all fixture requests before testing slot reuse.
+		close(release)
+		released = true
+		for i := 0; i < 8; i++ {
+			select {
+			case err := <-results:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("shared control fixture did not finish")
+			}
+		}
+		resp, err = server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("runtime control slot not reusable: %d", resp.StatusCode)
+		}
+	})
 	if enrollments.Load() != 1 {
 		t.Fatal("denied request caused authority work")
 	}
@@ -290,4 +447,12 @@ func TestStartupRequiresGateFDConfigAndEnrollmentBeforeListen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func nativeRuntimeUnknownFixture() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("fixture entropy unavailable")
+	}
+	return hex.EncodeToString(b)
 }

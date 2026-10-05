@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -243,6 +244,9 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 	admin.RegisterGatewayNativeRoutes(router.Group(""), adminSvc, gateway,
 		admin.GatewayNativeProfile{ID: service.GatewayMiMoResponsesProfile, BaseURL: profile.BaseURL, Model: profile.Model}, authorizeCandidate,
 		func(*gin.Context, service.GatewayNativeRoute) error { return ErrDenied }, func(*gin.Context, bool, error) {}, custody)
+	// Telemetry uses the same management credential, typed consumer context and
+	// shared control budget as candidates. No execution/cleanup authority enters.
+	router.GET("/private/native/v1/runtime", authorizeCandidate, nativeRuntime)
 	management := transport.ManagementHandler(router)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" || len(r.RequestURI) > 2048 ||
@@ -251,6 +255,8 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			return
 		}
 		switch {
+		case r.URL.Path == "/private/native/v1/runtime":
+			management.ServeHTTP(w, r)
 		case r.URL.Path == "/private/native/v1/candidates" || strings.HasPrefix(r.URL.Path, "/private/native/v1/candidates/"):
 			management.ServeHTTP(w, r)
 		case r.URL.Path == "/private/native/v1/transports" || strings.HasPrefix(r.URL.Path, "/private/native/v1/transports/"):
@@ -260,6 +266,47 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			http.Error(w, "private native bootstrap denied", http.StatusNotFound)
 		}
 	})
+}
+
+// nativeRuntimeSnapshot is the fixed GET /private/native/v1/runtime JSON contract
+// for the C sampler. Every field is an unsigned integer, except the positive
+// integer numGoroutine. There are no optional fields or caller-selected metrics.
+//
+// Exact keys and sources:
+//
+//	heapAllocBytes: runtime.MemStats.HeapAlloc, bytes of allocated heap objects.
+//	heapInuseBytes: runtime.MemStats.HeapInuse, bytes in in-use heap spans.
+//	sysBytes: runtime.MemStats.Sys, bytes obtained from the OS by the Go runtime.
+//	numGC: runtime.MemStats.NumGC, completed GC cycles.
+//	numGoroutine: runtime.NumGoroutine(), current Go goroutine count.
+//
+// This describes only the current native Go process. Sys is not RSS, cgroup
+// memory, C memory or readiness. The memory snapshot and goroutine count are
+// separate observations; callers must not infer an atomic cross-field instant.
+type nativeRuntimeSnapshot struct {
+	HeapAllocBytes uint64 `json:"heapAllocBytes"`
+	HeapInuseBytes uint64 `json:"heapInuseBytes"`
+	SysBytes       uint64 `json:"sysBytes"`
+	NumGC          uint32 `json:"numGC"`
+	NumGoroutine   int    `json:"numGoroutine"`
+}
+
+// nativeRuntime reads aggregate counters on demand. It does not force GC,
+// retain samples, start polling, or inspect processes/files/configuration.
+// Authorization and admission happen before this handler in privateHandler.
+func nativeRuntime(c *gin.Context) {
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	snapshot := nativeRuntimeSnapshot{
+		HeapAllocBytes: memory.HeapAlloc,
+		HeapInuseBytes: memory.HeapInuse,
+		SysBytes:       memory.Sys,
+		NumGC:          memory.NumGC,
+		NumGoroutine:   runtime.NumGoroutine(),
+	}
+	// An authenticated sample must never become a cached management response.
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, snapshot)
 }
 
 type boundedListener struct {
