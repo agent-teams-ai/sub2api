@@ -153,7 +153,7 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	close(start)
 	wg.Wait()
 	require.Equal(t, int32(1), exchanges.Load())
-	original, err := f1.ReadGatewayNativeOAuth(owner, scope, "f3-operation")
+	original, err := f1.ReadGatewayNativeOAuth(owner, scope, prepared.EnrollmentOperation)
 	require.NoError(t, err)
 	restartedRepo, err := NewGatewayNativeOAuthConnectRepository(db)
 	require.NoError(t, err)
@@ -165,16 +165,21 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	completed, err := restartedRepo.ReadConnectIntent(owner, scope, "f3-operation")
 	require.NoError(t, err)
 	require.True(t, original == completed.Outcome)
+	require.NotEqual(t, completed.Operation, completed.EnrollmentOperation)
+	require.NotEmpty(t, completed.EnrollmentMAC)
+	var acceptedMAC string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT intent_mac FROM gateway_oauth_identity_reservations WHERE consumer=$1 AND operation_ref=$2`, scope.Consumer, completed.EnrollmentOperation).Scan(&acceptedMAC))
+	require.Equal(t, acceptedMAC, completed.EnrollmentMAC)
 	require.Empty(t, completed.Envelope)
 	_, err = restarted.CompleteCallback(ctx, state, "another-code")
 	require.NoError(t, err)
 	require.Equal(t, int32(1), exchanges.Load())
 	// Completed readback survives later safe F1 erasure without changing outcome.
-	require.NoError(t, f1.EraseGatewayNativeOAuth(owner, scope, "f3-operation"))
+	require.NoError(t, f1.EraseGatewayNativeOAuth(owner, scope, prepared.EnrollmentOperation))
 	afterErase, err := restarted.ReadConnect(owner, scope, "f3-operation")
 	require.NoError(t, err)
 	require.True(t, recovered == afterErase)
-	for _, query := range []string{`UPDATE gateway_oauth_connect_intents SET state='prepared' WHERE consumer=$1`, `DELETE FROM gateway_oauth_connect_intents WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET outcome_account_id=123 WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET owner_ref='other' WHERE consumer=$1`} {
+	for _, query := range []string{`UPDATE gateway_oauth_connect_intents SET state='prepared' WHERE consumer=$1`, `DELETE FROM gateway_oauth_connect_intents WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET outcome_account_id=123 WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET owner_ref='other' WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET enrollment_mac=repeat('0',64) WHERE consumer=$1`, `UPDATE gateway_oauth_connect_intents SET enrollment_operation='connect-00000000-0000-0000-0000-000000000001' WHERE consumer=$1`} {
 		_, err = db.ExecContext(ctx, query, scope.Consumer)
 		require.Error(t, err)
 	}
@@ -204,4 +209,106 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_connect_intents WHERE entered_at IS NOT NULL`).Scan(&entries))
 	require.Equal(t, 2, entries)
 	require.NotEqual(t, prepared.StateHash, evidence.StateHash)
+
+	// Real F1 A exists under the same caller operation/scope. F3 B exchanges
+	// once and hits the actual principal/generation conflict; A is never B's ACK.
+	priorOwner, priorScope := oauthPGScope(t, "prior-consumer", "prior-owner", "prior-logical")
+	priorEnrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, f1, key)
+	require.NoError(t, err)
+	bundle = bundleFor("f3-prior-principal")
+	prior, err := priorEnrollment.Stage(priorOwner, priorScope, "prior-operation", bundle)
+	require.NoError(t, err)
+	bundle.AccessToken += "-new-B"
+	priorBegin, err := restarted.BeginConnect(priorOwner, priorScope, "prior-operation")
+	require.NoError(t, err)
+	priorURL, err := url.Parse(priorBegin.AuthorizeURL)
+	require.NoError(t, err)
+	challenge = priorURL.Query().Get("code_challenge")
+	failed, err := restarted.CompleteCallback(ctx, priorURL.Query().Get("state"), "fixture-code")
+	require.NoError(t, err)
+	require.Equal(t, "unknown", failed.State)
+	priorIntent, err := restartedRepo.ReadConnectIntent(priorOwner, priorScope, "prior-operation")
+	require.NoError(t, err)
+	require.NotEmpty(t, priorIntent.EnrollmentMAC)
+	stillPrior, err := f1.ReadGatewayNativeOAuth(priorOwner, priorScope, "prior-operation")
+	require.NoError(t, err)
+	require.Equal(t, prior, stillPrior)
+	_, err = restartedRepo.FinishConnect(priorOwner, priorIntent, "completed", prior)
+	require.Error(t, err)
+	// Even a forged operation/generation cannot turn the wrong physical row
+	// into this intent's result; the DB verifies the actual commitment and birth.
+	forged := prior
+	forged.Operation = priorIntent.EnrollmentOperation
+	_, err = restartedRepo.FinishConnect(priorOwner, priorIntent, "completed", forged)
+	require.Error(t, err)
+	for _, field := range []string{"consumer", "owner", "account", "generation", "commitment"} {
+		changed := completed.Scope
+		mac := completed.EnrollmentMAC
+		changedCtx := owner
+		switch field {
+		case "consumer":
+			changed.Consumer = "foreign"
+			changedCtx, err = service.WithGatewayNativeConsumer(owner, changed.Consumer)
+			require.NoError(t, err)
+		case "owner":
+			changed.Owner = "foreign"
+			changedCtx, err = service.WithGatewayNativeOAuthOwner(owner, changed.Owner)
+			require.NoError(t, err)
+		case "account":
+			changed.Account = "foreign"
+		case "generation":
+			changed.Generation = uuid.NewString()
+		case "commitment":
+			mac = strings.Repeat("0", 64)
+		}
+		_, found, err := f1.ReplayGatewayNativeOAuth(changedCtx, changed, completed.EnrollmentOperation, mac)
+		require.False(t, found)
+		if field == "consumer" {
+			require.NoError(t, err) // scoped absence yields no custody result
+		} else {
+			require.Error(t, err)
+		}
+	}
+	_, err = restarted.CompleteCallback(ctx, priorURL.Query().Get("state"), "another-code")
+	require.NoError(t, err)
+	require.Equal(t, int32(2), exchanges.Load())
+
+	// A prepared private operation cannot be used by an independent F1 writer.
+	// The guard also denies a mismatched commitment after the entry is bound.
+	exclusiveOwner, exclusiveScope := oauthPGScope(t, "exclusive-consumer", "exclusive-owner", "exclusive-logical")
+	_, err = restarted.BeginConnect(exclusiveOwner, exclusiveScope, "exclusive-operation")
+	require.NoError(t, err)
+	exclusiveIntent, err := restartedRepo.ReadConnectIntent(exclusiveOwner, exclusiveScope, "exclusive-operation")
+	require.NoError(t, err)
+	exclusiveBundle := bundleFor("f3-exclusive-principal")
+	_, err = priorEnrollment.Stage(exclusiveOwner, exclusiveScope, exclusiveIntent.EnrollmentOperation, exclusiveBundle)
+	require.Error(t, err)
+	won, err = restartedRepo.EnterConnect(exclusiveOwner, exclusiveIntent)
+	require.NoError(t, err)
+	require.True(t, won)
+	exclusiveIntent, err = restartedRepo.BindConnectEnrollment(exclusiveOwner, exclusiveIntent, strings.Repeat("0", 64))
+	require.NoError(t, err)
+	_, err = priorEnrollment.Stage(exclusiveOwner, exclusiveScope, exclusiveIntent.EnrollmentOperation, exclusiveBundle)
+	require.Error(t, err)
+	var candidates int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_identity_reservations WHERE consumer=$1`, exclusiveScope.Consumer).Scan(&candidates))
+	require.Zero(t, candidates)
+	sealed, err := restartedRepo.FinishConnect(exclusiveOwner, exclusiveIntent, "quarantined", service.GatewayNativeOAuthOutcome{})
+	require.NoError(t, err)
+	require.True(t, sealed.RecoveryDenied)
+	_, err = restartedRepo.BindConnectEnrollment(exclusiveOwner, sealed, strings.Repeat("1", 64))
+	require.Error(t, err)
+	// Actual accepted F1 operation collision at Prepare is denied by SQL,
+	// rather than relying on the probability of a fresh private UUID alone.
+	collision := exclusiveIntent
+	collision.Operation = "collision-operation"
+	collision.EnrollmentOperation = completed.EnrollmentOperation
+	collision.Scope = completed.Scope
+	collision.StateHash = strings.Repeat("1", 64)
+	collision.State = "prepared"
+	collision.Envelope = prepared.Envelope
+	collision.EnrollmentMAC = ""
+	collision.RecoveryDenied = false
+	_, err = restartedRepo.PrepareConnect(owner, collision)
+	require.Error(t, err)
 }

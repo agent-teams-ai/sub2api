@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/google/uuid"
 )
 
 const GatewayOAuthConnectRedirect = "http://localhost:1455/auth/callback"
@@ -28,15 +30,18 @@ const GatewayOAuthConnectTTL = 10 * time.Minute
 // Server-private persisted intent. Never marshal this as a response or log it.
 // No authorization code or token response is persisted here.
 type GatewayNativeOAuthConnectIntent struct {
-	Scope     GatewayNativeCredentialScope `json:"-"`
-	Operation string                       `json:"-"`
-	ClientID  string                       `json:"-"`
-	Redirect  string                       `json:"-"`
-	Deadline  time.Time                    `json:"-"`
-	StateHash string                       `json:"-"`
-	Envelope  string                       `json:"-"`
-	State     string                       `json:"-"`
-	Outcome   GatewayNativeOAuthOutcome    `json:"-"`
+	Scope               GatewayNativeCredentialScope `json:"-"`
+	Operation           string                       `json:"-"`
+	ClientID            string                       `json:"-"`
+	Redirect            string                       `json:"-"`
+	Deadline            time.Time                    `json:"-"`
+	StateHash           string                       `json:"-"`
+	Envelope            string                       `json:"-"`
+	State               string                       `json:"-"`
+	Outcome             GatewayNativeOAuthOutcome    `json:"-"`
+	EnrollmentOperation string                       `json:"-"`
+	EnrollmentMAC       string                       `json:"-"`
+	RecoveryDenied      bool                         `json:"-"`
 }
 
 // One durable CAS owns token entry; no in-memory lock is replay authority.
@@ -46,11 +51,12 @@ type GatewayNativeOAuthConnectRepository interface {
 	ReadConnectIntent(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthConnectIntent, error)
 	FindConnectState(context.Context, string) (GatewayNativeOAuthConnectIntent, error)
 	EnterConnect(context.Context, GatewayNativeOAuthConnectIntent) (bool, error)
+	BindConnectEnrollment(context.Context, GatewayNativeOAuthConnectIntent, string) (GatewayNativeOAuthConnectIntent, error)
 	FinishConnect(context.Context, GatewayNativeOAuthConnectIntent, string, GatewayNativeOAuthOutcome) (GatewayNativeOAuthConnectIntent, error)
 }
 
 type GatewayNativeOAuthConnectReadback interface {
-	ReadGatewayNativeOAuth(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthOutcome, error)
+	ReplayGatewayNativeOAuth(context.Context, GatewayNativeCredentialScope, string, string) (GatewayNativeOAuthOutcome, bool, error)
 }
 
 // Safe public operation view: deliberately omits native row IDs and claims.
@@ -91,14 +97,18 @@ func NewGatewayNativeOAuthConnect(key []byte, transport http.RoundTripper, repos
 			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second,
 			ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16384, MaxConnsPerHost: 2, DisableKeepAlives: true}
 	}
-	return &GatewayNativeOAuthConnect{aead: aead, client: &http.Client{Transport: transport, Timeout: 10 * time.Second,
+	return &GatewayNativeOAuthConnect{aead: aead, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }},
 		repository: repository, enrollment: enrollment, readback: readback, now: time.Now}, nil
 }
 
 func GatewayNativeOAuthConnectIntentValid(in GatewayNativeOAuthConnectIntent) bool {
 	hash, err := hex.DecodeString(in.StateHash)
+	enrollmentID, idErr := uuid.Parse(strings.TrimPrefix(in.EnrollmentOperation, "connect-"))
+	mac, macErr := hex.DecodeString(in.EnrollmentMAC)
 	return GatewayNativeOAuthScopeValid(in.Scope) && GatewayNativeCredentialRefValid(in.Operation) &&
+		idErr == nil && enrollmentID != uuid.Nil && in.EnrollmentOperation == "connect-"+enrollmentID.String() && in.EnrollmentOperation != in.Operation &&
+		(in.EnrollmentMAC == "" || (macErr == nil && len(mac) == 32 && hex.EncodeToString(mac) == in.EnrollmentMAC)) &&
 		in.ClientID == openai.ClientID && in.Redirect == GatewayOAuthConnectRedirect &&
 		!in.Deadline.IsZero() && in.Deadline.Equal(in.Deadline.Truncate(time.Microsecond)) &&
 		err == nil && len(hash) == 32 && hex.EncodeToString(hash) == in.StateHash
@@ -110,10 +120,10 @@ func SameGatewayNativeOAuthConnectIntent(a, b GatewayNativeOAuthConnectIntent) b
 
 func connectAAD(in GatewayNativeOAuthConnectIntent) []byte {
 	raw, _ := json.Marshal(struct {
-		Scope                                            GatewayNativeCredentialScope
-		Operation, Client, Redirect, Deadline, StateHash string
+		Scope                                                                 GatewayNativeCredentialScope
+		Operation, EnrollmentOperation, Client, Redirect, Deadline, StateHash string
 	}{
-		in.Scope, in.Operation, in.ClientID, in.Redirect, in.Deadline.UTC().Format(time.RFC3339Nano), in.StateHash})
+		in.Scope, in.Operation, in.EnrollmentOperation, in.ClientID, in.Redirect, in.Deadline.UTC().Format(time.RFC3339Nano), in.StateHash})
 	return append([]byte("account-gateway/native/oauth-connect-material/v1\x00"), raw...)
 }
 
@@ -173,7 +183,8 @@ func (s *GatewayNativeOAuthConnect) BeginConnect(ctx context.Context, scope Gate
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
 	}
 	in := GatewayNativeOAuthConnectIntent{Scope: scope, Operation: operation, ClientID: openai.ClientID, Redirect: GatewayOAuthConnectRedirect,
-		Deadline: s.now().UTC().Truncate(time.Microsecond).Add(GatewayOAuthConnectTTL), StateHash: connectStateHash(state), State: "prepared"}
+		EnrollmentOperation: "connect-" + uuid.NewString(),
+		Deadline:            s.now().UTC().Truncate(time.Microsecond).Add(GatewayOAuthConnectTTL), StateHash: connectStateHash(state), State: "prepared"}
 	in.Envelope, err = s.seal(in, connectMaterial{state, verifier})
 	if err != nil {
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
@@ -237,21 +248,45 @@ func (s *GatewayNativeOAuthConnect) reconcile(ctx context.Context, in GatewayNat
 	if in.State == "prepared" && !s.now().Before(in.Deadline) {
 		return s.repository.FinishConnect(ctx, in, "expired", GatewayNativeOAuthOutcome{})
 	}
-	if in.State != "entered" && in.State != "unknown" {
+	if (in.State != "entered" && in.State != "unknown") || in.RecoveryDenied {
 		return in, nil
 	}
 	ownerCtx, err := connectContext(ctx, in)
 	if err != nil {
 		return in, err
 	}
-	out, err := s.readback.ReadGatewayNativeOAuth(ownerCtx, in.Scope, in.Operation)
-	if err == nil && out.Operation == in.Operation && out.Generation == in.Scope.Generation && out.AccountID > 0 && (out.State == "staged" || out.State == "erased") {
+	if in.EnrollmentMAC == "" {
+		return s.repository.FinishConnect(ctx, in, "unknown", GatewayNativeOAuthOutcome{})
+	}
+	out, found, err := s.readback.ReplayGatewayNativeOAuth(ownerCtx, in.Scope, in.EnrollmentOperation, in.EnrollmentMAC)
+	if err == nil && found && out.Operation == in.EnrollmentOperation && out.Generation == in.Scope.Generation && out.AccountID > 0 && (out.State == "staged" || out.State == "erased") {
 		// F1 initial Stage always returns staged. Erase changes current readback,
 		// not the original enrollment outcome retained by the connect operation.
 		out.State = "staged"
 		return s.repository.FinishConnect(ctx, in, "completed", out)
 	}
 	return s.repository.FinishConnect(ctx, in, "unknown", GatewayNativeOAuthOutcome{})
+}
+
+// Intercept the already verified/sealed F1 reservation to durably link its exact
+// commitment before custody entry. F1 Stage and its commitment algorithm remain
+// unchanged; neither tokens nor the bundle are persisted by F3.
+type connectEnrollmentRepository struct {
+	GatewayNativeOAuthRepository
+	connect GatewayNativeOAuthConnectRepository
+	intent  *GatewayNativeOAuthConnectIntent
+}
+
+func (r connectEnrollmentRepository) StageGatewayNativeOAuth(ctx context.Context, reservation GatewayNativeOAuthReservation) (GatewayNativeOAuthOutcome, error) {
+	if reservation.Scope != r.intent.Scope || reservation.Operation != r.intent.EnrollmentOperation {
+		return GatewayNativeOAuthOutcome{}, ErrGatewayOAuthConflict
+	}
+	saved, err := r.connect.BindConnectEnrollment(ctx, *r.intent, reservation.IntentMAC)
+	if err != nil {
+		return GatewayNativeOAuthOutcome{}, err
+	}
+	*r.intent = saved
+	return r.GatewayNativeOAuthRepository.StageGatewayNativeOAuth(ctx, reservation)
 }
 
 func connectCodeValid(code string) bool {
@@ -301,8 +336,12 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 	defer cancel()
 	bundle, err := s.exchange(bounded, code, material.Verifier)
 	material = connectMaterial{}
+	quarantine := err != nil
 	if err == nil {
-		out, stageErr := s.enrollment.Stage(bounded, in.Scope, in.Operation, bundle)
+		enrollment := *s.enrollment
+		enrollment.repository = connectEnrollmentRepository{enrollment.repository, s.repository, &in}
+		out, stageErr := enrollment.Stage(bounded, in.Scope, in.EnrollmentOperation, bundle)
+		quarantine = errors.Is(stageErr, ErrGatewayOAuthConflict) || in.EnrollmentMAC == ""
 		bundle = GatewayNativeOAuthBundle{}
 		if stageErr == nil {
 			saved, finishErr := s.repository.FinishConnect(bounded, in, "completed", out)
@@ -314,6 +353,10 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 	// Bounded independent readback still works after the caller loses its ACK.
 	recovery, stop := context.WithTimeout(context.WithoutCancel(ownerCtx), 5*time.Second)
 	defer stop()
+	if quarantine {
+		saved, finishErr := s.repository.FinishConnect(recovery, in, "quarantined", GatewayNativeOAuthOutcome{})
+		return connectResult(saved), finishErr
+	}
 	saved, recoveryErr := s.reconcile(recovery, in)
 	if recoveryErr != nil {
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
@@ -322,6 +365,9 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 }
 
 func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier string) (GatewayNativeOAuthBundle, error) {
+	// One deadline covers dialing, TLS, headers AND reading/closing the body.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	deny := func() (GatewayNativeOAuthBundle, error) { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
 	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {openai.ClientID}, "redirect_uri": {GatewayOAuthConnectRedirect}, "code": {code}, "code_verifier": {verifier}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, openai.TokenURL, strings.NewReader(form.Encode()))

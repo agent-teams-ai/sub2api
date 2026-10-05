@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -65,11 +66,22 @@ func (r *connectHTTPStore) EnterConnect(_ context.Context, _ service.GatewayNati
 	r.row.State = "entered"
 	return true, nil
 }
+func (r *connectHTTPStore) BindConnectEnrollment(_ context.Context, in service.GatewayNativeOAuthConnectIntent, mac string) (service.GatewayNativeOAuthConnectIntent, error) {
+	if r.row.RecoveryDenied || r.row.StateHash != in.StateHash || (r.row.EnrollmentMAC != "" && r.row.EnrollmentMAC != mac) {
+		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayOAuthConflict
+	}
+	r.row.EnrollmentMAC = mac
+	return r.row, nil
+}
 func (r *connectHTTPStore) FinishConnect(_ context.Context, _ service.GatewayNativeOAuthConnectIntent, state string, out service.GatewayNativeOAuthOutcome) (service.GatewayNativeOAuthConnectIntent, error) {
 	if state == "completed" && r.lostFinalACK {
 		r.lostFinalACK = false
 		r.losses++
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
+	}
+	if state == "quarantined" {
+		state = "unknown"
+		r.row.RecoveryDenied = true
 	}
 	if r.row.State != "completed" {
 		r.row.State = state
@@ -81,12 +93,24 @@ func (r *connectHTTPStore) FinishConnect(_ context.Context, _ service.GatewayNat
 
 type connectHTTPEnrollmentStore struct {
 	service.GatewayNativeOAuthRepository
-	reservation service.GatewayNativeOAuthReservation
-	outcome     service.GatewayNativeOAuthOutcome
-	calls       int
+	reservation  service.GatewayNativeOAuthReservation
+	outcome      service.GatewayNativeOAuthOutcome
+	calls        int
+	conflicts    int
+	lostStageACK bool
 }
 
-func (r *connectHTTPEnrollmentStore) ReplayGatewayNativeOAuth(context.Context, service.GatewayNativeCredentialScope, string, string) (service.GatewayNativeOAuthOutcome, bool, error) {
+func (r *connectHTTPEnrollmentStore) ReplayGatewayNativeOAuth(ctx context.Context, scope service.GatewayNativeCredentialScope, op, mac string) (service.GatewayNativeOAuthOutcome, bool, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, scope) {
+		return service.GatewayNativeOAuthOutcome{}, false, service.ErrGatewayNativeIdentity
+	}
+	if r.reservation.Operation == op {
+		if r.reservation.Scope != scope || r.reservation.IntentMAC != mac {
+			r.conflicts++
+			return service.GatewayNativeOAuthOutcome{}, false, service.ErrGatewayOAuthConflict
+		}
+		return r.outcome, true, nil
+	}
 	return service.GatewayNativeOAuthOutcome{}, false, nil
 }
 func (r *connectHTTPEnrollmentStore) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (service.GatewayNativeOAuthOutcome, error) {
@@ -94,8 +118,16 @@ func (r *connectHTTPEnrollmentStore) StageGatewayNativeOAuth(ctx context.Context
 		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayNativeIdentity
 	}
 	r.calls++
+	if r.reservation.Operation != "" {
+		r.conflicts++
+		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayOAuthConflict
+	}
 	r.reservation = in
 	r.outcome = service.GatewayNativeOAuthOutcome{Operation: in.Operation, AccountID: 42, Generation: in.Scope.Generation, State: "staged"}
+	if r.lostStageACK {
+		r.lostStageACK = false
+		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayNativeIdentity
+	}
 	return r.outcome, nil
 }
 func (r *connectHTTPEnrollmentStore) ReadGatewayNativeOAuth(ctx context.Context, s service.GatewayNativeCredentialScope, op string) (service.GatewayNativeOAuthOutcome, error) {
@@ -106,18 +138,22 @@ func (r *connectHTTPEnrollmentStore) ReadGatewayNativeOAuth(ctx context.Context,
 }
 
 type connectHTTPFixture struct {
-	router      *gin.Engine
-	store       *connectHTTPStore
-	enrolled    *connectHTTPEnrollmentStore
-	connect     *service.GatewayNativeOAuthConnect
-	tokens      atomic.Int32
-	destination atomic.Int32
-	response    string
-	redirect    bool
-	challenge   string
-	scope       service.GatewayNativeCredentialScope
-	secrets     []string
-	logs        bytes.Buffer
+	router         *gin.Engine
+	store          *connectHTTPStore
+	enrolled       *connectHTTPEnrollmentStore
+	connect        *service.GatewayNativeOAuthConnect
+	enrollment     *service.GatewayNativeOAuthEnrollment
+	tokens         atomic.Int32
+	destination    atomic.Int32
+	response       string
+	redirect       bool
+	stallBody      bool
+	headersFlushed chan struct{}
+	bodyCancelled  chan struct{}
+	challenge      string
+	scope          service.GatewayNativeCredentialScope
+	secrets        []string
+	logs           bytes.Buffer
 }
 
 func connectHTTPRandom(t *testing.T, n int) []byte {
@@ -170,6 +206,18 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 			http.Redirect(w, r, destination.URL+"/stolen", 302)
 			return
 		}
+		if f.stallBody {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			close(f.headersFlushed)
+			select {
+			case <-r.Context().Done():
+				close(f.bodyCancelled)
+				return
+			case <-time.After(6 * time.Second):
+			}
+		}
 		_, _ = io.WriteString(w, f.response)
 	}))
 	t.Cleanup(source.Close)
@@ -189,6 +237,7 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	require.NoError(t, err)
 	enrollment, err := service.NewGatewayNativeOAuthEnrollment(service.NewGatewayNativeOAuthVerifier(transport), custody, f.enrolled, connectHTTPRandom(t, 32))
 	require.NoError(t, err)
+	f.enrollment = enrollment
 	f.connect, err = service.NewGatewayNativeOAuthConnect(connectHTTPRandom(t, 32), transport, f.store, enrollment, f.enrolled)
 	require.NoError(t, err)
 	gin.SetMode(gin.TestMode)
@@ -345,4 +394,105 @@ func TestGatewayNativeOAuthConnectHTTPTokenFailureIsSpent(t *testing.T) {
 			require.NotContains(t, w.Body.String()+f.logs.String(), "fixture-upstream-secret")
 		})
 	}
+}
+
+// A is a real signed, verified, sealed F1 Stage under the caller's operation.
+// B exchanges a different bundle for that same operation. A's old result must
+// never become B's success after either a definite conflict or failed exchange.
+func TestGatewayNativeOAuthConnectHTTPPriorStageCannotCompleteNewAttempt(t *testing.T) {
+	for _, failedExchange := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failed-exchange-%t", failedExchange), func(t *testing.T) {
+			f := newConnectHTTPFixture(t)
+			ctx, err := service.WithGatewayNativeConsumer(context.Background(), f.scope.Consumer)
+			require.NoError(t, err)
+			ctx, err = service.WithGatewayNativeOAuthOwner(ctx, f.scope.Owner)
+			require.NoError(t, err)
+			var m map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(f.response), &m))
+			var bundle service.GatewayNativeOAuthBundle
+			require.NoError(t, json.Unmarshal(m["id_token"], &bundle.IDToken))
+			bundle.AccessToken = gatewayConnectStageFixtureOpaque()
+			bundle.RefreshToken = gatewayConnectStageFixtureOpaque()
+			bundle.SensitiveMetadata = json.RawMessage(`{"private":"controlled-stage-A"}`)
+			out, err := f.enrollment.Stage(ctx, f.scope, "operation", bundle)
+			require.NoError(t, err)
+			require.Equal(t, "staged", out.State)
+			original := f.enrolled.reservation
+			state := f.begin(t)
+			if failedExchange {
+				f.response = `{"error":"controlled-exchange-failure"}`
+			}
+			path := "/auth/callback?state=" + state + "&code=fixture-code"
+			require.Equal(t, 200, f.request(t, path, "", false).Code)
+			read := f.request(t, "/private/native/v1/oauth/connect/read", f.input(), true)
+			require.Contains(t, read.Body.String(), `"state":"unknown"`)
+			require.NotContains(t, read.Body.String(), `"outcome":"staged"`)
+			require.Equal(t, original, f.enrolled.reservation)
+			if !failedExchange {
+				require.Equal(t, 1, f.enrolled.conflicts)
+			}
+			f.request(t, path, "", false)
+			require.Equal(t, int32(1), f.tokens.Load())
+		})
+	}
+}
+
+// Immediate headers do not end the exchange budget: a withheld body must be
+// cancelled at five seconds, and the spent callback must not exchange again.
+func TestGatewayNativeOAuthConnectHTTPFlushedHeadersStalledBodyDeadline(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	f.stallBody = true
+	f.headersFlushed = make(chan struct{})
+	f.bodyCancelled = make(chan struct{})
+	state := f.begin(t)
+	path := "/auth/callback?state=" + state + "&code=fixture-code"
+	started := time.Now()
+	require.Equal(t, 200, f.request(t, path, "", false).Code)
+	elapsed := time.Since(started)
+	select {
+	case <-f.headersFlushed:
+	default:
+		t.Fatal("controlled TLS server did not flush headers")
+	}
+	require.GreaterOrEqual(t, elapsed, 4500*time.Millisecond)
+	require.Less(t, elapsed, 5750*time.Millisecond)
+	require.Equal(t, "unknown", f.store.row.State)
+	require.Empty(t, f.store.row.Envelope)
+	require.Zero(t, f.enrolled.calls)
+	select {
+	case <-f.bodyCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("body read did not cancel the controlled server request")
+	}
+	f.request(t, path, "", false)
+	require.Equal(t, int32(1), f.tokens.Load())
+}
+
+func TestGatewayNativeOAuthConnectHTTPExactCommitmentLostStageACK(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	f.enrolled.lostStageACK = true
+	state := f.begin(t)
+	path := "/auth/callback?state=" + state + "&code=fixture-code"
+	require.Equal(t, 200, f.request(t, path, "", false).Code)
+	require.Equal(t, "completed", f.store.row.State)
+	require.NotEqual(t, "operation", f.enrolled.reservation.Operation)
+	require.Equal(t, f.store.row.EnrollmentOperation, f.enrolled.reservation.Operation)
+	require.Equal(t, f.store.row.EnrollmentMAC, f.enrolled.reservation.IntentMAC)
+	require.NotEmpty(t, f.store.row.EnrollmentMAC)
+	require.Equal(t, f.enrolled.outcome, f.store.row.Outcome)
+	read := f.request(t, "/private/native/v1/oauth/connect/read", f.input(), true)
+	for _, private := range []string{f.store.row.EnrollmentOperation, f.store.row.EnrollmentMAC} {
+		require.NotContains(t, read.Body.String()+f.logs.String(), private)
+	}
+	f.request(t, path, "", false)
+	require.Equal(t, int32(1), f.tokens.Load())
+	require.Equal(t, 1, f.enrolled.calls)
+}
+
+func gatewayConnectStageFixtureOpaque() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("fixture entropy unavailable")
+	}
+	return hex.EncodeToString(b)
 }

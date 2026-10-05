@@ -56,8 +56,8 @@ func (r *connectPureStore) FinishConnect(_ context.Context, _ GatewayNativeOAuth
 
 type connectNoOutcome struct{}
 
-func (connectNoOutcome) ReadGatewayNativeOAuth(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthOutcome, error) {
-	return GatewayNativeOAuthOutcome{}, ErrGatewayNativeIdentity
+func (connectNoOutcome) ReplayGatewayNativeOAuth(context.Context, GatewayNativeCredentialScope, string, string) (GatewayNativeOAuthOutcome, bool, error) {
+	return GatewayNativeOAuthOutcome{}, false, ErrGatewayNativeIdentity
 }
 
 func connectPureFixture(t *testing.T) (*GatewayNativeOAuthConnect, *connectPureStore, context.Context, GatewayNativeCredentialScope) {
@@ -139,7 +139,7 @@ func TestGatewayNativeOAuthConnectPrepareCustodyAndAuthority(t *testing.T) {
 	transport := s.client.Transport.(*http.Transport)
 	require.Nil(t, transport.Proxy)
 	require.True(t, transport.DisableKeepAlives)
-	require.NotZero(t, s.client.Timeout)
+	require.Equal(t, 5*time.Second, s.client.Timeout)
 	require.NotNil(t, s.client.CheckRedirect)
 	// Expiry clears ONLY material, retaining capability hash and replay outcome.
 	s.now = func() time.Time { return original.Deadline }
@@ -156,7 +156,7 @@ func TestGatewayNativeOAuthConnectMaterialExactAAD(t *testing.T) {
 	s, r, ctx, scope := connectPureFixture(t)
 	_, err := s.BeginConnect(ctx, scope, "operation")
 	require.NoError(t, err)
-	for _, field := range []string{"consumer", "owner", "account", "generation", "purpose", "operation", "deadline", "client", "redirect", "hash", "cipher"} {
+	for _, field := range []string{"consumer", "owner", "account", "generation", "purpose", "operation", "enrollment", "deadline", "client", "redirect", "hash", "cipher"} {
 		t.Run(field, func(t *testing.T) {
 			in := r.row
 			switch field {
@@ -172,6 +172,8 @@ func TestGatewayNativeOAuthConnectMaterialExactAAD(t *testing.T) {
 				in.Scope.Purpose = GatewayCredentialPurpose
 			case "operation":
 				in.Operation = "other"
+			case "enrollment":
+				in.EnrollmentOperation = "connect-" + uuid.NewString()
 			case "deadline":
 				in.Deadline = in.Deadline.Add(time.Microsecond)
 			case "client":
