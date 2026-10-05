@@ -1085,7 +1085,8 @@ func TestGatewayNativeActualResponseHeaderCapAndOrdinaryCompatibility(t *testing
 			server.StartTLS()
 			defer server.Close()
 			cfg := &config.Config{Gateway: config.GatewayConfig{OpenAIHTTP2: config.GatewayOpenAIHTTP2Config{Enabled: h2}}}
-			upstream := NewHTTPUpstream(cfg).(*httpUpstreamService)
+			upstream, ok := NewHTTPUpstream(cfg).(*httpUpstreamService)
+			require.True(t, ok, "test requires the concrete upstream transport")
 			defer func() {
 				for _, entry := range upstream.clients {
 					entry.client.CloseIdleConnections()
@@ -1103,7 +1104,8 @@ func TestGatewayNativeActualResponseHeaderCapAndOrdinaryCompatibility(t *testing
 			for _, headerCap := range []int64{0, service.GatewayNativeResponseHeaderBytes(private)} {
 				entry, err := upstream.getClientEntryWithHeaderLimit("", 71, 0, service.HTTPUpstreamProfileOpenAI, false, true, headerCap)
 				require.NoError(t, err)
-				transport := entry.client.Transport.(*http.Transport)
+				transport, ok := entry.client.Transport.(*http.Transport)
+				require.True(t, ok, "test requires the concrete HTTP transport")
 				if transport.TLSClientConfig == nil {
 					transport.TLSClientConfig = &tls.Config{}
 				}
