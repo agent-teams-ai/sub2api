@@ -53,10 +53,10 @@ func oauthFixtureVerifier(t *testing.T, handler http.Handler, now time.Time) *Ga
 		require.Equal(t, "auth.openai.com:443", address)
 		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
 	}
-	client.Transport = transport
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }
-	client.Timeout = 2 * time.Second
-	return &GatewayNativeOAuthVerifier{client: client, now: func() time.Time { return now }}
+	t.Cleanup(transport.CloseIdleConnections)
+	verifier := NewGatewayNativeOAuthVerifier(transport)
+	verifier.now = func() time.Time { return now }
+	return verifier
 }
 
 // Failure: decode-only JWT authority could reserve a fabricated subject, or a
@@ -121,20 +121,117 @@ func TestGatewayNativeOAuthSignedIdentityAndClaimRejections(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// Failure: redirected, ambiguous or malformed JWKS could substitute an attacker's
+// Failure: a genuinely signed token can expire while JWKS is being fetched;
+// using the pre-fetch clock can then grant first-enrollment identity authority.
+func TestGatewayNativeOAuthTemporalClaimsAfterJWKS(t *testing.T) {
+	key := oauthFixtureKey(t)
+	start := time.Unix(1800000000, 0)
+	for _, tc := range []struct {
+		name      string
+		retrieved time.Time
+		exp       time.Time
+		nbf       time.Time
+		iat       time.Time
+		valid     bool
+	}{
+		{"still valid after retrieval", start.Add(30 * time.Second), start.Add(time.Minute), start.Add(-time.Minute), start.Add(-time.Minute), true},
+		{"expires at retrieval", start.Add(time.Minute), start.Add(time.Minute), start.Add(-time.Minute), start.Add(-time.Minute), false},
+		{"expires during retrieval", start.Add(2 * time.Minute), start.Add(time.Minute), start.Add(-time.Minute), start.Add(-time.Minute), false},
+		{"not yet valid after clock adjustment", start.Add(-2 * time.Minute), start.Add(time.Hour), start.Add(-time.Minute), start.Add(-3 * time.Minute), false},
+		{"issued in future after clock adjustment", start.Add(-2 * time.Minute), start.Add(time.Hour), start.Add(-3 * time.Minute), start.Add(-time.Minute), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var clock atomic.Int64
+			clock.Store(start.Unix())
+			var requests atomic.Int32
+			verifier := oauthFixtureVerifier(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				require.Equal(t, "auth.openai.com", r.Host)
+				require.Equal(t, "/.well-known/jwks.json", r.URL.Path)
+				// Model elapsed retrieval time without wall-clock sleeps. The key
+				// is returned only after the trusted clock has changed.
+				clock.Store(tc.retrieved.Unix())
+				_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
+			}), start)
+			verifier.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+			claims := fmt.Sprintf(`{"iss":%q,"sub":"synthetic-subject","aud":%q,"exp":%d,"nbf":%d,"iat":%d}`, GatewayOAuthIssuer, gatewayOAuthAudience, tc.exp.Unix(), tc.nbf.Unix(), tc.iat.Unix())
+			token := oauthFixtureSign(t, key, `{"alg":"RS256","kid":"fixture"}`, claims)
+			identity, err := verifier.Verify(context.Background(), token)
+			if tc.valid {
+				require.NoError(t, err)
+				require.True(t, identity.Verified())
+			} else {
+				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+				require.Equal(t, GatewayNativeOAuthIdentity{}, identity)
+			}
+			require.Equal(t, int32(1), requests.Load())
+		})
+	}
+}
+
+// Failure: removing the production factory's redirect policy can contact an
+// untrusted key destination even when the eventual JWKS origin check denies.
+func TestGatewayNativeOAuthProductionVerifierRejectsRedirectWithoutDestinationRequest(t *testing.T) {
+	key := oauthFixtureKey(t)
+	now := time.Unix(1800000000, 0)
+	var sourceRequests, destinationRequests atomic.Int32
+	var redirect atomic.Bool
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destinationRequests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
+	}))
+	defer destination.Close()
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sourceRequests.Add(1)
+		require.Equal(t, "auth.openai.com", r.Host)
+		require.Equal(t, "/.well-known/jwks.json", r.URL.Path)
+		if redirect.Load() {
+			http.Redirect(w, r, destination.URL+"/keys", http.StatusFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
+	}))
+	defer source.Close()
+	transport := source.Client().Transport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	transport.TLSClientConfig.ServerName = "example.com"
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		switch address {
+		case "auth.openai.com:443":
+			address = source.Listener.Addr().String()
+		case destination.Listener.Addr().String():
+		default:
+			return nil, fmt.Errorf("unexpected fixture destination")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	verifier := NewGatewayNativeOAuthVerifier(transport)
+	verifier.now = func() time.Time { return now }
+	token := oauthFixtureSign(t, key, `{"alg":"RS256","kid":"fixture"}`, oauthFixtureClaims("synthetic-subject", now))
+	// Establish that the controlled source can satisfy the complete production
+	// issuer/audience/JWKS/signature contract before testing redirect refusal.
+	identity, err := verifier.Verify(context.Background(), token)
+	require.NoError(t, err)
+	require.True(t, identity.Verified())
+	redirect.Store(true)
+	identity, err = verifier.Verify(context.Background(), token)
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.Equal(t, GatewayNativeOAuthIdentity{}, identity)
+	require.Equal(t, int32(2), sourceRequests.Load())
+	require.Zero(t, destinationRequests.Load())
+}
+
+// Failure: ambiguous or malformed JWKS could substitute an attacker's
 // public key even though the JWT itself has a genuine cryptographic signature.
 func TestGatewayNativeOAuthJWKSRejectsUntrustedMaterial(t *testing.T) {
 	key := oauthFixtureKey(t)
 	now := time.Now().Truncate(time.Second)
 	token := oauthFixtureSign(t, key, `{"alg":"RS256","kid":"fixture"}`, oauthFixtureClaims("synthetic", now))
-	for _, name := range []string{"redirect", "duplicate kid", "small modulus", "bad exponent", "encryption key", "private material", "bad key_ops", "duplicate field", "wrong alg", "oversized"} {
+	for _, name := range []string{"duplicate kid", "small modulus", "bad exponent", "encryption key", "private material", "bad key_ops", "duplicate field", "wrong alg", "oversized"} {
 		t.Run(name, func(t *testing.T) {
 			jwk := oauthFixtureJWK(key)
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch name {
-				case "redirect":
-					http.Redirect(w, r, "https://untrusted.invalid/keys", http.StatusFound)
-					return
 				case "duplicate kid":
 					_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk, jwk}})
 					return

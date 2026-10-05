@@ -271,6 +271,9 @@ func (v *GatewayNativeOAuthVerifier) Verify(ctx context.Context, encoded string)
 	if err != nil {
 		return deny()
 	}
+	// JWKS retrieval can outlast the token. Validate temporal claims against
+	// the trusted clock again after the signing key has been retrieved.
+	now = v.now()
 	token, err := jwt.Parse(encoded, func(*jwt.Token) (any, error) { return key, nil },
 		jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(GatewayOAuthIssuer),
 		jwt.WithAudience(gatewayOAuthAudience), jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithTimeFunc(func() time.Time { return now }))
