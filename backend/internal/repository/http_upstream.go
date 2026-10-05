@@ -111,11 +111,12 @@ var errUpstreamClientLimitReached = errors.New("upstream client cache limit reac
 // poolSettings 连接池配置参数
 // 封装 Transport 所需的各项连接池参数
 type poolSettings struct {
-	maxIdleConns          int           // 最大空闲连接总数
-	maxIdleConnsPerHost   int           // 每主机最大空闲连接数
-	maxConnsPerHost       int           // 每主机最大连接数（含活跃）
-	idleConnTimeout       time.Duration // 空闲连接超时时间
-	responseHeaderTimeout time.Duration // 等待响应头超时时间
+	maxResponseHeaderBytes int64         // nonzero only for the owned private native path
+	maxIdleConns           int           // 最大空闲连接总数
+	maxIdleConnsPerHost    int           // 每主机最大空闲连接数
+	maxConnsPerHost        int           // 每主机最大连接数（含活跃）
+	idleConnTimeout        time.Duration // 空闲连接超时时间
+	responseHeaderTimeout  time.Duration // 等待响应头超时时间
 }
 
 type openAIHTTP2Settings struct {
@@ -211,7 +212,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	}
 
 	// 获取或创建对应的客户端，并标记请求占用
-	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile)
+	entry, err := s.getClientEntryWithHeaderLimit(proxyURL, accountID, accountConcurrency, profile, true, true, service.GatewayNativeResponseHeaderBytes(req.Context()))
 	if err != nil {
 		return nil, err
 	}
@@ -709,6 +710,10 @@ func (s *httpUpstreamService) getOrCreateClient(proxyURL string, accountID int64
 // markInFlight=true 时会标记进行中请求，用于请求路径防止被淘汰
 // enforceLimit=true 时会限制客户端数量，超限且无法淘汰时返回错误
 func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool) (*upstreamClientEntry, error) {
+	return s.getClientEntryWithHeaderLimit(proxyURL, accountID, accountConcurrency, profile, markInFlight, enforceLimit, 0)
+}
+
+func (s *httpUpstreamService) getClientEntryWithHeaderLimit(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool, headerBytes int64) (*upstreamClientEntry, error) {
 	// 获取隔离模式
 	isolation := s.getIsolationMode()
 	// 标准化代理 URL 并解析
@@ -720,10 +725,17 @@ func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, a
 	protocolMode := s.resolveProtocolMode(profile, proxyKey, parsedProxy)
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, profile)
+	settings.maxResponseHeaderBytes = headerBytes
 	// 构建缓存键（根据隔离策略不同）
 	cacheKey := buildCacheKey(isolation, proxyKey, accountID, protocolMode)
 	// 构建连接池配置键（用于检测配置变更）
 	poolKey := buildPoolKey(settings, protocolMode)
+	if headerBytes > 0 {
+		// Separate only private clients. Ordinary keys/policy and OpenAI protocol
+		// selection stay intact; repeated private calls reuse the bounded profile.
+		cacheKey += ":private-native"
+		poolKey += fmt.Sprintf(":headers=%d", headerBytes)
+	}
 
 	now := time.Now()
 	nowUnix := now.UnixNano()
@@ -1375,13 +1387,14 @@ func newUpstreamDialer() *net.Dialer {
 //   - ResponseHeaderTimeout: 等待响应头超时（不影响流式传输）
 func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMode string) (*http.Transport, error) {
 	transport := &http.Transport{
-		DialContext:           newUpstreamDialer().DialContext,
-		TLSHandshakeTimeout:   defaultUpstreamTLSHandshakeTimeout,
-		MaxIdleConns:          settings.maxIdleConns,
-		MaxIdleConnsPerHost:   settings.maxIdleConnsPerHost,
-		MaxConnsPerHost:       settings.maxConnsPerHost,
-		IdleConnTimeout:       settings.idleConnTimeout,
-		ResponseHeaderTimeout: settings.responseHeaderTimeout,
+		MaxResponseHeaderBytes: settings.maxResponseHeaderBytes,
+		DialContext:            newUpstreamDialer().DialContext,
+		TLSHandshakeTimeout:    defaultUpstreamTLSHandshakeTimeout,
+		MaxIdleConns:           settings.maxIdleConns,
+		MaxIdleConnsPerHost:    settings.maxIdleConnsPerHost,
+		MaxConnsPerHost:        settings.maxConnsPerHost,
+		IdleConnTimeout:        settings.idleConnTimeout,
+		ResponseHeaderTimeout:  settings.responseHeaderTimeout,
 	}
 	switch protocolMode {
 	case upstreamProtocolModeLongStreamH2, upstreamProtocolModeOpenAIH2:

@@ -44,6 +44,7 @@ type Config struct {
 	AcknowledgeOwnerClosure                    func(context.Context, string, Proof, Receipt) error
 	MaxEntries                                 int
 	CallbackTimeout, IOTimeout, CleanupTimeout time.Duration
+	ProviderReadIdle                           time.Duration
 	EnvelopeBytes, CallbackBytes               int64
 }
 
@@ -180,6 +181,10 @@ const privateExecutionHandlers = 32
 const privateControlHandlers = 8
 
 func New(ctx context.Context, cfg Config) (*Handler, error) {
+	// Existing private I/O policy is the backward-compatible trusted default.
+	if cfg.ProviderReadIdle == 0 {
+		cfg.ProviderReadIdle = cfg.IOTimeout
+	}
 	p := cfg.Profile
 	u, err := url.Parse(cfg.CallbackOrigin)
 	if ctx == nil || err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || len(cfg.CallbackOrigin) > 2048 || u.Path != "" && u.Path != "/" ||
@@ -192,6 +197,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		p.ProviderTokenUpperBound < p.Tokens || p.ProviderTokenUpperBound > 10000000 ||
 		cfg.MaxEntries < 1 || cfg.MaxEntries > 10000 || cfg.EnvelopeBytes < 1 || cfg.EnvelopeBytes > 5<<20 || cfg.CallbackBytes < 1 || cfg.CallbackBytes > 262144 ||
 		cfg.CallbackTimeout <= 0 || cfg.CallbackTimeout > 30*time.Second || cfg.IOTimeout <= 0 || cfg.IOTimeout > 30*time.Second ||
+		cfg.ProviderReadIdle <= 0 || cfg.ProviderReadIdle > cfg.IOTimeout ||
 		cfg.CleanupTimeout <= 0 || cfg.CleanupTimeout > 30*time.Second || len(cfg.CallbackCredential) < 1 || len(cfg.CallbackCredential) > 2048 || !bearerToken.MatchString(cfg.CallbackCredential) {
 		return nil, errDenied
 	}

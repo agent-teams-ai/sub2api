@@ -174,7 +174,7 @@ func Run(ctx context.Context, options Options) error {
 	tcfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, Authorize: auth,
 		Enrollment: gatewaytransport.Enrollment{OriginRef: origin, EngineIncarnation: inc, QualificationRef: c.Profile.QualificationRef},
 		Profile:    c.Profile.qualified(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
-		IOTimeout: 30 * time.Second, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
+		IOTimeout: 30 * time.Second, ProviderReadIdle: 30 * time.Second, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
 	a.compose(&tcfg)
 	transport, err := gatewaytransport.New(ctx, tcfg)
 	if err != nil || ctx.Err() != nil {

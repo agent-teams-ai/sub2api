@@ -26,11 +26,11 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
-const fixtureProviderKey = "test-fixture-literal"
-const fixtureExecutionToken = "example-fixture-literal"
-const fixtureCallbackToken = "fixture-callback"
-const fixtureCleanupToken = "fixture-cleanup"
-const fixtureForeignToken = "fixture-foreign"
+var fixtureProviderKey = gatewayIngressGuardFixtureOpaque()
+var fixtureExecutionToken = gatewayIngressGuardFixtureOpaque()
+var fixtureCallbackToken = gatewayIngressGuardFixtureOpaque()
+var fixtureCleanupToken = gatewayIngressGuardFixtureOpaque()
+var fixtureForeignToken = gatewayIngressGuardFixtureOpaque()
 
 // Assert the specified source bounds over HTTP, independently of the
 // implementation's channel capacities (changing those must change the result).
@@ -152,8 +152,10 @@ func (r *ownerFixtureRepo) LockGatewayNativeAccount(context.Context, int64) (*se
 }
 
 type ownerFixtureHTTP struct {
-	client     *http.Client
-	closeFails bool
+	client       *http.Client
+	closeFails   bool
+	closeGate    <-chan struct{}
+	closeStarted chan<- struct{}
 }
 
 func (u *ownerFixtureHTTP) Do(r *http.Request, _ string, _ int64, concurrency int) (*http.Response, error) {
@@ -161,6 +163,9 @@ func (u *ownerFixtureHTTP) Do(r *http.Request, _ string, _ int64, concurrency in
 		return nil, errors.New("ordinary limiter entered")
 	}
 	resp, err := u.client.Do(r)
+	if err == nil && u.closeGate != nil {
+		resp.Body = &ownerBlockedClose{ReadCloser: resp.Body, gate: u.closeGate, started: u.closeStarted}
+	}
 	if err == nil && u.closeFails {
 		resp.Body = &ownerCloseFailure{ReadCloser: resp.Body}
 	}
@@ -168,6 +173,20 @@ func (u *ownerFixtureHTTP) Do(r *http.Request, _ string, _ int64, concurrency in
 }
 func (u *ownerFixtureHTTP) DoWithTLS(r *http.Request, proxy string, id int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(r, proxy, id, concurrency)
+}
+
+// Regression: cancellation does not certify closure while the physical Close
+// is delayed, even when the HTTP request itself has already been interrupted.
+type ownerBlockedClose struct {
+	io.ReadCloser
+	gate    <-chan struct{}
+	started chan<- struct{}
+}
+
+func (b *ownerBlockedClose) Close() error {
+	b.started <- struct{}{}
+	<-b.gate
+	return b.ReadCloser.Close()
 }
 
 type ownerCloseFailure struct{ io.ReadCloser }
@@ -180,9 +199,13 @@ func (b *ownerCloseFailure) Close() error {
 func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 	// Regression: partial provider output stalls forever despite server IdleTimeout;
 	// timeout is mistaken for completion or releases unknown occupied evidence.
-	for _, mode := range []string{"completed", "held", "closeFailed", "idle", "idleCloseFailed"} {
+	for _, mode := range []string{"completed", "paused", "held", "closeFailed", "idle", "idleCloseFailed", "idleBlockedClose"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, acks atomic.Int32
+			closeGate := make(chan struct{})
+			closeStarted := make(chan struct{}, 1)
+			var releaseClose sync.Once
+			defer releaseClose.Do(func() { close(closeGate) })
 			providerEntered := make(chan struct{}, 1)
 			providerClosed := make(chan struct{}, 1)
 			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +218,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				default:
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
-				if mode == "held" || mode == "idle" || mode == "idleCloseFailed" {
+				if mode == "held" || strings.HasPrefix(mode, "idle") || mode == "paused" {
 					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
 				} else {
 					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
@@ -206,6 +229,17 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					return
 				}
 				flusher.Flush()
+				if mode == "paused" {
+					// A legitimate reasoning pause longer than the old hardcoded
+					// second must survive the trusted two-second fixture policy.
+					select {
+					case <-time.After(1200 * time.Millisecond):
+					case <-r.Context().Done():
+						return
+					}
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+					flusher.Flush()
+				}
 				// Completion must close the live body without waiting for EOF.
 				<-r.Context().Done()
 				select {
@@ -214,7 +248,11 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				}
 			}))
 			defer upstream.Close()
-			custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": []byte(strings.Repeat("K", 32))})
+			custodyKey := make([]byte, 32)
+			if _, err := rand.Read(custodyKey); err != nil {
+				t.Fatal(err)
+			}
+			custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": custodyKey})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -228,7 +266,11 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					service.GatewayModelExtraKey: "fixture-model", service.GatewayCredentialScopeExtraKey: scope.Metadata(), "openai_responses_mode": "force_responses", "openai_passthrough": true,
 					"native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
 			repo := &ownerFixtureRepo{row: row}
-			u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: upstream.Client(), closeFails: mode == "closeFailed" || mode == "idleCloseFailed"})
+			providerHTTP := &ownerFixtureHTTP{client: upstream.Client(), closeFails: mode == "closeFailed" || mode == "idleCloseFailed"}
+			if mode == "idleBlockedClose" {
+				providerHTTP.closeGate, providerHTTP.closeStarted = closeGate, closeStarted
+			}
+			u, err := service.NewGatewayNativeLifetimeUpstream(providerHTTP)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -258,7 +300,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 			var denyAuthority atomic.Bool
 			cfg := Config{Gateway: gateway, Custody: custody, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, "fixture-qualification"},
 				Profile:    QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "fixture-model", BaseURL: upstream.URL, QualificationRef: "fixture-qualification", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200},
-				MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken, CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, CleanupTimeout: time.Second,
+				MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken, CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, ProviderReadIdle: time.Second, CleanupTimeout: time.Second,
 				Authorize: func(r *http.Request) (Peer, error) {
 					switch r.Header.Get("Authorization") {
 					case "Bearer " + fixtureExecutionToken:
@@ -288,6 +330,9 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					acks.Add(1)
 					return nil
 				},
+			}
+			if mode == "paused" {
+				cfg.ProviderReadIdle = 2 * time.Second
 			}
 			h, err := New(context.Background(), cfg)
 			if err != nil {
@@ -364,15 +409,40 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					t.Fatal("original cancel failed")
 				}
 			}
+			if mode == "idleBlockedClose" {
+				select {
+				case <-closeStarted:
+				case <-time.After(2 * time.Second):
+					t.Fatal("idle did not cancel then attempt Close")
+				}
+				code, retained := call("/read-owner", fixtureExecutionToken, request)
+				if code != 202 || retained.Phase == "closed" || retained.Effect != "effect_unknown" ||
+					!retained.Lifetime.ContextDone || retained.Lifetime.BodyClosed || retained.Lifetime.ForwardingReturned || retained.Lifetime.Completed || retained.Acknowledged {
+					t.Fatal("blocked Close invented closure/completion", retained)
+				}
+				if code, _ := call("/ack-owner", fixtureExecutionToken, request); code != 409 || acks.Load() != 0 {
+					t.Fatal("blocked Close released occupancy")
+				}
+				call("", fixtureExecutionToken, input)
+				if entries.Load() != 1 || admits.Load() != 1 {
+					t.Fatal("blocked Close reentered provider")
+				}
+				select {
+				case <-done:
+					t.Fatal("forward returned before physical Close")
+				default:
+				}
+				releaseClose.Do(func() { close(closeGate) })
+			}
 			select {
 			case result := <-done:
-				if mode == "completed" && (result.err != nil || result.code != 200) {
+				if (mode == "completed" || mode == "paused") && (result.err != nil || result.code != 200) {
 					t.Fatal("actual completed stream failed", result.code, result.err)
 				}
-				if (mode == "idle" || mode == "idleCloseFailed") && bytes.Contains(result.body, []byte("response.completed")) {
+				if strings.HasPrefix(mode, "idle") && bytes.Contains(result.body, []byte("response.completed")) {
 					t.Fatal("read-idle delivered a false completed event")
 				}
-				if mode == "idle" || mode == "idleCloseFailed" {
+				if strings.HasPrefix(mode, "idle") {
 					// Distinguish the native 1s read-idle from this client's
 					// independent 3s timeout and the handler's 5s I/O deadline.
 					if result.duration < 800*time.Millisecond || result.duration >= 2*time.Second || !bytes.Contains(result.body, []byte("response.created")) {
@@ -405,7 +475,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 			if (mode == "closeFailed" || mode == "idleCloseFailed") && !receipt.Lifetime.CloseFailed {
 				t.Fatal("physical Close failure observation lost")
 			}
-			if mode == "idle" || mode == "idleCloseFailed" {
+			if strings.HasPrefix(mode, "idle") {
 				if receipt.Effect != "effect_unknown" || receipt.Lifetime.Completed || receipt.Acknowledged || acks.Load() != 0 || !receipt.Lifetime.ContextDone {
 					t.Fatal("read-idle changed unknown effect or acknowledged occupancy before closure ACK")
 				}
@@ -422,7 +492,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				if code != 202 || !receipt.Acknowledged || receipt.Phase != "closed" || acks.Load() != 1 {
 					t.Fatal("original closed proof not acknowledged")
 				}
-				if mode == "completed" && (receipt.Effect != "completed" || !receipt.Lifetime.Completed) {
+				if (mode == "completed" || mode == "paused") && (receipt.Effect != "completed" || !receipt.Lifetime.Completed) {
 					t.Fatal("completed native outcome lost")
 				}
 				if code, _ := call("/ack-owner", fixtureExecutionToken, request); code != 202 {

@@ -126,6 +126,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	}
 	ctx = service.WithGatewayNativeCustody(ctx, h.cfg.Custody)
 	ctx = service.WithGatewayNativeLifetime(ctx, e.life)
+	ctx = service.WithGatewayNativeProviderReadIdle(ctx, h.cfg.ProviderReadIdle)
 	c, _ := gin.CreateTestContext(raw)
 	c.Writer = &privateGinWriter{ResponseWriter: c.Writer, raw: raw}
 	c.Request = r.Clone(ctx)

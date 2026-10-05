@@ -2,6 +2,11 @@ package repository
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,6 +24,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -1038,4 +1045,155 @@ func TestHTTPUpstreamPublicHostsOnlyValidatesEveryRedirectHop(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.CheckRedirect(publicHop, via))
 	require.Error(t, client.CheckRedirect(publicHop, make([]*http.Request, 10)), "redirect chain stays capped")
+}
+
+// Regression: the private native path inherits Go's 10MiB header default, or
+// tightening a shared OpenAI client also rejects ordinary compatible responses.
+// Exercise real HTTP/1 and HTTP/2 parsing, including warmed client reuse.
+func TestGatewayNativeActualResponseHeaderCapAndOrdinaryCompatibility(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("h2=%v", h2), func(t *testing.T) {
+			var entries atomic.Int32
+			rejectedCanceled := make(chan struct{}, 2)
+			entropy := make([]byte, 32)
+			require.NoError(t, func() error { _, err := rand.Read(entropy); return err }())
+			value := base64.RawURLEncoding.EncodeToString(entropy)
+			large := strings.Repeat(value, 500) // >16KiB, below the ordinary default
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				entries.Add(1)
+				if h2 && r.ProtoMajor != 2 {
+					t.Error("fixture did not negotiate HTTP/2")
+				}
+				if !h2 && r.ProtoMajor != 1 {
+					t.Error("fixture did not use HTTP/1")
+				}
+				if r.URL.Path == "/large" || r.URL.Path == "/v1/responses" {
+					w.Header().Set("X-Provider-Metadata", large)
+				}
+				_, _ = io.WriteString(w, value)
+				if r.URL.Path == "/v1/responses" || r.Header.Get("X-Fixture-Private") != "" {
+					_ = http.NewResponseController(w).Flush()
+					select {
+					case <-r.Context().Done():
+						rejectedCanceled <- struct{}{}
+					case <-time.After(2 * time.Second):
+						t.Error("rejected private header left provider stream live")
+					}
+				}
+			}))
+			server.EnableHTTP2 = h2
+			server.StartTLS()
+			defer server.Close()
+			cfg := &config.Config{Gateway: config.GatewayConfig{OpenAIHTTP2: config.GatewayOpenAIHTTP2Config{Enabled: h2}}}
+			upstream := NewHTTPUpstream(cfg).(*httpUpstreamService)
+			defer func() {
+				for _, entry := range upstream.clients {
+					entry.client.CloseIdleConnections()
+				}
+			}()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			life, err := service.NewGatewayNativeLifetime(ctx, cancel, func() {}, 4096)
+			require.NoError(t, err)
+			ordinary := service.WithHTTPUpstreamProfile(ctx, service.HTTPUpstreamProfileOpenAI)
+			private := service.WithGatewayNativeLifetime(ordinary, life)
+			// Trust only this disposable local server, at the existing transport.
+			roots := x509.NewCertPool()
+			roots.AddCert(server.Certificate())
+			for _, headerCap := range []int64{0, service.GatewayNativeResponseHeaderBytes(private)} {
+				entry, err := upstream.getClientEntryWithHeaderLimit("", 71, 0, service.HTTPUpstreamProfileOpenAI, false, true, headerCap)
+				require.NoError(t, err)
+				transport := entry.client.Transport.(*http.Transport)
+				if transport.TLSClientConfig == nil {
+					transport.TLSClientConfig = &tls.Config{}
+				}
+				transport.TLSClientConfig.RootCAs = roots
+			}
+			call := func(ctx context.Context, path string, success bool) {
+				t.Helper()
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+path, nil)
+				require.NoError(t, err)
+				if !success {
+					req.Header.Set("X-Fixture-Private", value)
+				}
+				resp, err := upstream.Do(req, "", 71, 0)
+				if !success {
+					require.Error(t, err, "oversized private header must fail before response delivery")
+					require.Nil(t, resp, "no rejected response body may escape")
+					return
+				}
+				require.NoError(t, err)
+				body, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+				require.Equal(t, value, string(body))
+			}
+			call(ordinary, "/large", true)
+			call(private, "/small", true)
+			call(private, "/large", false)
+			call(ordinary, "/large", true)
+			call(private, "/small", true)
+			// Enter the actual native forwarding boundary as well as the repository:
+			// over-limit headers are a possible effect, never safe non-entry or
+			// synthesized completion, and vendor bytes cannot reach downstream.
+			generation, err := uuid.NewRandom()
+			require.NoError(t, err)
+			scope := service.GatewayNativeCredentialScope{Consumer: value, Owner: value, Account: value, Generation: generation.String(), Purpose: service.GatewayCredentialPurpose}
+			custody, err := service.NewGatewayNativeCredentialCustody(value, map[string][]byte{value: entropy})
+			require.NoError(t, err)
+			envelope, err := custody.Seal(scope, value)
+			require.NoError(t, err)
+			row := &service.Account{ID: 71, CreatedAt: time.Now().UTC(), Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive,
+				Credentials: map[string]any{"api_key": envelope, "base_url": server.URL},
+				Extra: map[string]any{service.GatewayGenerationExtraKey: generation.String(), service.GatewayProfileExtraKey: service.GatewayMiMoResponsesProfile,
+					service.GatewayModelExtraKey: "fixture-model", service.GatewayCredentialScopeExtraKey: scope.Metadata(), "openai_responses_mode": "force_responses",
+					"openai_passthrough": true, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+			descriptor, err := service.GatewayNativeDescriptor(row)
+			require.NoError(t, err)
+			life.BindAccount(scope.Consumer, scope.Account, scope.Generation)
+			require.True(t, life.Admit(time.Now().Add(time.Second)))
+			nativeCtx, err := service.WithGatewayNativeConsumer(private, scope.Consumer)
+			require.NoError(t, err)
+			nativeCtx = service.WithGatewayNativeCustody(nativeCtx, custody)
+			wrapped, err := service.NewGatewayNativeLifetimeUpstream(upstream)
+			require.NoError(t, err)
+			gateway := service.NewOpenAIGatewayService(&nativeHeaderFixtureRepo{row: row}, nil, nil, nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, wrapped, nil, nil, nil, nil, nil, nil, nil, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", nil)
+			result, entered, err := gateway.ForwardGatewayRoute(nativeCtx, c, descriptor, []byte(`{"model":"fixture-model","input":"fixture","store":false,"stream":true,"service_tier":"default"}`))
+			require.ErrorIs(t, err, service.ErrGatewayNativeEffectUnknown)
+			require.True(t, entered)
+			require.Nil(t, result)
+			require.Empty(t, recorder.Body.String())
+			require.False(t, life.Snapshot().Completed)
+			require.True(t, life.Snapshot().ContextDone)
+			for i := 0; i < 2; i++ {
+				select {
+				case <-rejectedCanceled:
+				case <-time.After(time.Second):
+					t.Fatal("header rejection did not cancel real provider stream")
+				}
+			}
+			require.EqualValues(t, 6, entries.Load(), "header rejection must not replay upstream")
+			require.Len(t, upstream.clients, 2, "private and ordinary profiles must coexist and reuse their clients")
+			for _, entry := range upstream.clients {
+				require.Zero(t, entry.inFlight, "rejected headers must release local pool tracking")
+			}
+		})
+	}
+}
+
+// Controlled storage only; network and native transport/parser are real. SQL
+// occupancy and restored/restarted issuer qualification remain separate gates.
+type nativeHeaderFixtureRepo struct {
+	service.AccountRepository
+	row *service.Account
+}
+
+func (r *nativeHeaderFixtureRepo) GetByID(context.Context, int64) (*service.Account, error) {
+	return r.row, nil
+}
+func (r *nativeHeaderFixtureRepo) LockGatewayNativeAccount(context.Context, int64) (*service.Account, func(), error) {
+	return r.row, func() {}, nil
 }

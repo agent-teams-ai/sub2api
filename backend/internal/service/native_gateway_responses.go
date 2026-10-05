@@ -34,9 +34,27 @@ func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error
 const gatewayNativeResponseLimit = 8 << 20
 const gatewayNativeSSEFrameLimit = 1 << 20
 
-// Actual provider body-read inactivity on the owned private Responses path.
-// Independent of the approved absolute lifetime and downstream write deadline.
-const gatewayNativeUpstreamReadIdle = time.Second
+// Draft fallback for direct private service callers. The dedicated handler
+// supplies its trusted IOTimeout-aligned policy; the approved context deadline
+// always wins. This is provider BODY inactivity, not listener idle or H2 PING.
+const gatewayNativeUpstreamReadIdle = 30 * time.Second
+
+type gatewayNativeProviderReadIdleKey struct{}
+
+// WithGatewayNativeProviderReadIdle is set by trusted private composition only,
+// never decoded from the request. Cancellation still observes the saved deadline.
+func WithGatewayNativeProviderReadIdle(ctx context.Context, idle time.Duration) context.Context {
+	return context.WithValue(ctx, gatewayNativeProviderReadIdleKey{}, idle)
+}
+
+// GatewayNativeResponseHeaderBytes marks the actual owned private transport.
+// Ordinary requests, including ordinary OpenAI profiles, keep their policy.
+func GatewayNativeResponseHeaderBytes(ctx context.Context) int64 {
+	if ctx == nil || gatewayNativeLifetime(ctx) == nil {
+		return 0
+	}
+	return 16 << 10
+}
 
 func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
 	target, err := s.gatewayNativeTargetURL(a)
@@ -74,7 +92,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	}
 	var reader io.Reader = resp.Body
 	if life := gatewayNativeLifetime(ctx); life != nil {
-		reader = &gatewayNativeIdleReader{reader: resp.Body, cancel: func() {
+		idle, _ := ctx.Value(gatewayNativeProviderReadIdleKey{}).(time.Duration)
+		if idle <= 0 || idle > gatewayNativeUpstreamReadIdle {
+			idle = gatewayNativeUpstreamReadIdle
+		}
+		reader = &gatewayNativeIdleReader{reader: resp.Body, idle: idle, cancel: func() {
 			// Cancel the real HTTP request to interrupt its blocked Read BEFORE
 			// requesting physical Close. Cancellation alone proves no closure.
 			stopUpstream()
@@ -197,6 +219,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 // timer that loses that race cannot cancel later downstream work or reads.
 type gatewayNativeIdleReader struct {
 	reader  io.Reader
+	idle    time.Duration
 	cancel  func()
 	mu      sync.Mutex
 	expired bool
@@ -213,7 +236,7 @@ func (r *gatewayNativeIdleReader) Read(p []byte) (int, error) {
 	}
 	pending := true
 	timerDone := make(chan struct{})
-	timer := time.AfterFunc(gatewayNativeUpstreamReadIdle, func() {
+	timer := time.AfterFunc(r.idle, func() {
 		defer close(timerDone)
 		r.mu.Lock()
 		if !pending {
