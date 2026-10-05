@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -12,7 +13,7 @@ import (
 // Reservation and inert native birth are one atomic transaction. PostgreSQL's
 // unique principal constraint serializes cross-consumer/owner contenders. No
 // reconnect, replacement, refresh writer or inferred owner is implemented.
-func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (service.GatewayNativeOAuthOutcome, error) {
+func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (out service.GatewayNativeOAuthOutcome, retErr error) {
 	deny := func() (service.GatewayNativeOAuthOutcome, error) {
 		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayNativeIdentity
 	}
@@ -35,7 +36,11 @@ func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in serv
 	if err != nil {
 		return deny()
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			out, retErr = deny()
+		}
+	}()
 	issuer, subject := in.Identity.Principal()
 	result, err := tx.ExecContext(ctx, `INSERT INTO gateway_oauth_identity_reservations
  (issuer,subject,consumer,owner_ref,account_ref,generation,operation_ref,intent_mac)

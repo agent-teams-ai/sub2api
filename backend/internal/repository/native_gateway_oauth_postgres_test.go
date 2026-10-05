@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -47,7 +48,9 @@ func oauthPGFixture(t *testing.T) (*service.GatewayNativeOAuthVerifier, func(str
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "use": "sig", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
 	}))
 	t.Cleanup(server.Close)
-	transport := server.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := server.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		require.Equal(t, "auth.openai.com:443", address)
@@ -90,13 +93,14 @@ func TestGatewayNativeOAuthPostgresReservationAndCustody(t *testing.T) {
 	defer cancel()
 	db, err := sql.Open("postgres", dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	db.SetMaxOpenConns(4)
 	var tables int
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`).Scan(&tables))
 	require.Zero(t, tables, "new isolated database required")
 	require.NoError(t, ApplyMigrations(ctx, db))
-	repo := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	repo, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	require.NoError(t, err)
@@ -217,7 +221,8 @@ func TestGatewayNativeOAuthPostgresReservationAndCustody(t *testing.T) {
 	require.Equal(t, original, replayed)
 	// A new repository/service instance recovers the original birth without the
 	// retired AES key. Safe operation readback is not credential qualification.
-	restoredRepo := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	restoredRepo, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
 	retired, err := service.NewGatewayNativeCredentialCustody("new-key", map[string][]byte{"new-key": make([]byte, 32)})
 	require.NoError(t, err)
 	restored, err := service.NewGatewayNativeOAuthEnrollment(verifier, retired, restoredRepo, key)
@@ -279,7 +284,7 @@ func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.Gatew
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
-	defer client.Close()
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	count, err := client.DBSize(ctx).Result()
 	require.NoError(t, err)
 	require.Zero(t, count, "disposable Redis must start empty")
@@ -294,7 +299,9 @@ func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.Gatew
 	hook := &oauthRedisCommandHook{}
 	client.AddHook(hook)
 	cache := NewGeminiTokenCache(client)
-	defer client.Del(ctx, oauthTokenKeyPrefix+service.OpenAITokenCacheKey(row))
+	defer func() {
+		require.NoError(t, client.Del(ctx, oauthTokenKeyPrefix+service.OpenAITokenCacheKey(row)).Err())
+	}()
 	require.NoError(t, cache.SetAccessToken(ctx, service.OpenAITokenCacheKey(row), "ordinary-fixture-cache-hit", time.Hour))
 	hook.calls.Store(0)
 	var upstream atomic.Int32
@@ -357,6 +364,109 @@ func (h *oauthRedisCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHo
 		h.calls.Add(int32(len(commands)))
 		return next(ctx, commands)
 	}
+}
+
+// Redis protocol endpoint records all token-cache operations. A seeded usable
+// hit proves the guard runs before an ordinary access token can escape.
+type oauthGuardCache struct {
+	client *redis.Client
+	calls  atomic.Int32
+}
+
+func (c *oauthGuardCache) GetAccessToken(ctx context.Context, key string) (string, error) {
+	c.calls.Add(1)
+	return c.client.Get(ctx, key).Result()
+}
+func (c *oauthGuardCache) SetAccessToken(ctx context.Context, key, value string, ttl time.Duration) error {
+	c.calls.Add(1)
+	return c.client.Set(ctx, key, value, ttl).Err()
+}
+func (c *oauthGuardCache) DeleteAccessToken(ctx context.Context, key string) error {
+	c.calls.Add(1)
+	return c.client.Del(ctx, key).Err()
+}
+func (c *oauthGuardCache) AcquireRefreshLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	c.calls.Add(1)
+	return c.client.SetNX(ctx, key+":lock", "owned", ttl).Result()
+}
+func (c *oauthGuardCache) ReleaseRefreshLock(ctx context.Context, key string) error {
+	c.calls.Add(1)
+	return c.client.Del(ctx, key+":lock").Err()
+}
+
+// Failure: managed rows, even malformed markers, could use a Redis hit, publish
+// plaintext tokens, acquire a refresh lock, or enter direct refresh.
+func TestGatewayNativeOAuthOrdinaryGuardsBeforeTokenCacheAndRefresh(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	cache := &oauthGuardCache{client: client}
+	ctx := context.Background()
+	for _, marker := range []string{service.GatewayGenerationExtraKey, service.GatewayProfileExtraKey, service.GatewayCredentialScopeExtraKey} {
+		t.Run(marker, func(t *testing.T) {
+			row := &service.Account{ID: 41, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Status: service.StatusActive, Extra: map[string]any{marker: nil}, Credentials: map[string]any{"access_token": "synthetic-plaintext-access", "refresh_token": "synthetic-plaintext-refresh", "expires_at": "1"}}
+			cacheKey := service.OpenAITokenCacheKey(row)
+			require.NoError(t, client.Set(ctx, cacheKey, "synthetic-cache-hit", time.Hour).Err())
+			before := redisServer.Dump()
+			provider := service.NewOpenAITokenProvider(nil, cache, nil)
+			token, err := provider.GetAccessToken(ctx, row)
+			require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+			require.Empty(t, token)
+			// Nil provider/repository would panic if either path passed the guard.
+			api := service.NewOAuthRefreshAPI(nil, cache)
+			result, err := api.RefreshIfNeeded(ctx, row, &service.OpenAITokenRefresher{}, time.Hour)
+			require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+			require.Nil(t, result)
+			refresher := service.NewOpenAITokenRefresher(nil, nil)
+			require.False(t, refresher.CanRefresh(row))
+			require.False(t, refresher.NeedsRefresh(row, time.Hour))
+			credentials, err := refresher.Refresh(ctx, row)
+			require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+			require.Nil(t, credentials)
+			require.Zero(t, cache.calls.Load())
+			require.Equal(t, before, redisServer.Dump())
+			require.NotContains(t, redisServer.Dump(), "synthetic-plaintext")
+		})
+	}
+	ordinary := &service.Account{ID: 41, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth}
+	token, err := service.NewOpenAITokenProvider(nil, cache, nil).GetAccessToken(ctx, ordinary)
+	require.NoError(t, err)
+	require.Equal(t, "synthetic-cache-hit", token)
+	require.Equal(t, int32(1), cache.calls.Load())
+}
+
+type oauthFreshManagedRepo struct {
+	service.AccountRepository
+	row   *service.Account
+	reads atomic.Int32
+}
+
+func (r *oauthFreshManagedRepo) GetByID(context.Context, int64) (*service.Account, error) {
+	r.reads.Add(1)
+	return r.row, nil
+}
+
+// Failure: an initially ordinary snapshot could fall back to cached plaintext
+// after the repository returns a managed identity, or refresh a managed reread.
+func TestGatewayNativeOAuthFreshManagedRowsDenyOrdinaryPublication(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	cache := &oauthGuardCache{client: client}
+	managed := &service.Account{ID: 72, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Status: service.StatusActive, Extra: map[string]any{service.GatewayCredentialScopeExtraKey: nil}}
+	repo := &oauthFreshManagedRepo{row: managed}
+	ordinary := &service.Account{ID: 72, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Status: service.StatusActive, Credentials: map[string]any{"access_token": "synthetic-stale-access", "expires_at": time.Now().Add(time.Hour).Unix()}}
+	token, err := service.NewOpenAITokenProvider(repo, cache, nil).GetAccessToken(context.Background(), ordinary)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	require.Empty(t, token)
+	require.Positive(t, repo.reads.Load())
+	require.Empty(t, redisServer.Keys())
+	// This refresh path does acquire/release the ordinary snapshot's lock. The
+	// fresh managed row must deny before a provider/executor or token write.
+	result, err := service.NewOAuthRefreshAPI(repo, cache).RefreshIfNeeded(context.Background(), ordinary, &service.OpenAITokenRefresher{}, time.Hour)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	require.Nil(t, result)
+	require.Empty(t, redisServer.Keys())
 }
 
 func gatewayOAuthGuardFixtureOpaque() string {

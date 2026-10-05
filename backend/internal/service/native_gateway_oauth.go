@@ -282,7 +282,7 @@ func (v *GatewayNativeOAuthVerifier) Verify(ctx context.Context, encoded string)
 	}
 	return GatewayNativeOAuthIdentity{issuer: issuer, subject: subject}, nil
 }
-func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (key *rsa.PublicKey, retErr error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, gatewayOAuthJWKS, nil)
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
@@ -291,7 +291,11 @@ func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (*rsa.
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			key, retErr = nil, ErrGatewayNativeIdentity
+		}
+	}()
 	if response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != gatewayOAuthJWKS {
 		return nil, ErrGatewayNativeIdentity
 	}
@@ -467,12 +471,13 @@ func (e *GatewayNativeOAuthEnrollment) Stage(ctx context.Context, s GatewayNativ
 	}
 	scopeRaw, _ := json.Marshal(s)
 	mac := hmac.New(sha256.New, e.intentKey)
-	mac.Write([]byte("account-gateway/native/oauth-enrollment-intent/v1\x00"))
-	mac.Write(scopeRaw)
-	mac.Write([]byte{0})
-	mac.Write([]byte(operation))
-	mac.Write([]byte{0})
-	mac.Write(raw)
+	// hash.Hash.Write always succeeds; the commitment bytes are unchanged.
+	_, _ = mac.Write([]byte("account-gateway/native/oauth-enrollment-intent/v1\x00"))
+	_, _ = mac.Write(scopeRaw)
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(operation))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(raw)
 	commitment := hex.EncodeToString(mac.Sum(nil))
 	// A previously accepted exact intent reads its original durable outcome even
 	// when the original ID token expires. This path creates no new authority.
