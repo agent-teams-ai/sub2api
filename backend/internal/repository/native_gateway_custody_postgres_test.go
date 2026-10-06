@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +29,7 @@ import (
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/Wei-Shaw/sub2api/migrations"
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -81,6 +85,220 @@ func custodyPGRow(scope service.GatewayNativeCredentialScope, envelope, baseURL 
 		Extra: map[string]any{service.GatewayGenerationExtraKey: scope.Generation, service.GatewayProfileExtraKey: service.GatewayMiMoResponsesProfile,
 			service.GatewayModelExtraKey: "synthetic-model", service.GatewayCredentialScopeExtraKey: scope.Metadata(), "openai_responses_mode": "force_responses",
 			"openai_passthrough": true, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+}
+
+// This exercises the real PostgreSQL driver row boundary, not the ORM create
+// constructor or provider transport. The dedicated F4 database is already
+// populated/migrated; every row, function and history change is rollback-only.
+// PostgreSQL sequence values consumed by INSERT are not transactional.
+func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
+	dsn := custodyPGDSN(t, "GATEWAY_NATIVE_PROFILE_PG_DSN", "gateway_oauth_dispatch_test_f4_")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	require.True(t, err == nil, "open dedicated profile PostgreSQL database")
+	db.SetMaxOpenConns(1)
+	defer func() {
+		if db.Close() != nil {
+			t.Error("close dedicated profile PostgreSQL database failed")
+		}
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	require.True(t, err == nil, "begin rollback-only profile transaction")
+	defer func() {
+		// ErrTxDone is expected after the explicit rollback below or the
+		// database/sql context-cancellation rollback. No path commits this tx.
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Error("rollback-only profile transaction cleanup failed")
+		}
+	}()
+	_, err = tx.ExecContext(ctx, `SET LOCAL statement_timeout='5s'; SET LOCAL lock_timeout='2s';
+		SET LOCAL idle_in_transaction_session_timeout='20s'; SET LOCAL search_path=pg_catalog,public;
+		LOCK TABLE public.accounts IN SHARE ROW EXCLUSIVE MODE;
+		LOCK TABLE public.schema_migrations IN SHARE MODE`)
+	require.True(t, err == nil, "bound and isolate profile regression transaction")
+	var database string
+	var populated bool
+	err = tx.QueryRowContext(ctx, `SELECT current_database(), EXISTS(SELECT 1 FROM public.accounts)`).Scan(&database, &populated)
+	require.True(t, err == nil, "read purpose database precondition")
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+	require.Equal(t, strings.TrimPrefix(u.Path, "/"), database)
+	require.True(t, populated, "profile regression requires the existing populated F4 database")
+
+	const oldFile = "244_gateway_oauth_fenced_refresh.sql"
+	const newFile = "247_gateway_native_openrouter_profile.sql"
+	oldSQL, err := migrations.FS.ReadFile(oldFile)
+	require.NoError(t, err)
+	newSQL, err := migrations.FS.ReadFile(newFile)
+	require.NoError(t, err)
+	guardStart := strings.Index(string(oldSQL), "CREATE OR REPLACE FUNCTION public.gateway_native_account_guard()")
+	require.GreaterOrEqual(t, guardStart, 0)
+	oldGuard := string(oldSQL)[guardStart:]
+	var newApplied bool
+	for _, file := range []string{oldFile, "246_gateway_oauth_profile_qualification.sql", newFile} {
+		content, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr)
+		digest := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
+		var checksum string
+		err = tx.QueryRowContext(ctx, `SELECT checksum FROM public.schema_migrations WHERE filename=$1`, file).Scan(&checksum)
+		if file == newFile && errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		require.True(t, err == nil, "known profile migration history required")
+		require.Equal(t, hex.EncodeToString(digest[:]), checksum, "migration checksum precondition")
+		if file == newFile {
+			newApplied = true
+		}
+	}
+	var later int
+	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM public.schema_migrations
+		WHERE substring(filename from '^([0-9]{3})_')::integer>246 AND filename<>$1`, newFile).Scan(&later)
+	require.True(t, err == nil, "read later migration precondition")
+	require.Zero(t, later, "future schema requires separate qualification")
+	var originalFunction, originalBody, originalHistory string
+	err = tx.QueryRowContext(ctx, `SELECT pg_get_functiondef(oid), prosrc FROM pg_proc
+		WHERE oid='public.gateway_native_account_guard()'::regprocedure AND prorettype='trigger'::regtype`).Scan(&originalFunction, &originalBody)
+	require.True(t, err == nil, "read current account guard precondition")
+	expectedGuard := oldGuard
+	if newApplied {
+		expectedGuard = string(newSQL)
+	}
+	parts := strings.Split(expectedGuard, "$$")
+	require.Len(t, parts, 3)
+	require.True(t, originalBody == parts[1], "current guard must exactly match known migration history")
+	var enabled bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_trigger
+		WHERE tgrelid='public.accounts'::regclass AND tgname='gateway_native_account_guard'
+		AND tgfoid='public.gateway_native_account_guard()'::regprocedure
+		AND tgtype=31 AND tgenabled IN ('O','A') AND NOT tgisinternal)
+		AND current_setting('session_replication_role')='origin'`).Scan(&enabled)
+	require.True(t, err == nil && enabled, "actual protected INSERT/UPDATE/DELETE trigger must be enabled")
+	const historySQL = `SELECT COALESCE(jsonb_agg(to_jsonb(m) ORDER BY filename),'[]'::jsonb)::text FROM public.schema_migrations m`
+	err = tx.QueryRowContext(ctx, historySQL).Scan(&originalHistory)
+	require.True(t, err == nil, "snapshot existing migration history")
+
+	custody, err := service.NewGatewayNativeCredentialCustody("pg-profile", map[string][]byte{"pg-profile": custodyPGBytes(t, 32)})
+	require.NoError(t, err)
+	fixture := func(profile, baseURL, model string) *service.Account {
+		var scope service.GatewayNativeCredentialScope
+		var key string
+		err := tx.QueryRowContext(ctx, `SELECT 'consumer/'||gen_random_uuid()::text,
+			'owner/'||gen_random_uuid()::text, 'account/'||gen_random_uuid()::text,
+			gen_random_uuid()::text, gen_random_uuid()::text||gen_random_uuid()::text`).Scan(
+			&scope.Consumer, &scope.Owner, &scope.Account, &scope.Generation, &key)
+		require.True(t, err == nil, "generate server-side profile fixture identity")
+		scope.Purpose = service.GatewayCredentialPurpose
+		envelope, err := custody.Seal(scope, key)
+		require.NoError(t, err)
+		a := custodyPGRow(scope, envelope, baseURL)
+		a.Name = "profile/" + scope.Generation
+		a.Extra[service.GatewayProfileExtraKey] = profile
+		a.Extra[service.GatewayModelExtraKey] = model
+		return a
+	}
+	const insertSQL = `INSERT INTO public.accounts
+		(name,platform,type,credentials,extra,status,concurrency,schedulable)
+		VALUES ($1,'openai','apikey',$2::jsonb,$3::jsonb,'disabled',1,false) RETURNING id,created_at`
+	original := fixture(service.GatewayOpenRouterResponsesProfile, service.GatewayOpenRouterBaseURL, service.GatewayOpenRouterModel)
+	credentials, err := json.Marshal(original.Credentials)
+	require.NoError(t, err)
+	extra, err := json.Marshal(original.Extra)
+	require.NoError(t, err)
+	// Only the real 244 guard suffix is installed, never its table DDL.
+	_, err = tx.ExecContext(ctx, oldGuard)
+	require.True(t, err == nil, "install actual old guard inside rollback transaction")
+	reject := func(statement string, args ...any) {
+		_, err := tx.ExecContext(ctx, "SAVEPOINT profile_rejected_write")
+		require.True(t, err == nil, "savepoint protected negative write")
+		_, denied := tx.ExecContext(ctx, statement, args...)
+		_, err = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT profile_rejected_write")
+		require.True(t, err == nil, "recover rejected write before any further guard execution")
+		_, err = tx.ExecContext(ctx, "RELEASE SAVEPOINT profile_rejected_write")
+		require.True(t, err == nil, "release recovered negative savepoint")
+		var pgErr *pq.Error
+		// Do not print driver details: unrelated constraint errors can include
+		// the entire row, including the encrypted credential envelope.
+		require.True(t, errors.As(denied, &pgErr), "protected write must return a PostgreSQL error")
+		require.Equal(t, pq.ErrorCode("23514"), pgErr.Code)
+	}
+	reject(insertSQL, original.Name, string(credentials), string(extra))
+	_, err = tx.ExecContext(ctx, string(newSQL))
+	require.True(t, err == nil, "execute actual additive 247 SQL")
+	// Use the exact encrypted row rejected above; ID and birth come from PG.
+	err = tx.QueryRowContext(ctx, insertSQL, original.Name, string(credentials), string(extra)).Scan(&original.ID, &original.CreatedAt)
+	require.True(t, err == nil, "247 must accept the protected OpenRouter physical row")
+	require.Positive(t, original.ID)
+	require.False(t, original.CreatedAt.IsZero())
+	var stored service.Account
+	var storedCredentials, storedExtra []byte
+	var grouped bool
+	err = tx.QueryRowContext(ctx, `SELECT id,created_at,platform,type,status,schedulable,credentials,extra,
+		EXISTS(SELECT 1 FROM public.account_groups g WHERE g.account_id=a.id)
+		FROM public.accounts a WHERE id=$1`, original.ID).Scan(&stored.ID, &stored.CreatedAt,
+		&stored.Platform, &stored.Type, &stored.Status, &stored.Schedulable, &storedCredentials, &storedExtra, &grouped)
+	require.True(t, err == nil, "read back actual protected physical row")
+	require.NoError(t, json.Unmarshal(storedCredentials, &stored.Credentials))
+	require.NoError(t, json.Unmarshal(storedExtra, &stored.Extra))
+	require.Equal(t, original.ID, stored.ID)
+	require.True(t, original.CreatedAt.Equal(stored.CreatedAt), "database birth must survive readback")
+	require.Equal(t, service.StatusDisabled, stored.Status)
+	require.False(t, stored.Schedulable || grouped)
+	require.True(t, stored.GetCredential("api_key") == original.GetCredential("api_key"), "encrypted envelope must survive readback")
+	require.NoError(t, custody.ValidateEnvelope(stored.GetCredential("api_key")))
+	expectedScope, err := service.GatewayNativeCredentialScopeForAccount(original)
+	require.NoError(t, err)
+	storedScope, err := service.GatewayNativeCredentialScopeForAccount(&stored)
+	require.NoError(t, err)
+	require.Equal(t, expectedScope, storedScope)
+	route, err := service.GatewayNativeDescriptor(&stored)
+	require.NoError(t, err)
+	require.Equal(t, original.ID, route.AccountID)
+	require.True(t, stored.CreatedAt.Equal(route.CreatedAt))
+	require.Equal(t, service.GatewayOpenRouterResponsesProfile, route.Profile)
+	require.Equal(t, service.GatewayOpenRouterBaseURL, route.BaseURL)
+	require.Equal(t, service.GatewayOpenRouterModel, route.Model)
+
+	mimo := fixture(service.GatewayMiMoResponsesProfile, "https://configured-mimo.invalid/v1", "configured-mimo-model")
+	mimoCredentials, err := json.Marshal(mimo.Credentials)
+	require.NoError(t, err)
+	mimoExtra, err := json.Marshal(mimo.Extra)
+	require.NoError(t, err)
+	err = tx.QueryRowContext(ctx, insertSQL, mimo.Name, string(mimoCredentials), string(mimoExtra)).Scan(&mimo.ID, &mimo.CreatedAt)
+	require.True(t, err == nil, "247 must preserve MiMo configured origin/model support")
+	require.Positive(t, mimo.ID)
+	require.NotEqual(t, original.ID, mimo.ID)
+	require.False(t, mimo.CreatedAt.IsZero())
+	// Fresh generation/scope prevents uniqueness errors from hiding an
+	// incorrect OpenRouter tuple's guard rejection.
+	wrong := fixture(service.GatewayOpenRouterResponsesProfile, "https://wrong-origin.invalid/v1", service.GatewayOpenRouterModel)
+	wrongCredentials, err := json.Marshal(wrong.Credentials)
+	require.NoError(t, err)
+	wrongExtra, err := json.Marshal(wrong.Extra)
+	require.NoError(t, err)
+	reject(insertSQL, wrong.Name, string(wrongCredentials), string(wrongExtra))
+	wrong.Credentials["base_url"] = service.GatewayOpenRouterBaseURL
+	wrong.Extra[service.GatewayModelExtraKey] = "unapproved-model"
+	wrongCredentials, err = json.Marshal(wrong.Credentials)
+	require.NoError(t, err)
+	wrongExtra, err = json.Marshal(wrong.Extra)
+	require.NoError(t, err)
+	reject(insertSQL, wrong.Name, string(wrongCredentials), string(wrongExtra))
+	reject(`UPDATE public.accounts SET created_at=created_at+interval '1 microsecond' WHERE id=$1`, original.ID)
+
+	require.NoError(t, tx.Rollback(), "explicit rollback is part of the regression")
+	var restoredFunction, restoredHistory string
+	var fixtures int
+	err = db.QueryRowContext(ctx, `SELECT pg_get_functiondef('public.gateway_native_account_guard()'::regprocedure)`).Scan(&restoredFunction)
+	require.True(t, err == nil, "read guard after rollback")
+	err = db.QueryRowContext(ctx, historySQL).Scan(&restoredHistory)
+	require.True(t, err == nil, "read history after rollback")
+	err = db.QueryRowContext(ctx, `SELECT count(*) FROM public.accounts WHERE extra->>'gateway_generation_v1' IN ($1,$2,$3)`,
+		original.Extra[service.GatewayGenerationExtraKey], mimo.Extra[service.GatewayGenerationExtraKey], wrong.Extra[service.GatewayGenerationExtraKey]).Scan(&fixtures)
+	require.True(t, err == nil, "read fixture absence after rollback")
+	require.Zero(t, fixtures)
+	require.True(t, originalFunction == restoredFunction, "rollback must restore the original guard")
+	require.True(t, originalHistory == restoredHistory, "rollback must preserve migration history")
 }
 
 func custodyPGGateway(repo service.AccountRepository, transport service.HTTPUpstream) *service.OpenAIGatewayService {
