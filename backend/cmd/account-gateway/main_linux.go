@@ -69,7 +69,7 @@ func absolute(path string) bool {
 const retirementBytes = 4096
 
 type retirementInput struct {
-	Current   bindingOutput                       `json:"current"`
+	Current   bindingOutput                        `json:"current"`
 	Selectors []gatewaylauncher.RetirementSelector `json:"selectors"`
 }
 

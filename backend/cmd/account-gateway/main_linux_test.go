@@ -138,22 +138,22 @@ func TestStrictRetirementInput(t *testing.T) {
 		}
 	}
 	bad := map[string]string{
-		"duplicate-decoded": strings.Replace(request, `"current":`, `"current":null,"\u0063urrent":`, 1),
-		"case-alias": strings.Replace(request, `"current"`, `"Current"`, 1),
-		"nested-duplicate": strings.Replace(request, `"pid":"123"`, `"pid":"123","\u0070id":"123"`, 1),
-		"nested-case": strings.Replace(request, `"birthTicks"`, `"BirthTicks"`, 1),
-		"selector-duplicate": strings.Replace(request, `"engineIncarnation":`, `"engineIncarnation":"unused","engineIncarnation":`, 1),
-		"selector-case": strings.Replace(request, `"engineIncarnation"`, `"EngineIncarnation"`, 1),
-		"unknown": strings.Replace(request, `"current":`, `"authorityDir":"unused","current":`, 1),
-		"nested-unknown": strings.Replace(request, `"pid":"123"`, `"pid":"123","path":"unused"`, 1),
+		"duplicate-decoded":     strings.Replace(request, `"current":`, `"current":null,"\u0063urrent":`, 1),
+		"case-alias":            strings.Replace(request, `"current"`, `"Current"`, 1),
+		"nested-duplicate":      strings.Replace(request, `"pid":"123"`, `"pid":"123","\u0070id":"123"`, 1),
+		"nested-case":           strings.Replace(request, `"birthTicks"`, `"BirthTicks"`, 1),
+		"selector-duplicate":    strings.Replace(request, `"engineIncarnation":`, `"engineIncarnation":"unused","engineIncarnation":`, 1),
+		"selector-case":         strings.Replace(request, `"engineIncarnation"`, `"EngineIncarnation"`, 1),
+		"unknown":               strings.Replace(request, `"current":`, `"authorityDir":"unused","current":`, 1),
+		"nested-unknown":        strings.Replace(request, `"pid":"123"`, `"pid":"123","path":"unused"`, 1),
 		"misplaced-known-field": strings.Replace(request, `"pid":"123"`, `"pid":"123","engineIncarnation":"unused"`, 1),
-		"trailing": request + `{}`,
-		"truncated": request[:len(request)-1],
-		"oversize": request + strings.Repeat(" ", retirementBytes+1-len(request)),
-		"null-current": `{"current":null,"selectors":[{"originRef":"disposable-origin","engineIncarnation":"34567890-1234-4234-8234-123456789abc"}]}`,
-		"empty-selectors": retirementRequest(t, b, []gatewaylauncher.RetirementSelector{}),
-		"three-selectors": retirementRequest(t, b, []gatewaylauncher.RetirementSelector{selector, selector, selector}),
-		"invalid-utf8": strings.Replace(request, "disposable-origin", string([]byte{0xff}), 1),
+		"trailing":              request + `{}`,
+		"truncated":             request[:len(request)-1],
+		"oversize":              request + strings.Repeat(" ", retirementBytes+1-len(request)),
+		"null-current":          `{"current":null,"selectors":[{"originRef":"disposable-origin","engineIncarnation":"34567890-1234-4234-8234-123456789abc"}]}`,
+		"empty-selectors":       retirementRequest(t, b, []gatewaylauncher.RetirementSelector{}),
+		"three-selectors":       retirementRequest(t, b, []gatewaylauncher.RetirementSelector{selector, selector, selector}),
+		"invalid-utf8":          strings.Replace(request, "disposable-origin", string([]byte{0xff}), 1),
 	}
 	for _, value := range []string{`"01"`, `"+1"`, `"-1"`, `"0"`, `"1.0"`, `"1e3"`, `"18446744073709551616"`, `1`, `null`} {
 		bad["decimal-"+value] = strings.Replace(request, `"birthTicks":"9007199254740993"`, `"birthTicks":`+value, 1)
