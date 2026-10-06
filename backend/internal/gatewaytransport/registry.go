@@ -32,10 +32,13 @@ type QualifiedProfile struct {
 type Config struct {
 	Gateway                                    *service.OpenAIGatewayService
 	Custody                                    *service.GatewayNativeCredentialCustody
+	OAuth                                      *service.GatewayNativeOAuthDispatch
 	Authorize                                  func(*http.Request) (Peer, error)
 	Enrollment                                 Enrollment
 	VerifyEnrollment                           func(context.Context, Enrollment) error
 	Profile                                    QualifiedProfile
+	OpenRouter                                 *QualifiedProfile
+	Codex                                      *QualifiedProfile
 	CallbackOrigin, CallbackCredential         string
 	VerifyDispatch                             func(context.Context, string, Proof, time.Time) error
 	AuthorizeCleanup                           func(context.Context, string, Proof, CleanupLease) error
@@ -192,7 +195,8 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		cfg.Gateway == nil || !cfg.Gateway.GatewayNativeLifetimeReady() || !service.GatewayNativeCredentialCustodyReady(cfg.Custody) || cfg.Authorize == nil || cfg.VerifyEnrollment == nil ||
 		cfg.VerifyDispatch == nil || cfg.AuthorizeCleanup == nil || cfg.AcknowledgeClosure == nil ||
 		!identifier.MatchString(cfg.Enrollment.OriginRef) || !identifier.MatchString(cfg.Enrollment.EngineIncarnation) || !identifier.MatchString(cfg.Enrollment.QualificationRef) ||
-		p.Profile != service.GatewayMiMoResponsesProfile || !identifier.MatchString(p.QualificationRef) || !qualifiedModel.MatchString(p.Model) || len(p.BaseURL) < 1 || len(p.BaseURL) > 2048 ||
+		p.Profile != service.GatewayMiMoResponsesProfile || cfg.Enrollment.QualificationRef != p.QualificationRef ||
+		!identifier.MatchString(p.QualificationRef) || !qualifiedModel.MatchString(p.Model) || len(p.BaseURL) < 1 || len(p.BaseURL) > 2048 ||
 		p.RequestBytes < 1 || p.RequestBytes > 4<<20 || p.OutputBytes < 1 || p.OutputBytes > 8<<20 || p.Tokens < 1 || p.Tokens > 10000000 ||
 		p.ProviderTokenUpperBound < p.Tokens || p.ProviderTokenUpperBound > 10000000 ||
 		cfg.MaxEntries < 1 || cfg.MaxEntries > 10000 || cfg.EnvelopeBytes < 1 || cfg.EnvelopeBytes > 5<<20 || cfg.CallbackBytes < 1 || cfg.CallbackBytes > 262144 ||
@@ -205,6 +209,29 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
 		return nil, errDenied
 	}
+	if cfg.OpenRouter != nil {
+		second := *cfg.OpenRouter // freeze caller-owned configuration before any callback
+		if second.Profile != service.GatewayOpenRouterResponsesProfile || !service.GatewayNativeAPIKeyProfileValid(second.Profile, second.BaseURL, second.Model) ||
+			!identifier.MatchString(second.QualificationRef) || second.RequestBytes < 1 || second.RequestBytes > 4<<20 ||
+			second.OutputBytes < 1 || second.OutputBytes > 8<<20 || second.Tokens < 1 || second.Tokens > 10000000 ||
+			second.ProviderTokenUpperBound < second.Tokens || second.ProviderTokenUpperBound > 10000000 {
+			return nil, errDenied
+		}
+		cfg.OpenRouter = &second
+	}
+	if (cfg.Codex == nil) != (cfg.OAuth == nil) {
+		return nil, errDenied
+	}
+	if cfg.Codex != nil {
+		codex := *cfg.Codex // independent tuple, frozen before enrollment/callback
+		if codex.Profile != service.GatewayCodexOAuthResponsesProfile || codex.BaseURL != service.GatewayCodexOAuthBaseURL || codex.Model != service.GatewayCodexOAuthModel ||
+			!identifier.MatchString(codex.QualificationRef) || codex.RequestBytes < 1 || codex.RequestBytes > 4<<20 ||
+			codex.OutputBytes < 1 || codex.OutputBytes > 8<<20 || codex.Tokens < 1 || codex.Tokens > 10000000 ||
+			codex.ProviderTokenUpperBound < codex.Tokens || codex.ProviderTokenUpperBound > 10000000 {
+			return nil, errDenied
+		}
+		cfg.Codex = &codex
+	}
 	enrollmentCtx, stop := context.WithTimeout(ctx, cfg.CallbackTimeout)
 	defer stop()
 	if cfg.VerifyEnrollment(enrollmentCtx, cfg.Enrollment) != nil || enrollmentCtx.Err() != nil {
@@ -215,6 +242,27 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
 		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+}
+
+func (h *Handler) profile(id string) (QualifiedProfile, bool) {
+	if id == h.cfg.Profile.Profile {
+		return h.cfg.Profile, true
+	}
+	if id == service.GatewayOpenRouterResponsesProfile && h.cfg.OpenRouter != nil {
+		return *h.cfg.OpenRouter, true
+	}
+	if id == service.GatewayCodexOAuthResponsesProfile && h.cfg.Codex != nil {
+		return *h.cfg.Codex, true
+	}
+	return QualifiedProfile{}, false
+}
+
+// Safe immutable configuration projection for the private candidate router.
+func (h *Handler) OpenRouterProfile() (QualifiedProfile, bool) {
+	if h.cfg.OpenRouter == nil {
+		return QualifiedProfile{}, false
+	}
+	return *h.cfg.OpenRouter, true
 }
 
 // Reserve before callback/claim. The secondary request identity prevents a new

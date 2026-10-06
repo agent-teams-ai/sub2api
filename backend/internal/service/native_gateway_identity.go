@@ -21,6 +21,15 @@ const GatewayProfileExtraKey = "gateway_profile_v1"
 const GatewayModelExtraKey = "gateway_model_v1"
 const GatewayMiMoResponsesProfile = "openai-responses-apikey-v1"
 const GatewayLegacyBridgeProfile = "mimo-token-plan-responses-chat-bridge-v1"
+const GatewayOpenRouterResponsesProfile = "openrouter-openai-responses-apikey-v1"
+const GatewayOpenRouterBaseURL = "https://openrouter.ai/api/v1"
+const GatewayOpenRouterModel = "openai/gpt-5.4-mini"
+
+// Finite identities only; endpoints/models remain trusted composition fields.
+func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
+	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
+		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && model == GatewayOpenRouterModel
+}
 
 var ErrGatewayNativeIdentity = errors.New("gateway native identity rejected")
 var ErrGatewayNativeReplay = errors.New("gateway native dispatch already entered")
@@ -79,7 +88,7 @@ func (s *OpenAIGatewayService) EraseGatewayCandidate(ctx context.Context, route 
 	id, err := uuid.Parse(route.Generation)
 	if !ok || err != nil || id == uuid.Nil || id.String() != route.Generation ||
 		route.AccountID <= 0 || route.CreatedAt.IsZero() || route.BaseURL == "" || route.Model == "" ||
-		(route.Profile != GatewayMiMoResponsesProfile && route.Profile != GatewayLegacyBridgeProfile) {
+		!GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) {
 		return ErrGatewayNativeIdentity
 	}
 	return eraser.EraseGatewayNativeAccount(ctx, route)
@@ -115,25 +124,29 @@ func validateGatewayNativeShape(a *Account) error {
 	if !ok || err != nil || id == uuid.Nil || id.String() != generation {
 		return ErrGatewayNativeIdentity
 	}
-	profile := a.Extra[GatewayProfileExtraKey]
+	profile, profileOK := a.Extra[GatewayProfileExtraKey].(string)
 	mode, passthrough := "force_responses", true
 	if profile == GatewayLegacyBridgeProfile {
 		mode, passthrough = "force_chat_completions", false
 	}
-	if (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile) ||
+	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile) ||
 		a.Extra["openai_responses_mode"] != mode ||
 		a.Extra["openai_passthrough"] != passthrough ||
 		a.Extra["native_api_key_cancel_on_disconnect"] != true ||
 		a.Extra["openai_preserve_compatible_reasoning"] != true {
 		return ErrGatewayNativeIdentity
 	}
-	if model, ok := a.Extra[GatewayModelExtraKey].(string); !ok || strings.TrimSpace(model) == "" {
+	model, modelOK := a.Extra[GatewayModelExtraKey].(string)
+	if !modelOK || strings.TrimSpace(model) == "" {
 		return ErrGatewayNativeIdentity
 	}
 	envelope, envelopeOK := a.Credentials["api_key"].(string)
 	baseURL, baseURLOK := a.Credentials["base_url"].(string)
 	if len(a.Credentials) != 2 || !envelopeOK || !baseURLOK || envelope == "" ||
 		envelope != strings.TrimSpace(envelope) || baseURL == "" {
+		return ErrGatewayNativeIdentity
+	}
+	if !GatewayNativeAPIKeyProfileValid(profile, baseURL, model) {
 		return ErrGatewayNativeIdentity
 	}
 	if _, _, _, err := gatewayNativeParseEnvelope(envelope); err != nil {
@@ -250,7 +263,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		return s.forwardGatewayOAuthRoute(ctx, c, route, body)
 	}
 	if ctx == nil || c == nil || c.Request == nil || s.accountRepo == nil || len(body) > 4<<20 || !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() || !gatewayNativeUnambiguousPolicyFields(body) ||
-		gjson.GetBytes(body, "model").String() != route.Model || (route.Profile != GatewayMiMoResponsesProfile && route.Profile != GatewayLegacyBridgeProfile) ||
+		gjson.GetBytes(body, "model").String() != route.Model || !GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) ||
 		gjson.GetBytes(body, "previous_response_id").String() != "" ||
 		(gjson.GetBytes(body, "service_tier").Exists() && gjson.GetBytes(body, "service_tier").String() != "default") ||
 		(gjson.GetBytes(body, "store").Exists() && gjson.GetBytes(body, "store").Bool()) {
@@ -289,7 +302,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	// Native Responses is the first qualification path. The separately selected
 	// historical bridge is never an automatic fallback after any dispatch.
 	var result *OpenAIForwardResult
-	if route.Profile == GatewayMiMoResponsesProfile {
+	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile {
 		result, err = s.forwardGatewayNativeResponses(ctx, c, a, body)
 	} else {
 		result, err = s.forwardResponsesViaRawChatCompletions(ctx, c, a, body)

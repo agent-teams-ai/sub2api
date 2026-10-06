@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +28,143 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+// Controlled persistence exercises the real management/service HTTP boundaries.
+// Existing SQL triggers reject OpenRouter: migrated SQL remains NOT_QUALIFIED.
+type finiteCatalogRows struct {
+	service.AdminAccountRepository
+	mu   sync.Mutex
+	rows map[int64]*service.Account
+}
+
+func (r *finiteCatalogRows) Create(_ context.Context, a *service.Account) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a.ID = int64(len(r.rows) + 1)
+	a.CreatedAt = time.Date(2026, 10, 6, 0, 0, 0, 123456000, time.UTC)
+	r.rows[a.ID] = a
+	return nil
+}
+
+func (r *finiteCatalogRows) GetByID(_ context.Context, id int64) (*service.Account, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rows[id], nil
+}
+
+func (r *finiteCatalogRows) FindByExtraField(_ context.Context, key string, value any) ([]service.Account, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var found []service.Account
+	for _, a := range r.rows {
+		if a.Extra[key] == value {
+			found = append(found, *a)
+		}
+	}
+	return found, nil
+}
+
+func (r *finiteCatalogRows) UpdateWithAccountBillingSettings(_ context.Context, a *service.Account, _, _ *bool, _ *float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows[a.ID] = a
+	return nil
+}
+
+func (r *finiteCatalogRows) LockGatewayNativeAccount(_ context.Context, id int64) (*service.Account, func(), error) {
+	r.mu.Lock()
+	return r.rows[id], r.mu.Unlock, nil
+}
+
+func TestFiniteAPIKeyCatalogHTTPCreateReadMutation(t *testing.T) {
+	var entries, admissions atomic.Int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entries.Add(1)
+		if r.Host == "openrouter.ai" {
+			require.Equal(t, "/api/v1/responses", r.URL.Path)
+		} else {
+			require.Equal(t, "mimo.fixture.invalid", r.Host)
+			require.Equal(t, "/v1/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"completed","output":[]}`)
+	}))
+	defer upstream.Close()
+	local := upstream.Client().Transport.(*http.Transport).Clone()
+	local.Proxy = nil
+	local.TLSClientConfig.ServerName = "example.com"
+	local.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address != "mimo.fixture.invalid:443" && address != "openrouter.ai:443" {
+			return nil, service.ErrGatewayNativeIdentity
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+	}
+	defer local.CloseIdleConnections()
+	repo := &finiteCatalogRows{rows: map[int64]*service.Account{}}
+	admin := nativeReviewAdmin(repo, nil)
+	gateway := nativeReviewGateway(repo, nil, &nativeReviewRealHTTP{client: &http.Client{Transport: local}})
+	primary := GatewayNativeProfile{service.GatewayMiMoResponsesProfile, "https://mimo.fixture.invalid/v1", "fixture-model"}
+	secondary := GatewayNativeProfile{service.GatewayOpenRouterResponsesProfile, service.GatewayOpenRouterBaseURL, service.GatewayOpenRouterModel}
+	token := "Bearer " + nativeReviewSyntheticKey(t)
+	authorize := func(c *gin.Context) {
+		if c.GetHeader("Authorization") != token {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		ctx, err := service.WithGatewayNativeConsumer(c.Request.Context(), "fixture-consumer")
+		require.NoError(t, err)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+	router := gin.New()
+	RegisterGatewayNativeRoutes(router.Group(""), admin, gateway, primary, authorize,
+		func(*gin.Context, service.GatewayNativeRoute) error { admissions.Add(1); return nil }, func(*gin.Context, bool, error) {}, nativeReviewCustody(t), secondary)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	base := server.URL + "/private/native/v1"
+	status, _ := custodyAPIRequest(t, server.Client(), http.MethodPost, base+"/candidates", token,
+		gatewayNativeCreate{"55555555-5555-4555-8555-555555555555", "caller-profile", "fixture", nativeReviewSyntheticKey(t), "fixture-owner", "fixture-account"})
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Empty(t, repo.rows)
+	var candidates []GatewayNativeCandidate
+	for i, profile := range []GatewayNativeProfile{primary, secondary} {
+		generation := []string{"33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"}[i]
+		status, data := custodyAPIRequest(t, server.Client(), http.MethodPost, base+"/candidates", token,
+			gatewayNativeCreate{generation, profile.ID, "fixture", nativeReviewSyntheticKey(t), "fixture-owner", profile.ID})
+		require.Equal(t, http.StatusOK, status, string(data))
+		var candidate GatewayNativeCandidate
+		require.NoError(t, json.Unmarshal(data, &candidate))
+		require.Equal(t, profile.ID, candidate.Descriptor.Profile)
+		require.Equal(t, profile.BaseURL, candidate.Descriptor.BaseURL)
+		require.Equal(t, profile.Model, candidate.Descriptor.Model)
+		require.Equal(t, "inactive", candidate.State)
+		status, _ = custodyAPIRequest(t, server.Client(), http.MethodGet, base+"/candidates/"+generation, token, nil)
+		require.Equal(t, http.StatusOK, status)
+		candidates = append(candidates, candidate)
+	}
+	require.Zero(t, entries.Load(), "create/read performs no provider probe")
+	bad := candidates[1].Descriptor
+	bad.Profile, bad.BaseURL, bad.Model = primary.ID, primary.BaseURL, primary.Model
+	status, _ = custodyAPIRequest(t, server.Client(), http.MethodPut, base+"/candidates/"+bad.Generation, token, gatewayNativeMutation{Descriptor: bad, State: "active"})
+	require.Equal(t, http.StatusConflict, status)
+	bad = candidates[1].Descriptor
+	bad.BaseURL = primary.BaseURL
+	status, _ = custodyAPIRequest(t, server.Client(), http.MethodPost, base+"/responses", token, gatewayNativeDispatchRequest{bad, json.RawMessage(`{}`)})
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Zero(t, admissions.Load())
+	require.Zero(t, entries.Load())
+	for _, candidate := range candidates {
+		status, data := custodyAPIRequest(t, server.Client(), http.MethodPut, base+"/candidates/"+candidate.Descriptor.Generation, token,
+			gatewayNativeMutation{Descriptor: candidate.Descriptor, Name: "renamed", State: "active"})
+		require.Equal(t, http.StatusOK, status, string(data))
+		payload, err := json.Marshal(map[string]any{"model": candidate.Descriptor.Model, "input": "controlled", "store": false, "service_tier": "default"})
+		require.NoError(t, err)
+		status, data = custodyAPIRequest(t, server.Client(), http.MethodPost, base+"/responses", token, gatewayNativeDispatchRequest{candidate.Descriptor, payload})
+		require.Equal(t, http.StatusOK, status, string(data))
+	}
+	require.EqualValues(t, 2, admissions.Load())
+	require.EqualValues(t, 2, entries.Load())
+}
 
 func custodyAPIRequest(t *testing.T, client *http.Client, method, target, token string, body any) (int, []byte) {
 	t.Helper()

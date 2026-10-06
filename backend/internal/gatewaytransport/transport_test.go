@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 var fixtureProviderKey = gatewayIngressGuardFixtureOpaque()
@@ -139,16 +143,167 @@ func ownerPOST(client *http.Client, origin, path, token string, input any) owner
 // Authorization boundary, TLS provider, registry and private HTTP paths run.
 type ownerFixtureRepo struct {
 	service.AccountRepository
-	row *service.Account
-	mu  sync.Mutex
+	row  *service.Account
+	rows map[int64]*service.Account
+	mu   sync.Mutex
 }
 
-func (r *ownerFixtureRepo) GetByID(context.Context, int64) (*service.Account, error) {
+func (r *ownerFixtureRepo) GetByID(_ context.Context, id int64) (*service.Account, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rows != nil {
+		return r.rows[id], nil
+	}
 	return r.row, nil
 }
-func (r *ownerFixtureRepo) LockGatewayNativeAccount(context.Context, int64) (*service.Account, func(), error) {
+func (r *ownerFixtureRepo) LockGatewayNativeAccount(_ context.Context, id int64) (*service.Account, func(), error) {
 	r.mu.Lock()
+	if r.rows != nil {
+		return r.rows[id], r.mu.Unlock, nil
+	}
 	return r.row, r.mu.Unlock, nil
+}
+
+// One simultaneous catalog, real admit HTTP and TLS Responses entry for both
+// presets. Cross-tuples and each profile's own caps deny before callback/entry.
+func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
+	var entries, admits atomic.Int32
+	var driftAfterAdmit atomic.Bool
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entries.Add(1)
+		var payload map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		if r.Host == "openrouter.ai" {
+			require.Equal(t, "/api/v1/responses", r.URL.Path)
+			require.Equal(t, service.GatewayOpenRouterModel, payload["model"])
+			require.Equal(t, float64(40), payload["max_output_tokens"])
+		} else {
+			require.Equal(t, "mimo.fixture.invalid", r.Host)
+			require.Equal(t, "/v1/responses", r.URL.Path)
+			require.Equal(t, "fixture-model", payload["model"])
+			require.Equal(t, float64(100), payload["max_output_tokens"])
+		}
+		require.Equal(t, "Bearer "+fixtureProviderKey, r.Header.Get("Authorization"))
+		require.Equal(t, false, payload["store"])
+		require.Equal(t, true, payload["stream"])
+		require.Contains(t, payload, "tools")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"exec\",\"input\":\"echo preserved\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"controlled final\"}]}]}}\n\n")
+	}))
+	defer provider.Close()
+	local := provider.Client().Transport.(*http.Transport).Clone()
+	local.Proxy = nil
+	local.TLSClientConfig.ServerName = "example.com"
+	local.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address != "mimo.fixture.invalid:443" && address != "openrouter.ai:443" {
+			return nil, errDenied
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, provider.Listener.Addr().String())
+	}
+	defer local.CloseIdleConnections()
+	custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": []byte(strings.Repeat("K", 32))})
+	require.NoError(t, err)
+	primary := QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, BaseURL: "https://mimo.fixture.invalid/v1", Model: "fixture-model", QualificationRef: "mimo-fixture-qualified", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200}
+	secondary := QualifiedProfile{Profile: service.GatewayOpenRouterResponsesProfile, BaseURL: service.GatewayOpenRouterBaseURL, Model: service.GatewayOpenRouterModel, QualificationRef: "openrouter-fixture-qualified", RequestBytes: 2048, OutputBytes: 2048, Tokens: 40, ProviderTokenUpperBound: 80}
+	repo := &ownerFixtureRepo{rows: map[int64]*service.Account{}}
+	inputs := make([]Request, 0, 2)
+	for i, profile := range []QualifiedProfile{primary, secondary} {
+		input := ownerRequest()
+		input.RequestRef = fmt.Sprintf("profile-request-%d", i)
+		input.Admission.ExecutionRef = fmt.Sprintf("profile-execution-%d", i)
+		input.Admission.InvocationRef = fmt.Sprintf("profile-invocation-%d", i)
+		input.Admission.ProfileID = profile.Profile
+		input.Admission.Limits.RequestBytes = profile.RequestBytes
+		input.Admission.Limits.OutputBytes = profile.OutputBytes
+		input.Admission.Limits.Tokens = profile.Tokens
+		input.Descriptor.AccountID += int64(i)
+		input.Descriptor.Profile, input.Descriptor.BaseURL, input.Descriptor.Model = profile.Profile, profile.BaseURL, profile.Model
+		if i == 1 {
+			input.Descriptor.Generation = "77777777-7777-4777-8777-777777777777"
+			input.Admission.AccountRef = "openrouter-account"
+		}
+		input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"preserved","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, profile.Model))
+		scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "fixture-owner", Account: input.Admission.AccountRef, Generation: input.Descriptor.Generation, Purpose: service.GatewayCredentialPurpose}
+		envelope, err := custody.Seal(scope, fixtureProviderKey)
+		require.NoError(t, err)
+		repo.rows[input.Descriptor.AccountID] = &service.Account{ID: input.Descriptor.AccountID, CreatedAt: input.Descriptor.CreatedAt, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive,
+			Credentials: map[string]any{"api_key": envelope, "base_url": profile.BaseURL}, Extra: map[string]any{service.GatewayGenerationExtraKey: scope.Generation, service.GatewayProfileExtraKey: profile.Profile, service.GatewayModelExtraKey: profile.Model, service.GatewayCredentialScopeExtraKey: scope.Metadata(), "openai_responses_mode": "force_responses", "openai_passthrough": true, "native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true}}
+		inputs = append(inputs, input)
+	}
+	u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: &http.Client{Transport: local}})
+	require.NoError(t, err)
+	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admits.Add(1)
+		var input admitRequest
+		require.Equal(t, "/private/native/v1/admit", r.URL.Path)
+		require.Equal(t, "Bearer "+fixtureCallbackToken, r.Header.Get("Authorization"))
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+		if driftAfterAdmit.Swap(false) {
+			repo.mu.Lock()
+			repo.rows[input.Descriptor.AccountID].Credentials["base_url"] = primary.BaseURL
+			repo.mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ownerReply(input))
+	}))
+	defer callback.Close()
+	cfg := Config{Gateway: gateway, Custody: custody, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, primary.QualificationRef}, Profile: primary, OpenRouter: &secondary,
+		MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken,
+		CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, ProviderReadIdle: time.Second, CleanupTimeout: time.Second,
+		Authorize: func(r *http.Request) (Peer, error) {
+			if r.Header.Get("Authorization") == "Bearer "+fixtureExecutionToken {
+				return Peer{"fixture-consumer", "execution"}, nil
+			}
+			return Peer{}, errDenied
+		}, VerifyEnrollment: func(context.Context, Enrollment) error { return nil }, VerifyDispatch: func(context.Context, string, Proof, time.Time) error { return nil },
+		AuthorizeCleanup: func(context.Context, string, Proof, CleanupLease) error { return errDenied }, AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied }}
+	h, err := New(context.Background(), cfg)
+	require.NoError(t, err)
+	defer h.Stop(context.Background())
+	server := httptest.NewServer(h)
+	defer server.Close()
+	// Mutating the composition input cannot turn an enrolled tuple into another.
+	secondary.Model = "caller-model"
+	for _, mutate := range []func(*Request){
+		func(r *Request) { r.Descriptor = inputs[0].Descriptor },
+		func(r *Request) { r.Admission.ProfileID = service.GatewayMiMoResponsesProfile },
+		func(r *Request) { r.Descriptor.BaseURL = primary.BaseURL },
+		func(r *Request) { r.Descriptor.Model = primary.Model },
+		func(r *Request) { r.Payload = json.RawMessage(strings.Replace(string(r.Payload), service.GatewayOpenRouterModel, primary.Model, 1)) },
+		func(r *Request) { r.Payload = json.RawMessage(strings.TrimSuffix(string(r.Payload), "}") + `,"max_output_tokens":81}`) },
+		func(r *Request) { r.Admission.Limits.Tokens = 41 },
+		func(r *Request) { r.Admission.Limits.RequestBytes = 2049 },
+		func(r *Request) { r.Admission.Limits.OutputBytes = 2049 },
+		func(r *Request) { r.Admission.ProfileID = "arbitrary-profile" },
+	} {
+		bad := inputs[1]
+		mutate(&bad)
+		result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, bad)
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusBadRequest, result.code)
+	}
+	require.Zero(t, admits.Load())
+	require.Zero(t, entries.Load())
+	for _, input := range inputs {
+		result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusOK, result.code)
+		require.Contains(t, string(result.body), "custom_tool_call")
+		require.Contains(t, string(result.body), "controlled final")
+	}
+	require.EqualValues(t, 2, admits.Load())
+	require.EqualValues(t, 2, entries.Load())
+	// A valid ingress tuple cannot survive a stored cross-profile endpoint
+	// change while the sole admit callback is in flight. Forward rechecks it.
+	driftAfterAdmit.Store(true)
+	stale := inputs[1]
+	stale.RequestRef = "openrouter-stale-tuple"
+	result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, stale)
+	require.NoError(t, result.err)
+	require.EqualValues(t, 3, admits.Load())
+	require.EqualValues(t, 2, entries.Load())
+	require.NotContains(t, string(result.body), "controlled final")
 }
 
 type ownerFixtureHTTP struct {
@@ -826,3 +981,209 @@ func gatewayIngressGuardFixtureOpaque() string {
 }
 
 var gatewayIngressGuardFixture1 = gatewayIngressGuardFixtureOpaque()
+
+// Only canonical mapping is controlled here. Actual encrypted credential
+// boundary, signed JWKS, explicit F2 version update and TLS inference run.
+type oauthTransportRows struct {
+	service.AccountRepository
+	row      *service.Account
+	physical service.GatewayNativeOAuthPhysical
+	mode     string
+	resolves int
+	admitted *atomic.Int32
+}
+
+func (r *oauthTransportRows) LockGatewayNativeAccount(context.Context, int64) (*service.Account, func(), error) {
+	return nil, nil, errDenied
+}
+func (r *oauthTransportRows) ReadGatewayNativeOAuthDispatch(_ context.Context, s service.GatewayNativeCredentialScope, op string) (service.GatewayNativeOAuthOutcome, error) {
+	return service.GatewayNativeOAuthOutcome{Operation: op, AccountID: r.row.ID, Generation: s.Generation, State: "completed"}, nil
+}
+func (r *oauthTransportRows) LockGatewayNativeOAuthDispatch(ctx context.Context, s service.GatewayNativeCredentialScope, op string, id int64) (*service.Account, service.GatewayNativeOAuthPhysical, func(), error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, s) || s != r.physical.Scope || op != r.physical.Operation || id != r.row.ID {
+		return nil, service.GatewayNativeOAuthPhysical{}, nil, errDenied
+	}
+	p := r.physical
+	p.RefreshFence = r
+	return r.row, p, func() {}, nil
+}
+func (r *oauthTransportRows) Check(context.Context) error { return nil }
+func (r *oauthTransportRows) QualifyGatewayNativeOAuthDispatch(_ context.Context, p service.GatewayNativeOAuthPhysical, version int64) error {
+	if !p.QualificationValid(version) {
+		return errDenied
+	}
+	r.physical = p
+	return nil
+}
+func (r *oauthTransportRows) ResolveGatewayNativeOAuthCanonical(ctx context.Context, route service.GatewayNativeRoute, account string) (service.GatewayNativeCredentialScope, string, error) {
+	r.resolves++
+	consumer, err := service.GatewayNativeConsumer(ctx)
+	if err != nil || r.admitted.Load() != 1 || consumer != "fixture-consumer" || account != ownerAccount || !service.SameGatewayNativeDescriptor(route, r.physical.Route) {
+		return service.GatewayNativeCredentialScope{}, "", errDenied
+	}
+	scope := r.physical.Scope
+	switch r.mode {
+	case "zero", "multi":
+		return scope, "", errDenied
+	case "foreign":
+		scope.Consumer = "foreign"
+	case "wrong-owner":
+		scope.Owner = "foreign-owner"
+	}
+	return scope, r.physical.Operation, nil
+}
+func (r *oauthTransportRows) PrepareGatewayNativeOAuthRefresh(_ context.Context, in service.GatewayNativeOAuthRefreshIntent) (service.GatewayNativeOAuthRefreshPrepared, error) {
+	return service.GatewayNativeOAuthRefreshPrepared{Outcome: service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "prepared"}, Fence: 1, Deadline: time.Now().Add(time.Second), Claimed: true, Envelope: r.row.GetCredential("oauth_bundle"), Issuer: r.physical.Issuer, Subject: r.physical.Subject}, nil
+}
+func (*oauthTransportRows) EnterGatewayNativeOAuthRefresh(context.Context, service.GatewayNativeOAuthRefreshIntent, int64) (bool, error) {
+	return true, nil
+}
+func (r *oauthTransportRows) CompleteGatewayNativeOAuthRefresh(_ context.Context, in service.GatewayNativeOAuthRefreshIntent, _ int64, envelope string) (service.GatewayNativeOAuthRefreshOutcome, error) {
+	r.row.Credentials = map[string]any{"oauth_bundle": envelope, "credential_version": "2"}
+	return service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: 2}, nil
+}
+func (*oauthTransportRows) UnknownGatewayNativeOAuthRefresh(context.Context, service.GatewayNativeOAuthRefreshIntent, int64) error {
+	return errDenied
+}
+
+func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
+	for _, mode := range []string{"valid", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
+		t.Run(mode, func(t *testing.T) {
+			var entries, admits, refreshes, checks atomic.Int32
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			require.NoError(t, err)
+			subject := uuid.NewString()
+			providerID := uuid.NewString()
+			token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{"iss": service.GatewayOAuthIssuer, "sub": subject, "aud": "app_EMoamEEZ73f0CkXaXp7hrann", "exp": time.Now().Add(time.Hour).Unix()})
+			token.Header["kid"] = "fixture"
+			signed, err := token.SignedString(key)
+			require.NoError(t, err)
+			access := uuid.NewString()
+			nextAccess := uuid.NewString()
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/.well-known/jwks.json":
+					require.Equal(t, "auth.openai.com", r.Host)
+					_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "use": "sig", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
+				case "/backend-api/accounts/check/v4-2023-04-27":
+					checks.Add(1)
+					_, _ = fmt.Fprintf(w, `{"accounts":{"irrelevant-key":{"account":{"account_id":%q}}}}`, providerID)
+				case "/oauth/token":
+					refreshes.Add(1)
+					require.Equal(t, "auth.openai.com", r.Host)
+					_ = json.NewEncoder(w).Encode(map[string]any{"access_token": nextAccess, "refresh_token": uuid.NewString(), "id_token": signed, "token_type": "Bearer", "expires_in": 3600})
+				case "/backend-api/codex/responses":
+					entries.Add(1)
+					require.Equal(t, "chatgpt.com", r.Host)
+					require.Equal(t, "Bearer "+nextAccess, r.Header.Get("Authorization"))
+					require.Equal(t, providerID, r.Header.Get("ChatGPT-Account-Id"))
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_fixture\",\"name\":\"exec\",\"input\":\"printf fixture\"}}\n\n")
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"controlled transport final\"}]}]}}\n\n")
+				default:
+					t.Errorf("unexpected OAuth route %s", r.URL.Path)
+					w.WriteHeader(500)
+				}
+			}))
+			defer upstream.Close()
+			provider := upstream.Client().Transport.(*http.Transport).Clone()
+			provider.DisableKeepAlives = true
+			provider.TLSClientConfig.ServerName = "example.com"
+			provider.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if address != "auth.openai.com:443" && address != "chatgpt.com:443" {
+					return nil, errDenied
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+			}
+			defer provider.CloseIdleConnections()
+			custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": []byte(strings.Repeat("K", 32))})
+			require.NoError(t, err)
+			scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "saved-server-owner", Account: ownerAccount, Generation: ownerGeneration, Purpose: service.GatewayOAuthBundlePurpose}
+			envelope, err := custody.SealOAuthBundle(scope, service.GatewayNativeOAuthBundle{AccessToken: access, RefreshToken: uuid.NewString(), IDToken: signed, SensitiveMetadata: json.RawMessage(`{"expires_in":3600}`)})
+			require.NoError(t, err)
+			birth := time.Now().UTC().Truncate(time.Microsecond)
+			row := &service.Account{ID: 7, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Status: service.StatusDisabled, CreatedAt: birth, Credentials: map[string]any{"oauth_bundle": envelope}, Extra: map[string]any{service.GatewayGenerationExtraKey: scope.Generation, service.GatewayProfileExtraKey: service.GatewayOAuthStagingProfile, service.GatewayCredentialScopeExtraKey: scope.Metadata()}}
+			physical := service.GatewayNativeOAuthPhysical{Scope: scope, Operation: "saved-private-connect-operation", Route: service.GatewayNativeRoute{AccountID: 7, Generation: scope.Generation, CreatedAt: birth, Profile: service.GatewayCodexOAuthResponsesProfile, BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel}, Issuer: service.GatewayOAuthIssuer, Subject: subject}
+			rows := &oauthTransportRows{row: row, physical: physical, mode: mode, admitted: &admits}
+			verifier := service.NewGatewayNativeOAuthVerifier(provider)
+			oauth, err := service.NewGatewayNativeOAuthDispatch(rows, custody, verifier, provider)
+			require.NoError(t, err)
+			ownerCtx, err := service.WithGatewayNativeConsumer(context.Background(), scope.Consumer)
+			require.NoError(t, err)
+			ownerCtx, err = service.WithGatewayNativeOAuthOwner(ownerCtx, scope.Owner)
+			require.NoError(t, err)
+			descriptor, err := oauth.Descriptor(ownerCtx, scope, physical.Operation)
+			require.NoError(t, err)
+			require.NotNil(t, descriptor.Native)
+			refresh, err := service.NewGatewayNativeOAuthRefresh(rows, custody, verifier, provider)
+			require.NoError(t, err)
+			if mode == "valid" {
+				out, err := refresh.Refresh(ownerCtx, service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 7, CreatedAt: birth, ExpectedVersion: 1, Operation: uuid.NewString(), Intent: uuid.NewString()})
+				require.NoError(t, err)
+				require.EqualValues(t, 2, out.Version)
+			}
+
+			ownedUpstream, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: &http.Client{Transport: provider}})
+			require.NoError(t, err)
+			gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, ownedUpstream, nil, nil, nil, nil, nil, nil, nil, nil)
+			callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				admits.Add(1)
+				var input admitRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+				reply := ownerReply(input)
+				canonical := physical.Route
+				reply.NativeDescriptor = &canonical
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(reply)
+			}))
+			defer callback.Close()
+			cfg := Config{Gateway: gateway, Custody: custody, OAuth: oauth, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, "fixture-qualification"},
+				Profile: QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "fixture-model", BaseURL: "https://fixture.invalid", QualificationRef: "fixture-qualification", RequestBytes: 2048, OutputBytes: 3072, Tokens: 50, ProviderTokenUpperBound: 80},
+				Codex: &QualifiedProfile{Profile: service.GatewayCodexOAuthResponsesProfile, Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL, QualificationRef: "codex-fixture-qualification", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200},
+				MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken, CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, CleanupTimeout: time.Second, Authorize: func(r *http.Request) (Peer, error) {
+				if r.Header.Get("Authorization") != "Bearer "+fixtureExecutionToken {
+					return Peer{}, errDenied
+				}
+				return Peer{"fixture-consumer", "execution"}, nil
+			}, VerifyEnrollment: func(context.Context, Enrollment) error { return nil }, VerifyDispatch: func(context.Context, string, Proof, time.Time) error { return nil }, AuthorizeCleanup: func(context.Context, string, Proof, CleanupLease) error { return errDenied }, AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied }}
+			for _, bad := range []QualifiedProfile{{Profile: "arbitrary-profile", Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL}, {Profile: service.GatewayCodexOAuthResponsesProfile, Model: "wrong-model", BaseURL: service.GatewayCodexOAuthBaseURL}, {Profile: service.GatewayCodexOAuthResponsesProfile, Model: service.GatewayCodexOAuthModel, BaseURL: "https://caller.invalid"}} {
+				wrong := cfg
+				wrong.Codex = &bad
+				_, err := New(context.Background(), wrong)
+				require.Error(t, err)
+			}
+			handler, err := New(context.Background(), cfg)
+			require.NoError(t, err)
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			defer handler.Stop(context.Background())
+			input := ownerRequest()
+			input.Descriptor = *descriptor.Native
+			input.Admission.ProfileID = service.GatewayCodexOAuthResponsesProfile
+			input.Payload = json.RawMessage(`{"model":"gpt-6.1-sol","input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
+			if mode == "forged-descriptor" {
+				input.Descriptor.CreatedAt = input.Descriptor.CreatedAt.Add(time.Microsecond)
+			}
+			result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
+			require.NoError(t, result.err)
+			require.EqualValues(t, 1, admits.Load())
+			if mode == "valid" {
+				require.EqualValues(t, 1, entries.Load())
+				require.EqualValues(t, 1, refreshes.Load())
+				require.Equal(t, "2", rows.row.GetCredential("credential_version"))
+				require.True(t, service.SameGatewayNativeDescriptor(*descriptor.Native, rows.physical.Route))
+				require.Contains(t, string(result.body), "custom_tool_call")
+				require.Contains(t, string(result.body), "controlled transport final")
+			} else {
+				require.Zero(t, entries.Load())
+				require.NotContains(t, string(result.body), "controlled transport final")
+			}
+			require.EqualValues(t, 1, checks.Load(), "invocation must not run qualification probe")
+			if mode == "forged-descriptor" {
+				require.Zero(t, rows.resolves)
+			} else {
+				require.Equal(t, 1, rows.resolves)
+			}
+		})
+	}
+}

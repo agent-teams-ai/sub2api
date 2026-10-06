@@ -41,7 +41,18 @@ type Config struct {
 	Peers         []ControlPeer   `json:"peers"`
 	Profile       ProfileConfig   `json:"profile"`
 	MaxEntries    int64           `json:"maxEntries"`
+	OAuth         *OAuthConfig    `json:"oauth,omitempty"`
+	OpenRouter    *ProfileConfig  `json:"openRouter,omitempty"`
 }
+
+// The optional OAuth key is separate from custody, inherited in protected FD6,
+// never env/CLI. Its required profile has independent qualification and bounds;
+// neither optional tuple inherits the primary MiMo qualification or limits.
+type OAuthConfig struct {
+	IntentKey string        `json:"intentKey"`
+	Profile   ProfileConfig `json:"profile"`
+}
+
 type AuthorityConfig struct {
 	Origin     string `json:"origin"`
 	Credential string `json:"credential"`
@@ -111,7 +122,7 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 			var field reflect.Type
 			for i := 0; i < typ.NumField(); i++ {
 				f := typ.Field(i)
-				if name == f.Tag.Get("json") {
+				if name == strings.Split(f.Tag.Get("json"), ",")[0] {
 					field = f.Type
 					break
 				}
@@ -121,7 +132,14 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 				return ErrDenied
 			}
 		}
-		if len(seen) != typ.NumField() {
+		required := typ.NumField()
+		for i := 0; i < typ.NumField(); i++ {
+			tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")
+			if len(tag) == 2 && tag[1] == "omitempty" && !seen[tag[0]] {
+				required--
+			}
+		}
+		if len(seen) != required {
 			return ErrDenied
 		}
 		t, err = d.Token()
@@ -131,6 +149,11 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 		if _, err = d.Token(); err != io.EOF {
 			return ErrDenied
 		}
+	case reflect.Pointer:
+		if (typ != reflect.TypeOf((*OAuthConfig)(nil)) && typ != reflect.TypeOf((*ProfileConfig)(nil))) || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return ErrDenied
+		}
+		return checkValue(raw, typ.Elem(), depth+1)
 	case reflect.Slice:
 		var values []json.RawMessage
 		if json.Unmarshal(raw, &values) != nil || values == nil || len(values) > 128 {
@@ -148,7 +171,7 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 		}
 	case reflect.String:
 		var s string
-		if json.Unmarshal(raw, &s) != nil || strings.ContainsRune(s, utf8.RuneError) {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &s) != nil || strings.ContainsRune(s, utf8.RuneError) {
 			return ErrDenied
 		}
 	case reflect.Bool:
@@ -197,14 +220,44 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 		seen[p.Credential] = true
 	}
 	p := c.Profile
-	u, err := url.Parse(p.BaseURL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || len(p.BaseURL) > 2048 ||
-		!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`).MatchString(p.Model) || !identifier.MatchString(p.QualificationRef) ||
-		p.RequestBytes < 1 || p.RequestBytes > 4<<20 || p.OutputBytes < 1 || p.OutputBytes > 8<<20 || p.Tokens < 1 ||
-		p.ProviderTokenUpperBound < p.Tokens || p.ProviderTokenUpperBound > 10000000 {
+	if !p.valid() {
 		return nil, ErrDenied
 	}
+	if c.OpenRouter != nil && (!c.OpenRouter.valid() || c.OpenRouter.BaseURL != service.GatewayOpenRouterBaseURL || c.OpenRouter.Model != service.GatewayOpenRouterModel) {
+		return nil, ErrDenied
+	}
+	if c.OAuth != nil {
+		codex := c.OAuth.Profile
+		key, keyErr := base64.StdEncoding.Strict().DecodeString(c.OAuth.IntentKey)
+		if keyErr != nil || len(key) != 32 || base64.StdEncoding.EncodeToString(key) != c.OAuth.IntentKey ||
+			(c.ListenAddress != "127.0.0.1:1455" && c.ListenAddress != "[::1]:1455") || !codex.valid() ||
+			codex.BaseURL != service.GatewayCodexOAuthBaseURL || codex.Model != service.GatewayCodexOAuthModel {
+			return nil, ErrDenied
+		}
+		for _, custodyKey := range keys {
+			if subtle.ConstantTimeCompare(key, custodyKey) == 1 {
+				return nil, ErrDenied
+			}
+		}
+	}
 	return adapter, nil
+}
+
+func (p ProfileConfig) valid() bool {
+	u, err := url.Parse(p.BaseURL)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && len(p.BaseURL) <= 2048 &&
+		regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`).MatchString(p.Model) && identifier.MatchString(p.QualificationRef) &&
+		p.RequestBytes >= 1 && p.RequestBytes <= 4<<20 && p.OutputBytes >= 1 && p.OutputBytes <= 8<<20 && p.Tokens >= 1 &&
+		p.ProviderTokenUpperBound >= p.Tokens && p.ProviderTokenUpperBound <= 10000000
+}
+
+func (c Config) openRouterProfile() *gatewaytransport.QualifiedProfile {
+	if c.OpenRouter == nil {
+		return nil
+	}
+	p := c.OpenRouter.qualified()
+	p.Profile = service.GatewayOpenRouterResponsesProfile
+	return &p
 }
 
 // Consumer and purpose come exclusively from the captured control mapping.
@@ -230,4 +283,17 @@ func authorize(peers []ControlPeer) func(*http.Request) (gatewaytransport.Peer, 
 		}
 		return gatewaytransport.Peer{}, ErrDenied
 	}
+}
+
+func (c Config) qualifiedProfile() gatewaytransport.QualifiedProfile {
+	return c.Profile.qualified()
+}
+
+func (c Config) codexProfile() *gatewaytransport.QualifiedProfile {
+	if c.OAuth == nil {
+		return nil
+	}
+	p := c.OAuth.Profile.qualified()
+	p.Profile = service.GatewayCodexOAuthResponsesProfile
+	return &p
 }
