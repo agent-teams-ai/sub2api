@@ -239,3 +239,79 @@ func (c *GatewayNativeCredentialCustody) authorization(envelope string, scope Ga
 	}
 	return "Bearer " + string(plain), nil
 }
+
+// Separate OAuth version/domain. API-key Seal and authorization remain gcn1
+// only. There is deliberately no OAuth Authorization/dispatch entry point.
+func gatewayOAuthAAD(scope GatewayNativeCredentialScope, id string) []byte {
+	encoded, _ := json.Marshal(scope)
+	return append([]byte("account-gateway/native/oauth-bundle/gco1/"+id+"\x00"), encoded...)
+}
+func (c *GatewayNativeCredentialCustody) SealOAuthBundle(scope GatewayNativeCredentialScope, bundle GatewayNativeOAuthBundle) (string, error) {
+	raw, err := bundle.bytes()
+	if err != nil {
+		return "", err
+	}
+	return c.sealOAuthBytes(scope, raw)
+}
+func (c *GatewayNativeCredentialCustody) sealOAuthBytes(scope GatewayNativeCredentialScope, raw []byte) (string, error) {
+	if c == nil || !GatewayNativeOAuthScopeValid(scope) || len(raw) == 0 || len(raw) > gatewayOAuthBundleLimit || c.keys[c.active] == nil {
+		return "", ErrGatewayNativeIdentity
+	}
+	aead := c.keys[c.active]
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", ErrGatewayNativeIdentity
+	}
+	sealed := aead.Seal(nil, nonce, raw, gatewayOAuthAAD(scope, c.active))
+	return "gco1." + c.active + "." + base64.RawURLEncoding.EncodeToString(nonce) + "." + base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+func gatewayOAuthParseEnvelope(envelope string) (string, []byte, []byte, error) {
+	if len(envelope) > 87600 {
+		return "", nil, nil, ErrGatewayNativeIdentity
+	}
+	parts := strings.Split(envelope, ".")
+	if len(parts) != 4 || parts[0] != "gco1" || !gatewayCredentialKeyIDValid(parts[1]) {
+		return "", nil, nil, ErrGatewayNativeIdentity
+	}
+	nonce, e1 := base64.RawURLEncoding.Strict().DecodeString(parts[2])
+	sealed, e2 := base64.RawURLEncoding.Strict().DecodeString(parts[3])
+	if e1 != nil || e2 != nil || len(nonce) != 12 || len(sealed) < 17 || len(sealed) > gatewayOAuthBundleLimit+16 || base64.RawURLEncoding.EncodeToString(nonce) != parts[2] || base64.RawURLEncoding.EncodeToString(sealed) != parts[3] {
+		return "", nil, nil, ErrGatewayNativeIdentity
+	}
+	return parts[1], nonce, sealed, nil
+}
+func (c *GatewayNativeCredentialCustody) ValidateOAuthEnvelope(envelope string) error {
+	id, _, _, err := gatewayOAuthParseEnvelope(envelope)
+	if err != nil || c == nil || c.keys[id] == nil {
+		return ErrGatewayNativeIdentity
+	}
+	return nil
+}
+
+// Private credential boundary, used for authenticity validation. It grants no
+// inference permit and must never be exposed as a readback/export API. Go
+// strings are immutable; this code makes no string-zeroization promise.
+func (c *GatewayNativeCredentialCustody) openOAuthBundle(envelope string, scope GatewayNativeCredentialScope) (GatewayNativeOAuthBundle, error) {
+	id, nonce, sealed, err := gatewayOAuthParseEnvelope(envelope)
+	if err != nil || c == nil || !GatewayNativeOAuthScopeValid(scope) || c.keys[id] == nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	raw, err := c.keys[id].Open(nil, nonce, sealed, gatewayOAuthAAD(scope, id))
+	if err != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	var bundle GatewayNativeOAuthBundle
+	fields, err := gatewayOAuthJSON(raw)
+	if err != nil || len(fields) != 4 || json.Unmarshal(raw, &bundle) != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	for _, name := range []string{"access_token", "refresh_token", "id_token", "sensitive_metadata"} {
+		if _, ok := fields[name]; !ok {
+			return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+		}
+	}
+	if _, err = bundle.bytes(); err != nil {
+		return GatewayNativeOAuthBundle{}, err
+	}
+	return bundle, nil
+}

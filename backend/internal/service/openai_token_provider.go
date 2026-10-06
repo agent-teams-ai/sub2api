@@ -132,6 +132,9 @@ func (p *OpenAITokenProvider) ensureMetrics() {
 
 // GetAccessToken returns a valid access_token.
 func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
+	if HasGatewayNativeIdentity(account) {
+		return "", ErrGatewayNativeIdentity
+	}
 	p.ensureMetrics()
 	if account == nil {
 		return "", errors.New("account is nil")
@@ -235,6 +238,9 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	// 3) Populate cache with TTL.
 	if p.tokenCache != nil {
 		latestAccount, isStale := CheckTokenVersion(ctx, account, p.accountRepo)
+		if HasGatewayNativeIdentity(latestAccount) {
+			return "", ErrGatewayNativeIdentity
+		}
 		if isStale && latestAccount != nil {
 			slog.Debug("openai_token_version_stale_use_latest", "account_id", account.ID)
 			accessToken = latestAccount.GetOpenAIAccessToken()
