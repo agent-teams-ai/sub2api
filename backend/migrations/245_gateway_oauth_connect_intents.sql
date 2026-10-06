@@ -31,7 +31,7 @@ CREATE TABLE gateway_oauth_connect_intents (
  CHECK (octet_length(owner_ref) BETWEEN 1 AND 800 AND owner_ref=btrim(owner_ref) AND owner_ref !~ '[[:cntrl:]]'),
  CHECK (octet_length(account_ref) BETWEEN 1 AND 800 AND account_ref=btrim(account_ref) AND account_ref !~ '[[:cntrl:]]'),
  CHECK (octet_length(operation_ref) BETWEEN 1 AND 800 AND operation_ref=btrim(operation_ref) AND operation_ref !~ '[[:cntrl:]]'),
- CHECK ((state IN ('prepared','entered') AND material_envelope ~ '^gcc1\.[A-Za-z0-9_-]{60,1019}$') OR (state IN ('unknown','completed','expired') AND material_envelope='')),
+ CHECK ((state IN ('prepared','entered') AND material_envelope ~ '^gcc1\.[A-Za-z0-9_-]+$' AND octet_length(material_envelope) BETWEEN 65 AND 1024) OR (state IN ('unknown','completed','expired') AND material_envelope='')),
  CHECK ((state IN ('prepared','expired') AND entered_at IS NULL) OR (state IN ('entered','unknown','completed') AND entered_at IS NOT NULL)),
  CHECK ((state='completed' AND enrollment_mac IS NOT NULL AND outcome_operation IS NOT NULL AND outcome_operation=enrollment_operation
   AND outcome_account_id IS NOT NULL AND outcome_account_id>0 AND outcome_generation IS NOT NULL

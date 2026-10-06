@@ -19,6 +19,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,14 +67,79 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	db, err := sql.Open("postgres", dsn)
+	// lib/pq sends this startup parameter on every pooled connection, including
+	// connections opened later by the migration runner or competing callbacks.
+	query := u.Query()
+	query.Set("search_path", "public")
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("postgres", u.String())
 	require.NoError(t, err)
 	defer db.Close()
 	db.SetMaxOpenConns(2)
-	var tables int
-	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`).Scan(&tables))
-	require.Zero(t, tables, "new isolated database required")
+	// Full migrations can be destructive. Reject user objects in every schema,
+	// including routines/types/extensions, before the first migration. PG17
+	// allocates ordinary user OIDs from 16384. Check large objects directly
+	// (their OIDs can be caller-assigned), and database-bound subscriptions
+	// whose ownership dependencies live in the shared catalogs.
+	var userObjects int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM (
+	 SELECT oid FROM pg_catalog.pg_namespace
+	 WHERE nspname NOT IN ('public','pg_catalog','pg_toast','information_schema') OR oid >= 16384
+	 UNION ALL
+	 SELECT objid FROM pg_catalog.pg_depend WHERE objid >= 16384
+	 UNION ALL
+	 SELECT objid FROM pg_catalog.pg_shdepend
+	 WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) AND objid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_largeobject_metadata
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_subscription
+	 WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+	) AS user_objects`).Scan(&userObjects))
+	require.Zero(t, userObjects, "empty isolated database without non-system user objects required")
 	require.NoError(t, ApplyMigrations(ctx, db))
+	t.Run("material envelope SQL constraint", func(t *testing.T) {
+		alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+		payload := strings.Repeat(alphabet, 16)
+		for _, tc := range []struct {
+			name     string
+			envelope string
+			accepted bool
+		}{
+			{"payload60", "gcc1." + payload[:60], true},
+			{"payload1019", "gcc1." + payload[:1019], true},
+			{"payload59", "gcc1." + payload[:59], false},
+			{"payload1020", "gcc1." + payload[:1020], false},
+			{"invalid character", "gcc1." + payload[:59] + "/", false},
+			{"newline", "gcc1." + payload[:60] + "\n", false},
+			{"non ASCII", "gcc1." + payload[:59] + "é", false},
+			{"wrong prefix", "gcc2." + payload[:60], false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Exercise the actual migrated table/guard, then roll back so
+				// the existing first-Begin/custody flow retains its exact fixture.
+				tx, err := db.BeginTx(ctx, nil)
+				require.NoError(t, err)
+				defer tx.Rollback()
+				result, err := tx.ExecContext(ctx, `INSERT INTO gateway_oauth_connect_intents
+				 (consumer,owner_ref,account_ref,generation,purpose,operation_ref,enrollment_operation,
+				 client_id,redirect_uri,deadline,state_hash,material_envelope)
+				 VALUES ('envelope-fixture','envelope-owner','envelope-account',$1,'provider-oauth-bundle-v1',
+				 'envelope-operation',$2,'app_EMoamEEZ73f0CkXaXp7hrann','http://localhost:1455/auth/callback',
+				 clock_timestamp()+interval '5 minutes',repeat('0',64),$3)`, uuid.NewString(), "connect-"+uuid.NewString(), tc.envelope)
+				if tc.accepted {
+					require.NoError(t, err)
+					rows, err := result.RowsAffected()
+					require.NoError(t, err)
+					require.EqualValues(t, 1, rows)
+				} else {
+					var pgErr *pq.Error
+					require.ErrorAs(t, err, &pgErr)
+					require.Equal(t, pq.ErrorCode("23514"), pgErr.Code)
+				}
+			})
+		}
+	})
 	repository, err := NewGatewayNativeOAuthConnectRepository(db)
 	require.NoError(t, err)
 	f1 := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
