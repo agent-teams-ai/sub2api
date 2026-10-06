@@ -24,6 +24,7 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	var mode atomic.Int32
 	var tokenCalls, jwksCalls, destinationCalls atomic.Int32
 	var receivedHeaders atomic.Bool
+	var verifyClockAdvance atomic.Bool
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { destinationCalls.Add(1) }))
 	defer destination.Close()
 	refresh := gatewayOAuthGuardFixtureOpaque()
@@ -36,6 +37,9 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 		require.Equal(t, "auth.openai.com", r.Host)
 		if r.URL.Path == "/.well-known/jwks.json" {
 			jwksCalls.Add(1)
+			if mode.Load() == 14 {
+				verifyClockAdvance.Store(true)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
 			return
 		}
@@ -77,6 +81,14 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 			flusher.Flush()
 			<-r.Context().Done()
 			return
+		case 10:
+			response[gatewayOAuthTimingMember] = map[string]any{"request_started": now.Format(time.RFC3339Nano)}
+		case 11:
+			response["expires_in"] = 0
+		case 12:
+			response["expires_in"] = int64(9223372036854775807)
+		case 13:
+			delete(response, "expires_in")
 		case 7:
 			_, _ = w.Write([]byte(`{"access_token":"a","Access_token":"b"}`))
 			return
@@ -98,6 +110,12 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	verifier := NewGatewayNativeOAuthVerifier(transport)
+	verifier.now = func() time.Time {
+		if verifyClockAdvance.Load() {
+			return now.Add(2 * time.Hour)
+		}
+		return now
+	}
 	// exchange shares the exact production constructor's fixed client policy.
 	custodyKey := make([]byte, 32)
 	_, err := rand.Read(custodyKey)
@@ -116,10 +134,50 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	require.Contains(t, string(bundle.SensitiveMetadata), "private_account_hint")
 	require.NotContains(t, string(bundle.SensitiveMetadata), nextAccess)
 	require.Equal(t, int32(1), jwksCalls.Load())
+	// Signed ID expiry wins over access expiry, which is fixed at request start.
+	metadata, err := gatewayOAuthJSON(bundle.SensitiveMetadata)
+	require.NoError(t, err)
+	var timing gatewayOAuthTiming
+	require.NoError(t, json.Unmarshal(metadata[gatewayOAuthTimingMember], &timing))
+	require.Equal(t, now.Add(time.Hour).Format(time.RFC3339Nano), timing.IDExpires)
+	tokenStarted, err := time.Parse(time.RFC3339Nano, timing.RequestStarted)
+	require.NoError(t, err)
+	accessExpires, err := time.Parse(time.RFC3339Nano, timing.AccessExpires)
+	require.NoError(t, err)
+	require.True(t, accessExpires.Equal(tokenStarted.Add(time.Hour)))
+	due, qualified := gatewayOAuthBundleDue(bundle, now.Add(time.Hour-61*time.Second), custody)
+	require.True(t, qualified)
+	require.False(t, due)
+	due, qualified = gatewayOAuthBundleDue(bundle, now.Add(time.Hour-60*time.Second), custody)
+	require.True(t, qualified)
+	require.True(t, due)
+	// Historical provider metadata, even when encrypted, cannot forge fresh timing.
+	legacy := bundle
+	legacyMetadata := map[string]any{"expires_in": 3600, gatewayOAuthTimingMember: map[string]any{
+		"request_started": timing.RequestStarted, "access_expires": timing.AccessExpires, "id_expires": timing.IDExpires, "engine_proof": "provider-controlled"}}
+	legacy.SensitiveMetadata, err = json.Marshal(legacyMetadata)
+	require.NoError(t, err)
+	due, qualified = gatewayOAuthBundleDue(legacy, time.Now().Add(24*time.Hour), custody)
+	require.False(t, qualified)
+	require.False(t, due)
+	// Dates and whole-bundle bytes are bound by the engine proof; raw JWT text or
+	// changing either the date or access token cannot become timing authority.
+	changed := bundle
+	changed.AccessToken = gatewayOAuthGuardFixtureOpaque()
+	_, qualified = gatewayOAuthBundleDue(changed, time.Now(), custody)
+	require.False(t, qualified)
+	timing.IDExpires = now.Add(-time.Hour).Format(time.RFC3339Nano)
+	metadata[gatewayOAuthTimingMember], err = json.Marshal(timing)
+	require.NoError(t, err)
+	changed = bundle
+	changed.SensitiveMetadata, err = json.Marshal(metadata)
+	require.NoError(t, err)
+	_, qualified = gatewayOAuthBundleDue(changed, time.Now(), custody)
+	require.False(t, qualified)
 	for _, tc := range []struct {
 		name string
 		mode int32
-	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"header deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}} {
+	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"header deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}, {"reserved provider metadata", 10}, {"zero expiry", 11}, {"overflow expiry", 12}, {"missing expiry", 13}} {
 		t.Run(tc.name, func(t *testing.T) {
 			mode.Store(tc.mode)
 			budget := 100 * time.Millisecond
@@ -141,8 +199,66 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 			require.Zero(t, destinationCalls.Load(), "redirect denial must precede destination contact")
 		})
 	}
-	require.Equal(t, int32(9), tokenCalls.Load())
+	require.Equal(t, int32(13), tokenCalls.Load())
 	require.Equal(t, int32(2), jwksCalls.Load(), "only complete ID tokens require fixed trusted verification")
+	// Exercise fresh enrollment enrichment at the same signed HTTP/custody
+	// boundary. A later retry must match the original four-field commitment,
+	// even with a different request-start clock and an expired original ID token.
+	scope := GatewayNativeCredentialScope{Consumer: "timing-consumer", Owner: "timing-owner", Account: "timing-account", Generation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Purpose: GatewayOAuthBundlePurpose}
+	ownerCtx, err := WithGatewayNativeConsumer(context.Background(), scope.Consumer)
+	require.NoError(t, err)
+	ownerCtx, err = WithGatewayNativeOAuthOwner(ownerCtx, scope.Owner)
+	require.NoError(t, err)
+	intentKey := make([]byte, 32)
+	_, err = rand.Read(intentKey)
+	require.NoError(t, err)
+	enrollmentObserver := &refreshEnrollmentCommitmentObserver{}
+	enrollment, err := NewGatewayNativeOAuthEnrollment(verifier, custody, enrollmentObserver, intentKey)
+	require.NoError(t, err)
+	fresh := GatewayNativeOAuthBundle{
+		AccessToken: nextAccess, RefreshToken: nextRefresh, IDToken: goodID,
+		SensitiveMetadata: json.RawMessage(`{"expires_in":3600,"private_account_hint":"fresh-exchange"}`),
+		requestStarted:    now.Add(-30 * time.Second),
+	}
+	jwksBeforeEnrollment := jwksCalls.Load()
+	accepted, err := enrollment.Stage(ownerCtx, scope, "timed-original-enrollment", fresh)
+	require.NoError(t, err)
+	require.Equal(t, jwksBeforeEnrollment+1, jwksCalls.Load(), "fresh enrichment uses the original complete verification")
+	sealedBeforeReplay := enrollmentObserver.reservation.Envelope
+	stored, err := custody.openOAuthVersion(sealedBeforeReplay, scope, 1)
+	require.NoError(t, err)
+	storedMetadata, err := gatewayOAuthJSON(stored.SensitiveMetadata)
+	require.NoError(t, err)
+	var storedTiming gatewayOAuthTiming
+	require.NoError(t, json.Unmarshal(storedMetadata[gatewayOAuthTimingMember], &storedTiming))
+	require.Equal(t, fresh.requestStarted.Format(time.RFC3339Nano), storedTiming.RequestStarted)
+	require.Equal(t, now.Add(time.Hour-30*time.Second).Format(time.RFC3339Nano), storedTiming.AccessExpires,
+		"verification must not extend access expiry beyond fixed request start")
+	require.Equal(t, now.Add(time.Hour).Format(time.RFC3339Nano), storedTiming.IDExpires)
+	due, qualified = gatewayOAuthBundleDue(stored, now.Add(time.Hour-90*time.Second), custody)
+	require.True(t, qualified)
+	require.True(t, due, "access expiry is earlier than signed ID expiry in this enrollment")
+	verifyClockAdvance.Store(true)
+	fresh.requestStarted = now.Add(2 * time.Hour)
+	replayed, err := enrollment.Stage(ownerCtx, scope, "timed-original-enrollment", fresh)
+	require.NoError(t, err)
+	require.Equal(t, accepted, replayed)
+	require.Equal(t, sealedBeforeReplay, enrollmentObserver.reservation.Envelope)
+	require.Equal(t, 1, enrollmentObserver.stages, "replay does not rewrite historical custody or timing")
+	require.Equal(t, jwksBeforeEnrollment+1, jwksCalls.Load(), "exact original replay bypasses expired token verification")
+	changedIntent := fresh
+	changedIntent.AccessToken = gatewayOAuthGuardFixtureOpaque()
+	_, err = enrollment.Stage(ownerCtx, scope, "timed-original-enrollment", changedIntent)
+	require.ErrorIs(t, err, ErrGatewayOAuthConflict)
+	verifyClockAdvance.Store(false)
+
+	// A delayed JWKS crosses signed expiry: the verifier must fail, rather than
+	// moving the absolute deadline forward to verification/response completion.
+	mode.Store(14)
+	_, err = s.exchange(context.Background(), refresh, GatewayOAuthIssuer, "reserved-subject")
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.True(t, verifyClockAdvance.Load())
+	verifyClockAdvance.Store(false)
 	// These scenarios observe service/repository context contracts using actual
 	// signed HTTP and custody. Durable SQL publication is proved only by real PG.
 	for _, tc := range []struct {
@@ -261,4 +377,30 @@ func (*httpOnlyRefreshRepository) CompleteGatewayNativeOAuthRefresh(context.Cont
 }
 func (*httpOnlyRefreshRepository) UnknownGatewayNativeOAuthRefresh(context.Context, GatewayNativeOAuthRefreshIntent, int64) error {
 	panic("SQL scenario must use real PG")
+}
+
+// This observer checks the enrollment commitment/custody contract only; the
+// closest PostgreSQL test remains authoritative for durable replay and fencing.
+type refreshEnrollmentCommitmentObserver struct {
+	GatewayNativeOAuthRepository
+	reservation GatewayNativeOAuthReservation
+	outcome     GatewayNativeOAuthOutcome
+	stages      int
+}
+
+func (o *refreshEnrollmentCommitmentObserver) ReplayGatewayNativeOAuth(_ context.Context, scope GatewayNativeCredentialScope, operation, commitment string) (GatewayNativeOAuthOutcome, bool, error) {
+	if o.stages == 0 {
+		return GatewayNativeOAuthOutcome{}, false, nil
+	}
+	if scope != o.reservation.Scope || operation != o.reservation.Operation || commitment != o.reservation.IntentMAC {
+		return GatewayNativeOAuthOutcome{}, false, ErrGatewayOAuthConflict
+	}
+	return o.outcome, true, nil
+}
+
+func (o *refreshEnrollmentCommitmentObserver) StageGatewayNativeOAuth(_ context.Context, in GatewayNativeOAuthReservation) (GatewayNativeOAuthOutcome, error) {
+	o.stages++
+	o.reservation = in
+	o.outcome = GatewayNativeOAuthOutcome{Operation: in.Operation, AccountID: 1, Generation: in.Scope.Generation, State: "staged"}
+	return o.outcome, nil
 }

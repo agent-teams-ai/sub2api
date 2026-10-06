@@ -141,3 +141,39 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {
 	_, err = d.Token()
 	return err == io.EOF
 }
+
+// Only the original connect selectors enter maintenance; no F2 reference/version
+// is an input. Output cannot serialize the private repository projection.
+func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *service.GatewayNativeOAuthRefresh, authorize gin.HandlerFunc) error {
+	if group == nil || group.BasePath() != "/" || refresh == nil || authorize == nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST("/private/native/v1/oauth/refresh", authorize, func(c *gin.Context) {
+		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_refresh_unavailable"}) }
+		var req gatewayConnectInput
+		if !gatewayConnectDecode(c, &req) {
+			fail()
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail()
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+		out, err := refresh.Maintain(c.Request.Context(), scope, req.Operation)
+		if err != nil && out.State != "unknown" {
+			fail()
+			return
+		}
+		switch out.State {
+		case "idle", "prepared", "entered", "completed", "unknown":
+		default:
+			fail()
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, out)
+	})
+	return nil
+}

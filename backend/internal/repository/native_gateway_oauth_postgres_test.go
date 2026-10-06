@@ -489,13 +489,14 @@ var gatewayOAuthGuardFixture5 = gatewayOAuthGuardFixtureOpaque()
 func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	dsn := os.Getenv("GATEWAY_NATIVE_OAUTH_REFRESH_TEST_DSN")
 	if dsn == "" {
-		t.Skip("NOT_RUN: F2 disposable PostgreSQL DSN absent; owner runs after independent review")
+		t.Skip("NOT_RUN: existing populated compatible F2/F4 purpose PostgreSQL DSN absent; ROOT runs after independent review")
 	}
 	u, err := url.Parse(dsn)
 	require.NoError(t, err)
 	require.True(t, u.Scheme == "postgres" || u.Scheme == "postgresql")
 	require.True(t, u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
-	require.True(t, strings.HasPrefix(strings.TrimPrefix(u.Path, "/"), "gateway_oauth_refresh_test_"))
+	database := strings.TrimPrefix(u.Path, "/")
+	require.True(t, strings.HasPrefix(database, "gateway_oauth_refresh_test_") || database == "gateway_oauth_dispatch_test_f4_oct6_guardv5")
 	require.True(t, u.RawQuery == "" || u.RawQuery == "sslmode=disable")
 	if u.User != nil {
 		_, password := u.User.Password()
@@ -509,8 +510,14 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	db.SetMaxOpenConns(4)
 	var tables int
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`).Scan(&tables))
-	require.Zero(t, tables)
-	require.NoError(t, ApplyMigrations(ctx, db))
+	// Source-only admission for ROOT's existing populated compatible purpose DB.
+	// This boundary never migrates or provisions a database/server.
+	require.Positive(t, tables, "ROOT must supply the populated compatible F2/F4 purpose database")
+	var compatible bool
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT to_regclass('public.gateway_oauth_refresh_attempts') IS NOT NULL
+ AND to_regclass('public.gateway_oauth_connect_intents') IS NOT NULL
+ AND to_regclass('public.gateway_oauth_profile_qualifications') IS NOT NULL`).Scan(&compatible))
+	require.True(t, compatible)
 	repo, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
 	require.True(t, ok)
 	refreshRepo, ok := repo.(service.GatewayNativeOAuthRefreshRepository)
@@ -521,6 +528,12 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	custody, err := service.NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": key})
 	require.NoError(t, err)
 	var calls atomic.Int32
+	var accountChecks atomic.Int32
+	providerAccount := uuid.NewString()
+	var originalBundle service.GatewayNativeOAuthBundle
+	var expirySeconds atomic.Int64
+	expirySeconds.Store(3600)
+	runConsumer := "consumer-f2-" + uuid.NewString()
 	var mismatch atomic.Bool
 	var releaseMu sync.Mutex
 	releases := []chan struct{}{}
@@ -551,22 +564,81 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 			subject = "foreign-subject"
 		}
 		b := bundleFor(subject)
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": b.AccessToken, "refresh_token": b.RefreshToken, "id_token": b.IDToken, "token_type": "Bearer", "expires_in": 3600, "protected_hint": "f2-sensitive-metadata"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": b.AccessToken, "refresh_token": b.RefreshToken, "id_token": b.IDToken, "token_type": "Bearer", "expires_in": expirySeconds.Load(), "protected_hint": "f2-sensitive-metadata"})
+	}, func(w http.ResponseWriter, r *http.Request) {
+		accountChecks.Add(1)
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "Bearer "+originalBundle.AccessToken, r.Header.Get("Authorization"))
+		require.Equal(t, "application/json", r.Header.Get("Accept"))
+		_, _ = fmt.Fprintf(w, `{"accounts":{"unrelated-workspace":{"account":{"account_id":%q}}}}`, providerAccount)
 	})
 	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, repo, key)
 	require.NoError(t, err)
-	principal, scope := oauthPGScope(t, "consumer-f2", "owner-f2", "logical-f2")
-	originalBundle := bundleFor("subject-f2")
-	staged, err := enrollment.Stage(principal, scope, "stage-f2", originalBundle)
+	principal, scope := oauthPGScope(t, runConsumer, "owner-f2", "logical-f2")
+	originalBundle = bundleFor("subject-f2")
+	// Reuse the real F3 journal and F4 qualification on this exact F2 row.
+	journal, err := NewGatewayNativeOAuthConnectRepository(db)
 	require.NoError(t, err)
+	connector, err := service.NewGatewayNativeOAuthConnect(key, transport, journal, enrollment, repo)
+	require.NoError(t, err)
+	const connectOperation = "maintenance-original-connect"
+	_, err = connector.BeginConnect(principal, scope, connectOperation)
+	require.NoError(t, err)
+	connectIntent, err := journal.ReadConnectIntent(principal, scope, connectOperation)
+	require.NoError(t, err)
+	won, err := journal.EnterConnect(principal, connectIntent)
+	require.NoError(t, err)
+	require.True(t, won)
+	binding := &oauthRefreshConnectBinding{GatewayNativeOAuthRepository: repo, journal: journal, intent: connectIntent}
+	boundEnrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, binding, key)
+	require.NoError(t, err)
+	staged, err := boundEnrollment.Stage(principal, scope, connectIntent.EnrollmentOperation, originalBundle)
+	require.NoError(t, err)
+	_, err = journal.FinishConnect(principal, binding.intent, "completed", staged)
+	require.NoError(t, err)
+	dispatchRepo, ok := repo.(service.GatewayNativeOAuthDispatchRepository)
+	require.True(t, ok)
+	_, physical, release, err := dispatchRepo.LockGatewayNativeOAuthDispatch(principal, scope, connectOperation, staged.AccountID)
+	require.NoError(t, err)
+	release()
+	// A bare physical DTO has no private proof and cannot qualify this row.
+	require.False(t, physical.QualificationValid(1))
+	require.ErrorIs(t, dispatchRepo.QualifyGatewayNativeOAuthDispatch(principal, physical, 1), service.ErrGatewayNativeIdentity)
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(dispatchRepo, custody, verifier, transport)
+	require.NoError(t, err)
+	descriptor, err := dispatch.Descriptor(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayCodexOAuthQualification, descriptor.Qualification)
+	require.Equal(t, connectOperation, descriptor.Operation)
+	require.Equal(t, scope.Account, descriptor.Account)
+	require.NotNil(t, descriptor.Native)
+	require.Equal(t, physical.Route, *descriptor.Native)
+	require.Equal(t, staged.AccountID, descriptor.Native.AccountID)
+	require.Equal(t, staged.Generation, descriptor.Native.Generation)
+	require.Equal(t, service.GatewayCodexOAuthResponsesProfile, descriptor.Native.Profile)
+	require.Equal(t, service.GatewayCodexOAuthBaseURL, descriptor.Native.BaseURL)
+	require.Equal(t, service.GatewayCodexOAuthModel, descriptor.Native.Model)
+	require.EqualValues(t, 1, accountChecks.Load())
+	require.Zero(t, calls.Load())
 	var birth time.Time
 	var original, extra []byte
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT created_at,credentials,extra FROM accounts WHERE id=$1`, staged.AccountID).Scan(&birth, &original, &extra))
+	require.True(t, birth.Equal(descriptor.Native.CreatedAt))
 	in := service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: staged.AccountID, CreatedAt: birth, ExpectedVersion: 1, Operation: "refresh-one", Intent: "rotate-whole-bundle"}
 	lossy := &oauthRefreshLostACK{GatewayNativeOAuthRefreshRepository: refreshRepo}
 	lossy.lose.Store(true)
 	refresher, err := service.NewGatewayNativeOAuthRefresh(lossy, custody, verifier, transport)
 	require.NoError(t, err)
+	// Legacy bundle has no reserved trusted deadline: maintenance creates no
+	// attempt and performs no token exchange, even on a qualified physical row.
+	idle, err := refresher.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "idle", idle.State)
+	require.Empty(t, idle.RefreshRef)
+	require.Zero(t, calls.Load())
+	require.EqualValues(t, 1, accountChecks.Load())
+	resolver, ok := repo.(service.GatewayNativeOAuthRefreshResolver)
+	require.True(t, ok)
 	// Same numeric ID with one microsecond birth difference is not authority.
 	wrong := in
 	wrong.CreatedAt = wrong.CreatedAt.Add(time.Microsecond)
@@ -592,6 +664,15 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	}
 	close(start)
 	require.Eventually(t, func() bool { return calls.Load() == 1 }, 3*time.Second, 10*time.Millisecond)
+	recovered, err := resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.NotNil(t, recovered.Attempt)
+	require.Equal(t, in, *recovered.Attempt, "must reconstruct original arbitrary F2 reference, not derive from current version")
+	observed, err := refresher.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "entered", observed.State)
+	require.Equal(t, in.Operation, observed.RefreshRef)
+	require.Equal(t, int32(1), calls.Load())
 	changed := in
 	changed.Intent = "different-intent"
 	_, err = refresher.Refresh(principal, changed)
@@ -621,6 +702,24 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: 2}, done)
 	require.Equal(t, int32(1), calls.Load())
+	// The caller lost its completion ACK and supplies only original F3 selectors.
+	// Current version is already newer: reconstruct old version/ref before due.
+	recovered, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, in, *recovered.Attempt)
+	require.Equal(t, int64(2), recovered.Version)
+	for j := 0; j < 4; j++ {
+		maintained, err := refresher.Maintain(principal, scope, connectOperation)
+		require.NoError(t, err)
+		require.Equal(t, "completed", maintained.State)
+		require.Equal(t, connectOperation, maintained.Operation)
+		require.Equal(t, scope.Account, maintained.AccountRef)
+		require.Equal(t, in.Operation, maintained.RefreshRef)
+	}
+	require.Equal(t, int32(1), calls.Load(), "future trusted expiry suppresses a second rotation after lost completion ACK")
+	var attempts int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_refresh_attempts WHERE account_id=$1`, in.AccountID).Scan(&attempts))
+	require.Equal(t, 1, attempts)
 	checkRow := func(version int64) []byte {
 		var afterBirth time.Time
 		var credentials, afterExtra []byte
@@ -659,7 +758,13 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	duplicate, err := refreshRepo.PrepareGatewayNativeOAuthRefresh(principal, next)
 	require.NoError(t, err)
 	require.False(t, duplicate.Claimed)
+	maintained, err := refresher.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "prepared", maintained.State)
+	require.Equal(t, next.Operation, maintained.RefreshRef)
+	require.Equal(t, int32(1), calls.Load(), "prepared is not permission to bypass future trusted deadline")
 	time.Sleep(time.Until(prepared.Deadline) + 100*time.Millisecond)
+	expirySeconds.Store(1)
 	second, err := refresher.Refresh(principal, next)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), second.Version)
@@ -672,13 +777,49 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	_, err = refreshRepo.CompleteGatewayNativeOAuthRefresh(principal, next, prepared.Fence, prepared.Envelope)
 	require.Error(t, err)
 	require.Equal(t, int32(2), calls.Load())
-	beforeUnknown := checkRow(3)
+	// Race original-selector maintenance against the same physical lock on an
+	// actually due bundle. The provider publishes a future deadline afterwards.
+	expirySeconds.Store(3600)
+	lossy.lose.Store(true)
+	maintenanceOut := make([]service.GatewayNativeOAuthMaintenanceOutcome, 4)
+	maintenanceErr := make([]error, 4)
+	maintenanceStart := make(chan struct{})
+	for j := range maintenanceOut {
+		wg.Add(1)
+		go func(j int) {
+			defer wg.Done()
+			<-maintenanceStart
+			maintenanceOut[j], maintenanceErr[j] = refresher.Maintain(principal, scope, connectOperation)
+		}(j)
+	}
+	close(maintenanceStart)
+	wg.Wait()
+	for _, err := range maintenanceErr {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(3), calls.Load(), "concurrent due maintenance has one fenced provider entry")
+	require.False(t, lossy.lose.Load(), "maintenance completion ACK must have been discarded")
+	recovered, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.NotNil(t, recovered.Attempt)
+	require.Equal(t, int64(3), recovered.Attempt.ExpectedVersion)
+	require.Equal(t, int64(4), recovered.Version)
+	canonicalRef := recovered.Attempt.Operation
+	require.NotEqual(t, next.Operation, canonicalRef)
+	for j := 0; j < 3; j++ {
+		maintained, err := refresher.Maintain(principal, scope, connectOperation)
+		require.NoError(t, err)
+		require.Equal(t, "completed", maintained.State)
+		require.Equal(t, canonicalRef, maintained.RefreshRef)
+	}
+	require.Equal(t, int32(3), calls.Load(), "future bundle cannot rotate again")
+	beforeUnknown := checkRow(4)
 	doneAgain, err := refresher.Refresh(principal, in)
 	require.NoError(t, err)
 	require.Equal(t, done, doneAgain)
 	// Crash after durable ENTERED (even before actual HTTP) is permanently unknown.
 	ambiguous := in
-	ambiguous.ExpectedVersion = 3
+	ambiguous.ExpectedVersion = 4
 	ambiguous.Operation = "entered-crash"
 	enteredAttempt, err := refreshRepo.PrepareGatewayNativeOAuthRefresh(principal, ambiguous)
 	require.NoError(t, err)
@@ -691,14 +832,21 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Equal(t, "unknown", unknown.State)
 	_, err = refreshRepo.CompleteGatewayNativeOAuthRefresh(principal, ambiguous, enteredAttempt.Fence, enteredAttempt.Envelope)
 	require.Error(t, err)
+	for j := 0; j < 3; j++ {
+		maintained, err := refresher.Maintain(principal, scope, connectOperation)
+		require.NoError(t, err)
+		require.Equal(t, "unknown", maintained.State)
+		require.Equal(t, ambiguous.Operation, maintained.RefreshRef)
+	}
+	require.Equal(t, int32(3), calls.Load(), "unknown reconstructed through original connect cannot rearm")
 	takeover := ambiguous
 	takeover.Operation = "new-op-after-ambiguity"
 	_, err = refresher.Refresh(principal, takeover)
 	require.Error(t, err)
-	require.Equal(t, int32(2), calls.Load())
-	require.JSONEq(t, string(beforeUnknown), string(checkRow(3)))
+	require.Equal(t, int32(3), calls.Load())
+	require.JSONEq(t, string(beforeUnknown), string(checkRow(4)))
 	// A validly signed different principal is quarantined; no fallback publication.
-	principal2, scope2 := oauthPGScope(t, "consumer-f2", "owner-f2", "mismatch-account")
+	principal2, scope2 := oauthPGScope(t, runConsumer, "owner-f2", "mismatch-account")
 	staged2, err := enrollment.Stage(principal2, scope2, "stage-mismatch", bundleFor("subject-other"))
 	require.NoError(t, err)
 	var birth2 time.Time
@@ -715,7 +863,7 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	var retained []byte
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials FROM accounts WHERE id=$1`, staged2.AccountID).Scan(&retained))
 	require.JSONEq(t, string(old2), string(retained))
-	require.Equal(t, int32(3), calls.Load())
+	require.Equal(t, int32(4), calls.Load())
 	// Cryptographically invalid initial custody is structurally accepted staging
 	// but must make zero provider/JWKS calls at the refresh credential boundary.
 	wrongKey := make([]byte, 32)
@@ -725,7 +873,7 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.NoError(t, err)
 	wrongEnrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, wrongCustody, repo, key)
 	require.NoError(t, err)
-	principal3, scope3 := oauthPGScope(t, "consumer-f2", "owner-f2", "invalid-custody")
+	principal3, scope3 := oauthPGScope(t, runConsumer, "owner-f2", "invalid-custody")
 	staged3, err := wrongEnrollment.Stage(principal3, scope3, "stage-invalid-custody", bundleFor("invalid-custody-subject"))
 	require.NoError(t, err)
 	var birth3 time.Time
@@ -733,7 +881,7 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	invalid := service.GatewayNativeOAuthRefreshIntent{Scope: scope3, AccountID: staged3.AccountID, CreatedAt: birth3, ExpectedVersion: 1, Operation: "refresh-invalid-custody", Intent: "rotate"}
 	_, err = refresher.Refresh(principal3, invalid)
 	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
-	require.Equal(t, int32(3), calls.Load())
+	require.Equal(t, int32(4), calls.Load())
 	var dump []byte
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT jsonb_build_object('accounts',(SELECT jsonb_agg(to_jsonb(a)) FROM accounts a),'attempts',(SELECT jsonb_agg(to_jsonb(f)) FROM gateway_oauth_refresh_attempts f))`).Scan(&dump))
 	for _, secret := range []string{originalBundle.AccessToken, originalBundle.RefreshToken, originalBundle.IDToken, "f2-sensitive-metadata"} {
@@ -743,10 +891,10 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 		lateVerifier, lateTransport, lateBundleFor := oauthPGRefreshFixture(t, func(w http.ResponseWriter, r *http.Request, bundleFor func(string) service.GatewayNativeOAuthBundle) {
 			b := bundleFor("subject-late-commit")
 			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": b.AccessToken, "refresh_token": b.RefreshToken, "id_token": b.IDToken, "token_type": "Bearer", "expires_in": 3600})
-		})
+		}, nil)
 		lateEnrollment, err := service.NewGatewayNativeOAuthEnrollment(lateVerifier, custody, repo, key)
 		require.NoError(t, err)
-		lateCtx, lateScope := oauthPGScope(t, "consumer-f2", "owner-f2", "late-commit-account")
+		lateCtx, lateScope := oauthPGScope(t, runConsumer, "owner-f2", "late-commit-account")
 		staged, err := lateEnrollment.Stage(lateCtx, lateScope, "stage-late-commit", lateBundleFor("subject-late-commit"))
 		require.NoError(t, err)
 		var created time.Time
@@ -840,11 +988,13 @@ func (r *oauthRefreshLostACK) CompleteGatewayNativeOAuthRefresh(ctx context.Cont
 	}
 	return out, err
 }
-func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http.Request, func(string) service.GatewayNativeOAuthBundle)) (*service.GatewayNativeOAuthVerifier, http.RoundTripper, func(string) service.GatewayNativeOAuthBundle) {
+func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http.Request, func(string) service.GatewayNativeOAuthBundle), accountCheck func(http.ResponseWriter, *http.Request)) (*service.GatewayNativeOAuthVerifier, http.RoundTripper, func(string) service.GatewayNativeOAuthBundle) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
+	subjectSuffix := "-" + uuid.NewString()
 	bundleFor := func(subject string) service.GatewayNativeOAuthBundle {
+		subject += subjectSuffix
 		claims := fmt.Sprintf(`{"iss":%q,"sub":%q,"aud":"app_EMoamEEZ73f0CkXaXp7hrann","exp":%d}`, service.GatewayOAuthIssuer, subject, time.Now().Add(time.Hour).Unix())
 		body := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"fixture"}`)) + "." + base64.RawURLEncoding.EncodeToString([]byte(claims))
 		digest := sha256.Sum256([]byte(body))
@@ -853,6 +1003,11 @@ func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http
 		return service.GatewayNativeOAuthBundle{AccessToken: gatewayOAuthGuardFixtureOpaque(), RefreshToken: gatewayOAuthGuardFixtureOpaque(), IDToken: body + "." + base64.RawURLEncoding.EncodeToString(signature), SensitiveMetadata: json.RawMessage(`{"private":"f2-sensitive-metadata"}`)}
 	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if accountCheck != nil && r.Host == "chatgpt.com" {
+			require.Equal(t, "/backend-api/accounts/check/v4-2023-04-27", r.URL.Path)
+			accountCheck(w, r)
+			return
+		}
 		require.Equal(t, "auth.openai.com", r.Host)
 		if r.URL.Path == "/.well-known/jwks.json" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "use": "sig", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
@@ -867,9 +1022,34 @@ func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http
 	transport := baseTransport.Clone()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		require.Equal(t, "auth.openai.com:443", address)
+		if address != "auth.openai.com:443" && (accountCheck == nil || address != "chatgpt.com:443") {
+			return nil, service.ErrGatewayNativeIdentity
+		}
 		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
 	}
 	t.Cleanup(transport.CloseIdleConnections)
 	return service.NewGatewayNativeOAuthVerifier(transport), transport, bundleFor
+}
+
+// Bind real F1 commitment into the existing entered F3 journal before staging.
+type oauthRefreshConnectBinding struct {
+	service.GatewayNativeOAuthRepository
+	journal service.GatewayNativeOAuthConnectRepository
+	intent  service.GatewayNativeOAuthConnectIntent
+}
+
+func (b *oauthRefreshConnectBinding) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (service.GatewayNativeOAuthOutcome, error) {
+	saved, err := b.journal.BindConnectEnrollment(ctx, b.intent, in.IntentMAC)
+	if err != nil {
+		return service.GatewayNativeOAuthOutcome{}, err
+	}
+	b.intent = saved
+	return b.GatewayNativeOAuthRepository.StageGatewayNativeOAuth(ctx, in)
+}
+func (r *oauthRefreshLostACK) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution, error) {
+	resolver, ok := r.GatewayNativeOAuthRefreshRepository.(service.GatewayNativeOAuthRefreshResolver)
+	if !ok {
+		return service.GatewayNativeOAuthRefreshResolution{}, errors.New("refresh test repository does not implement resolver")
+	}
+	return resolver.ResolveGatewayNativeOAuthRefresh(ctx, scope, operation)
 }
