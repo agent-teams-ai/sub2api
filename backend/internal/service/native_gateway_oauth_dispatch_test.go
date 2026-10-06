@@ -5,6 +5,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ type oauthDispatchStore struct {
 	row            *Account
 	physical       GatewayNativeOAuthPhysical
 	locks          int
+	releases       int
 	beforeLock     func(int)
 	qualifications int
 	reject         bool
@@ -36,6 +38,8 @@ type oauthDispatchStore struct {
 	fenceUnknown   bool
 	fenceEntered   bool
 	fenceChecks    int
+	fencePasses    int
+	fenceCheckedAt time.Time
 }
 
 func (r *oauthDispatchStore) ReadGatewayNativeOAuthDispatch(ctx context.Context, s GatewayNativeCredentialScope, op string) (GatewayNativeOAuthOutcome, error) {
@@ -54,13 +58,15 @@ func (r *oauthDispatchStore) LockGatewayNativeOAuthDispatch(ctx context.Context,
 	}
 	p := r.physical
 	p.RefreshFence = r
-	return r.row, p, func() {}, nil
+	return r.row, p, func() { r.releases++ }, nil
 }
 func (r *oauthDispatchStore) Check(ctx context.Context) error {
 	r.fenceChecks++
 	if ctx.Err() != nil || r.fenceUnknown || r.fenceEntered || (!r.fenceDeadline.IsZero() && !time.Now().Before(r.fenceDeadline)) {
 		return ErrGatewayNativeIdentity
 	}
+	r.fencePasses++
+	r.fenceCheckedAt = time.Now()
 	return nil
 }
 
@@ -430,10 +436,31 @@ func TestGatewayOAuthInvalidEntryHasNoProviderEffect(t *testing.T) {
 // Removing the retained post-JWKS fence permits provider entry after ambiguity
 // publication or a prepared deadline crossing during signed JWKS verification.
 func TestGatewayOAuthRetainedFenceAfterSignedJWKS(t *testing.T) {
-	for _, mode := range []string{"unknown", "entered", "deadline"} {
+	for _, mode := range []string{"unknown", "entered", "deadline", "account_expiry"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newOAuthDispatchFixture(t)
 			route := f.qualify(t)
+			jwksBefore := f.jwks.Load()
+			var verificationChecks int
+			var verifiedAt time.Time
+			var tokenClaims struct {
+				Expires int64 `json:"exp"`
+			}
+			if mode == "account_expiry" {
+				claims, err := base64.RawURLEncoding.DecodeString(strings.Split(f.bundle.IDToken, ".")[1])
+				require.NoError(t, err)
+				require.NoError(t, json.Unmarshal(claims, &tokenClaims))
+				f.dispatch.verifier.now = func() time.Time {
+					now := time.Now()
+					verificationChecks++
+					if verificationChecks == 1 {
+						require.True(t, f.store.row.ExpiresAt.After(now), "locked account must remain valid before JWKS")
+					} else {
+						verifiedAt = now
+					}
+					return now
+				}
+			}
 			f.store.beforeLock = func(n int) {
 				if n == 3 {
 					switch mode {
@@ -444,10 +471,31 @@ func TestGatewayOAuthRetainedFenceAfterSignedJWKS(t *testing.T) {
 					case "deadline":
 						f.store.fenceDeadline = time.Now().Add(20 * time.Millisecond)
 						f.jwksDelay = 60 * time.Millisecond
+					case "account_expiry":
+						expires := time.Now().Add(100 * time.Millisecond)
+						f.store.row.ExpiresAt = &expires
+						f.jwksDelay = 200 * time.Millisecond
+						require.True(t, expires.After(time.Now()), "account must be future at final lock")
 					}
 				}
 			}
 			_, entered, err, life := f.call(t, route, oauthDispatchPayload())
+			if mode == "account_expiry" {
+				require.Equal(t, 3, f.store.locks)
+				require.Equal(t, f.store.locks, f.store.releases)
+				require.Equal(t, jwksBefore+1, f.jwks.Load(), "entry verification must reach signed JWKS")
+				require.Equal(t, 2, verificationChecks, "JWKS retrieval must complete")
+				require.True(t, verifiedAt.After(*f.store.row.ExpiresAt))
+				require.Equal(t, 1, f.store.fencePasses, "signature and retained fence must both pass")
+				require.False(t, f.store.fenceCheckedAt.Before(verifiedAt))
+				require.True(t, time.Unix(tokenClaims.Expires, 0).After(f.store.fenceCheckedAt), "signed token must remain valid")
+				deadline, bounded := life.ctx.Deadline()
+				require.True(t, bounded)
+				require.True(t, deadline.After(f.store.fenceCheckedAt), "invocation must remain valid")
+				require.True(t, life.lease.After(f.store.fenceCheckedAt), "lease must remain valid")
+				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+				require.Nil(t, f.lastAuthorization.Load())
+			}
 			require.Error(t, err)
 			require.False(t, entered)
 			require.Zero(t, f.entries.Load())

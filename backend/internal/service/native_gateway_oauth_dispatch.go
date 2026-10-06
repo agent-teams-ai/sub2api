@@ -485,6 +485,9 @@ func (s *OpenAIGatewayService) checkGatewayOAuthDispatch(request *http.Request, 
 	if p.RefreshFence == nil || p.RefreshFence.Check(request.Context()) != nil {
 		return deny()
 	}
+	if fresh.ExpiresAt != nil && !fresh.ExpiresAt.After(time.Now()) {
+		return deny()
+	}
 	if !gatewayNativeEntered(request.Context(), &state.entered) {
 		release()
 		return noop, ErrGatewayNativeReplay
