@@ -145,10 +145,16 @@ jobs:
           set -o pipefail
           go build -o "$RUNNER_TEMP/account-gateway" ./cmd/account-gateway
           go vet ./cmd/account-gateway
-          go test ./cmd/account-gateway -count=1 -v | tee "$RUNNER_TEMP/account-gateway-entry.log"
+          go test ./cmd/account-gateway -skip '^TestActualRetirementCLI$' -count=1 -v | tee "$RUNNER_TEMP/account-gateway-entry.log"
+          sudo -n env PATH="$(dirname "$(command -v go)"):/usr/bin:/bin" \
+            HOME="$HOME" GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
+            GOPATH="$(go env GOPATH)" TMPDIR="$RUNNER_TEMP" \
+            GOTOOLCHAIN=local GOENV=off GOPROXY=off GOSUMDB=off GOVCS='*:off' \
+            go test ./cmd/account-gateway -run '^TestActualRetirementCLI$' -count=1 -v \
+            | tee -a "$RUNNER_TEMP/account-gateway-entry.log"
           if grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/account-gateway-entry.log"; then
             exit 1
           fi
-          for critical in TestEmittedBindingPreservesKernelIdentity TestClosedDiagnosticPipeReturnsBootstrapFailure; do
+          for critical in TestEmittedBindingPreservesKernelIdentity TestClosedDiagnosticPipeReturnsBootstrapFailure TestActualRetirementCLI; do
             test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/account-gateway-entry.log")" -eq 1
           done
