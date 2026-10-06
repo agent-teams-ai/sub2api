@@ -20,6 +20,9 @@ import (
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
+		return GatewayCodexOAuthBaseURL + "/responses", nil
+	}
 	if a.Extra[GatewayProfileExtraKey] == GatewayLegacyBridgeProfile {
 		return s.openAIChatCompletionsTargetURL(a)
 	}
@@ -67,7 +70,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
-	request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
+	if a.Type != AccountTypeOAuth {
+		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
+	}
 	request.Header.Set("Content-Type", "application/json")
 	// No caller affinity, turn-state, auth or routing headers. No invented
 	// vendor protocol switch: the official model catalog drives CLI tool shapes.
