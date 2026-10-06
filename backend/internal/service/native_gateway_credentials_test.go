@@ -327,3 +327,66 @@ func TestGatewayNativeCustodyAuthorizationHTTP(t *testing.T) {
 		require.EqualValues(t, 1, entries.Load())
 	})
 }
+
+// Failure: a rotated whole bundle could authenticate under another engine
+// version, downgrade to initial gco1, or lose its exact custody scope.
+func TestGatewayNativeOAuthVersionCustody(t *testing.T) {
+	key := custodyTestBytes(t, 32)
+	custody, err := NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": key})
+	require.NoError(t, err)
+	scope := GatewayNativeCredentialScope{Consumer: "consumer", Owner: "owner", Account: "account", Generation: "11111111-1111-4111-8111-111111111111", Purpose: GatewayOAuthBundlePurpose}
+	bundle := GatewayNativeOAuthBundle{AccessToken: base64.RawURLEncoding.EncodeToString(custodyTestBytes(t, 32)), RefreshToken: base64.RawURLEncoding.EncodeToString(custodyTestBytes(t, 32)), IDToken: base64.RawURLEncoding.EncodeToString(custodyTestBytes(t, 32)), SensitiveMetadata: json.RawMessage(`{"protected":"fixture"}`)}
+	initial, err := custody.SealOAuthBundle(scope, bundle)
+	require.NoError(t, err)
+	_, err = custody.openOAuthVersion(initial, scope, 1)
+	require.NoError(t, err)
+	rotated, err := custody.sealOAuthVersion(scope, 2, bundle)
+	require.NoError(t, err)
+	again, err := custody.sealOAuthVersion(scope, 2, bundle)
+	require.NoError(t, err)
+	require.NotEqual(t, rotated, again, "fresh GCM nonce per publication")
+	opened, err := custody.openOAuthVersion(rotated, scope, 2)
+	require.NoError(t, err)
+	require.Equal(t, bundle, opened)
+	for _, version := range []int64{0, 1, 3} {
+		_, err = custody.openOAuthVersion(rotated, scope, version)
+		require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	}
+	_, err = custody.openOAuthVersion(initial, scope, 2)
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	for _, field := range []string{"consumer", "owner", "account", "generation", "purpose"} {
+		foreign := scope
+		switch field {
+		case "consumer":
+			foreign.Consumer = "other"
+		case "owner":
+			foreign.Owner = "other"
+		case "account":
+			foreign.Account = "other"
+		case "generation":
+			foreign.Generation = "22222222-2222-4222-8222-222222222222"
+		case "purpose":
+			foreign.Purpose = GatewayCredentialPurpose
+		}
+		_, err = custody.openOAuthVersion(rotated, foreign, 2)
+		require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	}
+	for _, bad := range []string{strings.Replace(rotated, ".2.", ".02.", 1), strings.Replace(rotated, ".2.", ".3.", 1), strings.Replace(rotated, "gco2.", "gco1.", 1)} {
+		_, err = custody.openOAuthVersion(bad, scope, 2)
+		require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	}
+	parts := strings.Split(rotated, ".")
+	ciphertext, err := base64.RawURLEncoding.DecodeString(parts[4])
+	require.NoError(t, err)
+	ciphertext[0] ^= 1
+	parts[4] = base64.RawURLEncoding.EncodeToString(ciphertext)
+	_, err = custody.openOAuthVersion(strings.Join(parts, "."), scope, 2)
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	wrong, err := NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": custodyTestBytes(t, 32)})
+	require.NoError(t, err)
+	_, err = wrong.openOAuthVersion(rotated, scope, 2)
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	for _, token := range []string{bundle.AccessToken, bundle.RefreshToken, bundle.IDToken} {
+		require.NotContains(t, rotated, token)
+	}
+}

@@ -349,3 +349,20 @@ func gatewayOAuthGuardFixtureOpaque() string {
 var gatewayOAuthGuardFixture1 = gatewayOAuthGuardFixtureOpaque()
 var gatewayOAuthGuardFixture2 = gatewayOAuthGuardFixtureOpaque()
 var gatewayOAuthGuardFixture3 = gatewayOAuthGuardFixtureOpaque()
+
+// Fresh signed token authority cannot survive a bounded JWKS timeout. Signature
+// authenticity alone never substitutes for successful fixed-origin verification.
+func TestGatewayNativeOAuthSignedIdentityRetrievalDeadline(t *testing.T) {
+	key := oauthFixtureKey(t)
+	now := time.Now().Truncate(time.Second)
+	var calls atomic.Int32
+	verifier := oauthFixtureVerifier(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); <-r.Context().Done() }), now)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	identity, err := verifier.Verify(ctx, oauthFixtureSign(t, key, `{"alg":"RS256","kid":"fixture"}`, oauthFixtureClaims("reserved-subject", now)))
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.False(t, identity.Verified())
+	require.Equal(t, int32(1), calls.Load())
+	require.Less(t, time.Since(start), time.Second)
+}

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -300,6 +301,9 @@ func (c *GatewayNativeCredentialCustody) openOAuthBundle(envelope string, scope 
 	if err != nil {
 		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
 	}
+	return gatewayOAuthDecodeBundle(raw)
+}
+func gatewayOAuthDecodeBundle(raw []byte) (GatewayNativeOAuthBundle, error) {
 	var bundle GatewayNativeOAuthBundle
 	fields, err := gatewayOAuthJSON(raw)
 	if err != nil || len(fields) != 4 || json.Unmarshal(raw, &bundle) != nil {
@@ -314,4 +318,43 @@ func (c *GatewayNativeCredentialCustody) openOAuthBundle(envelope string, scope 
 		return GatewayNativeOAuthBundle{}, err
 	}
 	return bundle, nil
+}
+
+// gco1 is accepted ONLY at initial engine version 1. Rotations use a distinct
+// versioned AEAD domain; neither a format fallback nor a plaintext getter exists.
+func gatewayOAuthVersionAAD(scope GatewayNativeCredentialScope, id string, version int64) []byte {
+	encoded, _ := json.Marshal(scope)
+	return append([]byte("account-gateway/native/oauth-bundle/gco2/"+id+"/"+strconv.FormatInt(version, 10)+"\x00"), encoded...)
+}
+func (c *GatewayNativeCredentialCustody) sealOAuthVersion(scope GatewayNativeCredentialScope, version int64, bundle GatewayNativeOAuthBundle) (string, error) {
+	raw, err := bundle.bytes()
+	if err != nil || c == nil || !GatewayNativeOAuthScopeValid(scope) || version < 2 || c.keys[c.active] == nil {
+		return "", ErrGatewayNativeIdentity
+	}
+	aead := c.keys[c.active]
+	nonce := make([]byte, aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return "", ErrGatewayNativeIdentity
+	}
+	sealed := aead.Seal(nil, nonce, raw, gatewayOAuthVersionAAD(scope, c.active, version))
+	return "gco2." + c.active + "." + strconv.FormatInt(version, 10) + "." + base64.RawURLEncoding.EncodeToString(nonce) + "." + base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+func (c *GatewayNativeCredentialCustody) openOAuthVersion(envelope string, scope GatewayNativeCredentialScope, version int64) (GatewayNativeOAuthBundle, error) {
+	if version == 1 {
+		return c.openOAuthBundle(envelope, scope)
+	}
+	parts := strings.Split(envelope, ".")
+	if c == nil || !GatewayNativeOAuthScopeValid(scope) || version < 2 || len(envelope) > 87620 || len(parts) != 5 || parts[0] != "gco2" || parts[2] != strconv.FormatInt(version, 10) {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	// Reuse only the canonical nonce/ciphertext shape parser, never its gco1 AAD.
+	id, nonce, sealed, err := gatewayOAuthParseEnvelope("gco1." + parts[1] + "." + parts[3] + "." + parts[4])
+	if err != nil || c.keys[id] == nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	raw, err := c.keys[id].Open(nil, nonce, sealed, gatewayOAuthVersionAAD(scope, id, version))
+	if err != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	return gatewayOAuthDecodeBundle(raw)
 }
