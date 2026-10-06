@@ -151,7 +151,9 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": bundle.AccessToken, "refresh_token": bundle.RefreshToken, "id_token": bundle.IDToken, "token_type": "Bearer", "expires_in": 3600})
 	}))
 	defer connectTokens.Close()
-	connectTransport := connectTokens.Client().Transport.(*http.Transport).Clone()
+	connectBaseTransport, ok := connectTokens.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	connectTransport := connectBaseTransport.Clone()
 	connectTransport.TLSClientConfig.ServerName = "example.com"
 	connectTransport.DisableKeepAlives = true
 	defer connectTransport.CloseIdleConnections()
@@ -177,7 +179,9 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 		_, _ = fmt.Fprintf(w, `{"accounts":{"unrelated-workspace":{"account":{"account_id":%q}}}}`, provider)
 	}))
 	defer check.Close()
-	transport := check.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := check.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.TLSClientConfig.ServerName = "example.com"
 	defer transport.CloseIdleConnections()
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -207,7 +211,8 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	require.NotNil(t, out.Native)
 	consumerCtx, err := service.WithGatewayNativeConsumer(ctx, scope.Consumer)
 	require.NoError(t, err)
-	canonical := repo.(service.GatewayNativeOAuthCanonicalRepository)
+	canonical, ok := repo.(service.GatewayNativeOAuthCanonicalRepository)
+	require.True(t, ok)
 	selected, selectedOperation, err := canonical.ResolveGatewayNativeOAuthCanonical(consumerCtx, *out.Native, scope.Account)
 	require.NoError(t, err)
 	require.Equal(t, scope, selected)
