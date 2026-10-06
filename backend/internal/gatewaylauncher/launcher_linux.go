@@ -595,3 +595,104 @@ func ReadReceipt(c AuthorityConfig, expected Binding) (Receipt, error) {
 	}
 	return Receipt{}, ErrBinding
 }
+
+// RetirementSelector is a data filter from an original cleanup proof. It
+// conveys no process identity, launch authority or current-engine closure.
+type RetirementSelector struct {
+	OriginRef         string `json:"originRef"`
+	EngineIncarnation string `json:"engineIncarnation"`
+}
+
+// ReadRetirements derives complete OLD bindings only from protected durable
+// receipts. ReadReceipt's complete-caller-identity contract remains unchanged.
+// No flock acquisition, recovery, process observation or journal write occurs.
+func ReadRetirements(c AuthorityConfig, current Binding, selectors []RetirementSelector) ([]Receipt, error) {
+	if !validAuthority(c) || !fullBinding(current) || current.OriginRef != c.OriginRef || len(selectors) < 1 || len(selectors) > 2 {
+		return nil, ErrBinding
+	}
+	seen := map[string]bool{}
+	for _, s := range selectors {
+		if s.OriginRef != c.OriginRef || !canonicalUUID(s.EngineIncarnation) || s.EngineIncarnation == current.Incarnation || seen[s.EngineIncarnation] {
+			return nil, ErrBinding
+		}
+		seen[s.EngineIncarnation] = true
+	}
+	a, err := openAuthority(c.Directory)
+	if err != nil {
+		return nil, err
+	}
+	defer a.close()
+	f, err := a.openFile(lockName, syscall.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	s, err := statFD(f)
+	_ = f.Close()
+	if err != nil {
+		return nil, ErrUnsafe
+	}
+	a.device, a.inode = uint64(s.Dev), s.Ino
+	boot, err := bootID()
+	if err != nil {
+		return nil, err
+	}
+	read := func() (journal, error) {
+		j, exists, e := a.read()
+		if e != nil {
+			return journal{}, e
+		}
+		if !exists {
+			return journal{}, ErrEvidence
+		}
+		if e = a.validate(j, c.OriginRef, boot); e != nil {
+			return journal{}, e
+		}
+		if j.Current.Binding != current {
+			return journal{}, ErrBinding
+		}
+		return j, a.checkLock()
+	}
+	j, err := read()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Receipt, 0, len(selectors))
+	for _, selector := range selectors {
+		var old *Receipt
+		for i := range j.Receipts {
+			r := &j.Receipts[i]
+			if r.Binding.OriginRef == selector.OriginRef && r.Binding.Incarnation == selector.EngineIncarnation {
+				if old != nil {
+					return nil, ErrBinding
+				}
+				old = r
+			}
+		}
+		if old == nil {
+			return nil, ErrBinding
+		}
+		r, e := ReadReceipt(c, old.Binding)
+		if e != nil {
+			return nil, e
+		}
+		if r != *old {
+			return nil, ErrBinding
+		}
+		result = append(result, r)
+	}
+	// A concurrent supervisor publication must not mix current and old snapshots.
+	// Pin/recheck the directory and fixed inode again without taking its flock.
+	final, err := read()
+	if err != nil {
+		return nil, err
+	}
+	if final.Current != j.Current || len(final.Receipts) != len(j.Receipts) {
+		return nil, ErrBinding
+	}
+	for i := range j.Receipts {
+		if final.Receipts[i] != j.Receipts[i] {
+			return nil, ErrBinding
+		}
+	}
+	return result, nil
+}
