@@ -74,7 +74,7 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	u.RawQuery = query.Encode()
 	db, err := sql.Open("postgres", u.String())
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { require.NoError(t, db.Close()) }()
 	db.SetMaxOpenConns(2)
 	// Full migrations can be destructive. Reject user objects in every schema,
 	// including routines/types/extensions, before the first migration. PG17
@@ -120,7 +120,7 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 				// the existing first-Begin/custody flow retains its exact fixture.
 				tx, err := db.BeginTx(ctx, nil)
 				require.NoError(t, err)
-				defer tx.Rollback()
+				defer func() { require.NoError(t, tx.Rollback()) }()
 				result, err := tx.ExecContext(ctx, `INSERT INTO gateway_oauth_connect_intents
 				 (consumer,owner_ref,account_ref,generation,purpose,operation_ref,enrollment_operation,
 				 client_id,redirect_uri,deadline,state_hash,material_envelope)
