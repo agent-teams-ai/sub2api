@@ -1204,7 +1204,7 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 		data, _ := io.ReadAll(response.Body)
-		response.Body.Close()
+		_ = response.Body.Close() // Secondary cleanup must preserve the response assertions.
 		if response.StatusCode != 200 || response.Header.Get("Referrer-Policy") != "no-referrer" || bytes.Contains(data, []byte("controlled-code-marker")) || bytes.Contains(data, []byte("original-mount-operation")) || bytes.Contains(data, []byte("vendor secret")) {
 			t.Fatal("callback capability/reflection failed")
 		}
@@ -1229,7 +1229,7 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 		data, _ := io.ReadAll(response.Body)
-		response.Body.Close()
+		_ = response.Body.Close() // Secondary cleanup must preserve the response assertions.
 		if response.StatusCode != 400 || bytes.Contains(data, []byte("controlled-code-marker")) {
 			t.Fatal("callback alias or query reflection accepted", response.StatusCode)
 		}
@@ -1245,7 +1245,7 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close() // Secondary cleanup must preserve the response assertion.
 	if response.StatusCode != 400 {
 		t.Fatal("legacy callback exception opened")
 	}
