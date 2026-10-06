@@ -148,3 +148,33 @@ func TestGatewayNativeResponses_PhysicalAccountAndTools(t *testing.T) {
 		require.False(t, a.IsSchedulable())
 	})
 }
+
+// Regression: a provider body returning (0,nil) repeatedly keeps a stuck stream
+// alive by refreshing its timer despite making no byte progress.
+type nativeZeroProgressBody struct {
+	ctx   context.Context
+	reads atomic.Int32
+}
+
+func (b *nativeZeroProgressBody) Read([]byte) (int, error) {
+	b.reads.Add(1)
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	case <-time.After(5 * time.Millisecond):
+		return 0, nil
+	}
+}
+func TestGatewayNativeIdleZeroByteReadsCannotRenewTolerance(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := &nativeZeroProgressBody{ctx: ctx}
+	reader := &gatewayNativeIdleReader{reader: body, idle: 50 * time.Millisecond, cancel: cancel}
+	start := time.Now()
+	n, err := reader.Read(make([]byte, 1))
+	require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
+	require.Zero(t, n)
+	require.Greater(t, body.reads.Load(), int32(1))
+	require.Less(t, time.Since(start), time.Second)
+	require.Error(t, ctx.Err())
+}
