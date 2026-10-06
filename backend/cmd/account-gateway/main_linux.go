@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/gatewaybootstrap"
 	"github.com/Wei-Shaw/sub2api/internal/gatewaylauncher"
@@ -64,7 +66,138 @@ func absolute(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path
 }
 
+const retirementBytes = 4096
+
+type retirementInput struct {
+	Current   bindingOutput                        `json:"current"`
+	Selectors []gatewaylauncher.RetirementSelector `json:"selectors"`
+}
+
+// Token validation precedes struct decoding: encoding/json alone accepts
+// duplicate decoded names and case aliases. Exact escaped names remain valid.
+func retirementJSON(d *json.Decoder, depth int) error {
+	if depth > 3 {
+		return gatewaylauncher.ErrBinding
+	}
+	token, err := d.Token()
+	if err != nil {
+		return err
+	}
+	delim, container := token.(json.Delim)
+	if !container {
+		return nil
+	}
+	if delim != '{' && delim != '[' {
+		return gatewaylauncher.ErrBinding
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		if delim == '{' {
+			key, e := d.Token()
+			if e != nil {
+				return e
+			}
+			name, ok := key.(string)
+			if !ok || seen[name] {
+				return gatewaylauncher.ErrBinding
+			}
+			switch name {
+			case "current", "selectors", "originRef", "bootId", "incarnation", "pid", "birthTicks", "lockDevice", "lockInode", "engineIncarnation":
+			default:
+				return gatewaylauncher.ErrBinding
+			}
+			seen[name] = true
+		}
+		if err = retirementJSON(d, depth+1); err != nil {
+			return err
+		}
+	}
+	_, err = d.Token() // Decoder validates the matching closing delimiter.
+	return err
+}
+
+func parseRetirement(r io.Reader) (gatewaylauncher.Binding, []gatewaylauncher.RetirementSelector, error) {
+	data, err := io.ReadAll(io.LimitReader(r, retirementBytes+1))
+	if err != nil || len(data) > retirementBytes || !utf8.Valid(data) {
+		return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	if retirementJSON(d, 0) != nil {
+		return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+	}
+	if _, err = d.Token(); err != io.EOF {
+		return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+	}
+	var input retirementInput
+	d = json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if d.Decode(&input) != nil || len(input.Selectors) < 1 || len(input.Selectors) > 2 {
+		return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+	}
+	b := input.Current
+	pid, err := strconv.ParseInt(b.PID, 10, strconv.IntSize)
+	if err != nil || pid <= 0 || strconv.FormatInt(pid, 10) != b.PID {
+		return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+	}
+	numbers := []string{b.BirthTicks, b.LockDevice, b.LockInode}
+	var values [3]uint64
+	for i, value := range numbers {
+		values[i], err = strconv.ParseUint(value, 10, 64)
+		if err != nil || strconv.FormatUint(values[i], 10) != value || (i != 1 && values[i] == 0) {
+			return gatewaylauncher.Binding{}, nil, gatewaylauncher.ErrBinding
+		}
+	}
+	return gatewaylauncher.Binding{OriginRef: b.OriginRef, BootID: b.BootID, Incarnation: b.Incarnation,
+		PID: int(pid), BirthTicks: values[0], LockDevice: values[1], LockInode: values[2]}, input.Selectors, nil
+}
+
+func readRetirement(args []string, in io.Reader, out, diagnostic io.Writer) int {
+	// Root and the exact fixed-purpose argv are checked BEFORE any stdin read.
+	if os.Geteuid() != 0 || len(args) != 5 || args[0] != "--read-retirement" || args[1] != "--authority-dir" ||
+		!absolute(args[2]) || args[2] == "/" || args[3] != "--origin-ref" || args[4] == "" {
+		fmt.Fprintln(diagnostic, "account-gateway: invalid retirement configuration")
+		return 2
+	}
+	current, selectors, err := parseRetirement(in)
+	if err != nil {
+		fmt.Fprintln(diagnostic, "account-gateway: invalid retirement input")
+		return 2
+	}
+	receipts, err := gatewaylauncher.ReadRetirements(gatewaylauncher.AuthorityConfig{Directory: args[2], OriginRef: args[4]}, current, selectors)
+	if err != nil {
+		fmt.Fprintln(diagnostic, "account-gateway: retirement evidence denied")
+		return 1
+	}
+	if emitRetirements(out, receipts) != nil {
+		fmt.Fprintln(diagnostic, "account-gateway: retirement output failed")
+		return 1
+	}
+	return 0
+}
+
+func emitRetirements(out io.Writer, receipts []gatewaylauncher.Receipt) error {
+	response := struct {
+		Receipts []receiptOutput `json:"receipts"`
+	}{Receipts: make([]receiptOutput, len(receipts))}
+	for i, r := range receipts {
+		response.Receipts[i] = receiptOutput{Binding: outputBinding(r.Binding), Scope: r.Scope, Method: r.Method}
+	}
+	data, err := json.Marshal(response)
+	data = append(data, '\n')
+	if err != nil || len(data) > retirementBytes {
+		return gatewaylauncher.ErrBinding
+	}
+	n, err := out.Write(data)
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "--read-retirement" {
+		return readRetirement(args, os.Stdin, os.Stdout, os.Stderr)
+	}
 	// A lost metadata/diagnostic reader must reach exact-handle shutdown.
 	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)

@@ -642,6 +642,7 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 	if _, err = ReadReceipt(f.config.Authority, old.Binding); err == nil {
 		t.Fatal("live child certified retired")
 	}
+	assertRetirementLookup(t, f, old.Binding, []RetirementSelector{{old.Binding.OriginRef, old.Binding.Incarnation}}, nil)
 	stopEngine(t, f.root)
 	until := time.Now().Add(5 * time.Second)
 	for {
@@ -658,10 +659,12 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 	if err = os.Remove(filepath.Join(f.root, "exchange", "stop")); err != nil {
 		t.Fatal(err)
 	}
-	fresh := startFixture(t, f.config)
-	if fresh.Binding().Incarnation == old.Binding.Incarnation {
+	p = runSupervisor(t, f, "hold", "supervisor-b.json")
+	b := exactBinding(t, filepath.Join(f.root, "supervisor-b.json"))
+	if b.Status != "started" || b.Binding.Incarnation == old.Binding.Incarnation {
 		t.Fatal("incarnation reused")
 	}
+	t.Cleanup(func() { cleanupFixtureProcess(t, b.Binding) })
 	r, err := ReadReceipt(f.config.Authority, old.Binding)
 	if err != nil || r.Binding != old.Binding || r.Method != "reacquired-after-supervisor-loss" {
 		t.Fatalf("old recovery evidence overwritten: %v", err)
@@ -670,6 +673,165 @@ func TestSupervisorLossAndExactRecovery(t *testing.T) {
 	wrong.Incarnation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	if _, err = ReadReceipt(f.config.Authority, wrong); !errors.Is(err, ErrBinding) {
 		t.Fatal("wrong incarnation accepted")
+	}
+	assertRetirementLookup(t, f, b.Binding, []RetirementSelector{{old.Binding.OriginRef, old.Binding.Incarnation}}, []Binding{old.Binding})
+	// Lose B after Current overwrite and before any A cleanup/publication.
+	// The supervisor helper publishes only its own binding, never priorReceipt.
+	if err = p.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Wait()
+	assertRetirementLookup(t, f, b.Binding, []RetirementSelector{{b.Binding.OriginRef, b.Binding.Incarnation}}, nil)
+	probeLock(t, f.config, true)
+	stopEngine(t, f.root)
+	waitFixtureExit(t, b.Binding)
+	if err = os.Remove(filepath.Join(f.root, "exchange", "stop")); err != nil {
+		t.Fatal(err)
+	}
+	c := startFixture(t, f.config)
+	selectors := []RetirementSelector{{old.Binding.OriginRef, old.Binding.Incarnation}, {b.Binding.OriginRef, b.Binding.Incarnation}}
+	assertRetirementLookup(t, f, c.Binding(), selectors, []Binding{old.Binding, b.Binding})
+	testRetirementDenials(t, f, c.Binding(), selectors[0])
+	stopEngine(t, f.root)
+	ctx, cancel := deadline(t)
+	defer cancel()
+	if _, err = c.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Remove(filepath.Join(f.root, "exchange", "stop")); err != nil {
+		t.Fatal(err)
+	}
+	// An actual failed exec overwrites Current with start-failed, but cannot
+	// erase A; the next successful current can still select the durable receipt.
+	bad := filepath.Join(f.root, "failed-retirement-exec")
+	if err = os.WriteFile(bad, []byte("\x7fELFsynthetic-invalid-image"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	failed := f.config
+	failed.EnginePath = bad
+	failedLauncher, startErr := Start(failed)
+	trackLauncher(t, failedLauncher)
+	if failedLauncher != nil || !errors.Is(startErr, ErrStart) {
+		t.Fatal("expected actual failed exec", startErr)
+	}
+	d := startFixture(t, f.config)
+	assertRetirementLookup(t, f, d.Binding(), selectors[:1], []Binding{old.Binding})
+}
+
+func waitFixtureExit(t *testing.T, b Binding) {
+	t.Helper()
+	until := time.Now().Add(5 * time.Second)
+	for time.Now().Before(until) {
+		n, state, err := birth(b.PID)
+		if os.IsNotExist(err) || (err == nil && n == b.BirthTicks && (state == 'Z' || state == 'X')) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("exact disposable engine exit absent")
+}
+
+func assertRetirementLookup(t *testing.T, f fixture, current Binding, selectors []RetirementSelector, want []Binding) {
+	t.Helper()
+	path := filepath.Join(f.config.Authority.Directory, journalName)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var j journal
+	if json.Unmarshal(before, &j) != nil {
+		t.Fatal("fixture journal malformed")
+	}
+	n, state, birthErr := birth(j.Current.Binding.PID)
+	receipts, err := ReadRetirements(f.config.Authority, current, selectors)
+	if want == nil {
+		if err == nil || receipts != nil {
+			t.Fatal("denied lookup returned positive evidence")
+		}
+	} else {
+		if err != nil || len(receipts) != len(want) {
+			t.Fatal("durable selected evidence absent", err)
+		}
+		for i, r := range receipts {
+			if r.Binding != want[i] || r.Scope != LocalTeardownScope || (r.Method != "observed-child-exit" && r.Method != "reacquired-after-supervisor-loss") {
+				t.Fatal("selected evidence changed identity/order/scope")
+			}
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("readonly lookup changed source journal")
+	}
+	if _, err = os.Stat(filepath.Join(f.config.Authority.Directory, stagingName)); !os.IsNotExist(err) {
+		t.Fatal("readonly lookup created publication staging")
+	}
+	if birthErr == nil && state != 'Z' && state != 'X' {
+		got, s, e := birth(j.Current.Binding.PID)
+		if e != nil || got != n || s == 'Z' || s == 'X' {
+			t.Fatal("readonly lookup affected exact live engine")
+		}
+		probeLock(t, f.config, true)
+	}
+}
+
+func testRetirementDenials(t *testing.T, f fixture, current Binding, old RetirementSelector) {
+	t.Helper()
+	for _, field := range []string{"origin", "boot", "incarnation", "pid", "birth", "device", "inode"} {
+		wrong := current
+		switch field {
+		case "origin":
+			wrong.OriginRef += "-foreign"
+		case "boot":
+			wrong.BootID = "00000000-0000-0000-0000-000000000000"
+		case "incarnation":
+			wrong.Incarnation = old.EngineIncarnation
+		case "pid":
+			wrong.PID = os.Getpid() // live different process, never a signal target
+		case "birth":
+			wrong.BirthTicks++ // same PID with a reused/different birth identity
+		case "device":
+			wrong.LockDevice++
+		case "inode":
+			wrong.LockInode++
+		}
+		assertRetirementLookup(t, f, wrong, []RetirementSelector{old}, nil)
+	}
+	for _, selectors := range [][]RetirementSelector{
+		nil, {old, old}, {old, old, old},
+		{{old.OriginRef + "-foreign", old.EngineIncarnation}},
+		{{current.OriginRef, current.Incarnation}},
+		{{current.OriginRef, "00000000-0000-0000-0000-000000000000"}},
+		{old, {current.OriginRef, "00000000-0000-0000-0000-000000000000"}},
+		{{current.OriginRef, strings.ReplaceAll(old.EngineIncarnation, "-", "")}},
+	} {
+		assertRetirementLookup(t, f, current, selectors, nil)
+	}
+	// Validate the ENTIRE journal, including unselected records and ambiguity.
+	path := filepath.Join(f.config.Authority.Directory, journalName)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.WriteFile(path, original, 0600); err != nil {
+			t.Error(err)
+		}
+	}()
+	for _, mode := range []string{"ambiguous", "unselected-corrupt"} {
+		var j journal
+		if json.Unmarshal(original, &j) != nil {
+			t.Fatal("fixture journal malformed")
+		}
+		if mode == "ambiguous" {
+			j.Receipts = append(j.Receipts, j.Receipts[0])
+		} else {
+			j.Receipts[len(j.Receipts)-1].Scope = "invalid-local-scope"
+		}
+		data, e := json.Marshal(j)
+		if e != nil || os.WriteFile(path, data, 0600) != nil {
+			t.Fatal("cannot publish owned corrupt fixture")
+		}
+		assertRetirementLookup(t, f, current, []RetirementSelector{old}, nil)
 	}
 }
 
