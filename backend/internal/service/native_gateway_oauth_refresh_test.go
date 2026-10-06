@@ -72,7 +72,9 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"access_token":`))
-			w.(http.Flusher).Flush()
+			flusher, ok := w.(http.Flusher)
+			require.True(t, ok)
+			flusher.Flush()
 			<-r.Context().Done()
 			return
 		case 7:
@@ -82,7 +84,9 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
-	transport := server.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := server.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	defer transport.CloseIdleConnections()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
