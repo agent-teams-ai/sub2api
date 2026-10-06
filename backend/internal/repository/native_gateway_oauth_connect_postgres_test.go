@@ -107,6 +107,14 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	 UNION ALL
 	 SELECT oid FROM pg_catalog.pg_default_acl WHERE oid >= 16384
 	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_ts_template WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_ts_parser WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_ts_dict WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_ts_config WHERE oid >= 16384
+	 UNION ALL
 	 SELECT oid FROM pg_catalog.pg_largeobject_metadata
 	 UNION ALL
 	 SELECT oid FROM pg_catalog.pg_subscription
@@ -130,6 +138,20 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 		require.NoError(t, err, "fixture role must be able to create the regression cast")
 		require.ErrorIs(t, requireEmptyDatabase(tx), errFixtureNotEmpty)
 	}), "cast guard and checked rollback must pass before any migration")
+	require.True(t, t.Run("pinned text-search template denies migrations", func(t *testing.T) {
+		// PG17 suppresses dependencies on pinned builtin namespace/functions.
+		// Templates have no owner; the direct high-OID guard must still deny.
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback template fixture: %v", rollbackErr)
+			}
+		}()
+		_, err = tx.ExecContext(ctx, `CREATE TEXT SEARCH TEMPLATE pg_catalog.oauth_empty_template_fixture (INIT = pg_catalog.dsimple_init, LEXIZE = pg_catalog.dsimple_lexize)`)
+		require.NoError(t, err, "fixture role must be able to create the regression template")
+		require.ErrorIs(t, requireEmptyDatabase(tx), errFixtureNotEmpty)
+	}), "template guard and checked rollback must pass before any migration")
 	require.NoError(t, requireEmptyDatabase(db))
 	require.NoError(t, ApplyMigrations(ctx, db))
 	t.Run("material envelope SQL constraint", func(t *testing.T) {
