@@ -285,7 +285,9 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": next.AccessToken, "refresh_token": next.RefreshToken, "id_token": next.IDToken, "token_type": "Bearer", "expires_in": 3600})
 	}))
 	defer tokens.Close()
-	tokenTransport := tokens.Client().Transport.(*http.Transport).Clone()
+	tokenBaseTransport, ok := tokens.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	tokenTransport := tokenBaseTransport.Clone()
 	tokenTransport.TLSClientConfig.ServerName = "example.com"
 	defer tokenTransport.CloseIdleConnections()
 	tokenTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -543,7 +545,9 @@ func oauthDispatchPGGateway(t *testing.T, repo service.AccountRepository, entrie
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(provider.Close)
-	transport := provider.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := provider.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -636,7 +640,9 @@ func oauthDispatchPGSignedFixture(t *testing.T) (*service.GatewayNativeOAuthVeri
 	}))
 	t.Cleanup(server.Close)
 	t.Cleanup(func() { gate.releaseOnce.Do(func() { close(gate.release) }) })
-	transport := server.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := server.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DisableKeepAlives = true
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
