@@ -90,6 +90,7 @@ type gatewayNativeDispatch struct {
 	account *Account
 	scope   GatewayNativeCredentialScope
 	custody *GatewayNativeCredentialCustody
+	oauth   *GatewayNativeOAuthPhysical
 	entered atomic.Bool
 }
 
@@ -228,6 +229,9 @@ func snapshotGatewayNativeAccount(a *Account) *Account {
 		snapshot.Extra[key] = value
 	}
 	scope, _ := GatewayNativeCredentialScopeForAccount(a)
+	if a.Type == AccountTypeOAuth {
+		scope, _ = gatewayOAuthScopeForAccount(a)
+	}
 	snapshot.Extra[GatewayCredentialScopeExtraKey] = scope.Metadata()
 	if a.ExpiresAt != nil {
 		expires := *a.ExpiresAt
@@ -241,6 +245,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
 			defer lifetime.finish()
 		}
+	}
+	if ctx != nil && route.Profile == GatewayCodexOAuthResponsesProfile {
+		return s.forwardGatewayOAuthRoute(ctx, c, route, body)
 	}
 	if ctx == nil || c == nil || c.Request == nil || s.accountRepo == nil || len(body) > 4<<20 || !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() || !gatewayNativeUnambiguousPolicyFields(body) ||
 		gjson.GetBytes(body, "model").String() != route.Model || (route.Profile != GatewayMiMoResponsesProfile && route.Profile != GatewayLegacyBridgeProfile) ||
@@ -313,6 +320,9 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 			return noop, ErrGatewayNativeIdentity
 		}
 		return noop, nil
+	}
+	if state.route.Profile == GatewayCodexOAuthResponsesProfile {
+		return s.checkGatewayOAuthDispatch(request, a, state)
 	}
 	if state.account != a || validateGatewayNativeRoute(state.route, a) != nil || request.Method != http.MethodPost ||
 		request.Header.Get("Authorization") != "Bearer "+a.GetCredential("api_key") {
