@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -78,11 +79,16 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	db.SetMaxOpenConns(2)
 	// Full migrations can be destructive. Reject user objects in every schema,
 	// including routines/types/extensions, before the first migration. PG17
-	// allocates ordinary user OIDs from 16384. Check large objects directly
-	// (their OIDs can be caller-assigned), and database-bound subscriptions
-	// whose ownership dependencies live in the shared catalogs.
-	var userObjects int
-	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM (
+	// allocates ordinary user OIDs from 16384. Dependencies on pinned builtins
+	// are suppressed, so also inventory schema-less object catalogs directly.
+	// Check large objects regardless of OID (they can be caller-assigned), and
+	// database-bound subscriptions whose ownership dependencies are shared.
+	errFixtureNotEmpty := errors.New("empty isolated database without non-system user objects required")
+	requireEmptyDatabase := func(queryer interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	}) error {
+		var userObjects int
+		if err := queryer.QueryRowContext(ctx, `SELECT count(*) FROM (
 	 SELECT oid FROM pg_catalog.pg_namespace
 	 WHERE nspname NOT IN ('public','pg_catalog','pg_toast','information_schema') OR oid >= 16384
 	 UNION ALL
@@ -91,12 +97,40 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	 SELECT objid FROM pg_catalog.pg_shdepend
 	 WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) AND objid >= 16384
 	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_cast WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_language WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_transform WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_am WHERE oid >= 16384
+	 UNION ALL
+	 SELECT oid FROM pg_catalog.pg_default_acl WHERE oid >= 16384
+	 UNION ALL
 	 SELECT oid FROM pg_catalog.pg_largeobject_metadata
 	 UNION ALL
 	 SELECT oid FROM pg_catalog.pg_subscription
 	 WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
-	) AS user_objects`).Scan(&userObjects))
-	require.Zero(t, userObjects, "empty isolated database without non-system user objects required")
+	) AS user_objects`).Scan(&userObjects); err != nil {
+			return err
+		}
+		if userObjects != 0 {
+			return errFixtureNotEmpty
+		}
+		return nil
+	}
+	require.NoError(t, requireEmptyDatabase(db))
+	require.True(t, t.Run("dependency-free cast denies migrations", func(t *testing.T) {
+		// Builtin types are pinned, and casts have neither namespace nor owner
+		// dependencies. The old dependency-only inventory misses this object.
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, tx.Rollback()) }()
+		_, err = tx.ExecContext(ctx, `CREATE CAST (integer AS text) WITH INOUT`)
+		require.NoError(t, err, "fixture role must be able to create the regression cast")
+		require.ErrorIs(t, requireEmptyDatabase(tx), errFixtureNotEmpty)
+	}), "cast guard and checked rollback must pass before any migration")
+	require.NoError(t, requireEmptyDatabase(db))
 	require.NoError(t, ApplyMigrations(ctx, db))
 	t.Run("material envelope SQL constraint", func(t *testing.T) {
 		alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
