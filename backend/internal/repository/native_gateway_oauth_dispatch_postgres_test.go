@@ -56,7 +56,11 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	defer cancel()
 	db, err := openOAuthDispatchFixtureDB(dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close fixture database: %v", closeErr)
+		}
+	}()
 	db.SetMaxOpenConns(4)
 	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
 	// Safety qualification uses rollback-only objects before ANY migration. No
@@ -116,9 +120,12 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
 	require.NoError(t, ApplyMigrations(ctx, db))
 	repo := NewAccountRepository(nil, db, nil)
-	stageRepo := repo.(service.GatewayNativeOAuthRepository)
-	dispatchRepo := repo.(service.GatewayNativeOAuthDispatchRepository)
-	refreshRepo := repo.(service.GatewayNativeOAuthRefreshRepository)
+	stageRepo, ok := repo.(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
+	dispatchRepo, ok := repo.(service.GatewayNativeOAuthDispatchRepository)
+	require.True(t, ok)
+	refreshRepo, ok := repo.(service.GatewayNativeOAuthRefreshRepository)
+	require.True(t, ok)
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	require.NoError(t, err)
@@ -373,7 +380,11 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	}
 	writer, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	require.NoError(t, err)
-	defer writer.Rollback()
+	defer func() {
+		if rollbackErr := writer.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback held writer: %v", rollbackErr)
+		}
+	}()
 	var writerPID int
 	require.NoError(t, writer.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&writerPID))
 	var id int64
@@ -699,7 +710,11 @@ func TestOAuthDispatchFixturePinsEveryPQConnection(t *testing.T) {
 	t.Setenv("PGOPTIONS", "-c search_path=inherited_foreign,public")
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() {
+		if closeErr := listener.Close(); closeErr != nil {
+			t.Errorf("close fixture listener: %v", closeErr)
+		}
+	}()
 	seen := make(chan string, 2)
 	failures := make(chan error, 2)
 	go func() {
@@ -710,7 +725,11 @@ func TestOAuthDispatchFixturePinsEveryPQConnection(t *testing.T) {
 				return
 			}
 			go func(conn net.Conn) {
-				defer conn.Close()
+				defer func() {
+					if closeErr := conn.Close(); closeErr != nil {
+						t.Errorf("close fixture connection: %v", closeErr)
+					}
+				}()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				header := make([]byte, 4)
 				if _, err := io.ReadFull(conn, header); err != nil {
@@ -751,16 +770,28 @@ func TestOAuthDispatchFixturePinsEveryPQConnection(t *testing.T) {
 	}()
 	db, err := openOAuthDispatchFixtureDB("postgres://fixture@" + listener.Addr().String() + "/gateway_oauth_dispatch_test_protocol?sslmode=disable")
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close fixture database: %v", closeErr)
+		}
+	}()
 	db.SetMaxOpenConns(2)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	first, err := db.Conn(ctx)
 	require.NoError(t, err)
-	defer first.Close()
+	defer func() {
+		if closeErr := first.Close(); closeErr != nil {
+			t.Errorf("close first fixture connection: %v", closeErr)
+		}
+	}()
 	second, err := db.Conn(ctx)
 	require.NoError(t, err)
-	defer second.Close()
+	defer func() {
+		if closeErr := second.Close(); closeErr != nil {
+			t.Errorf("close second fixture connection: %v", closeErr)
+		}
+	}()
 	for range 2 {
 		select {
 		case path := <-seen:

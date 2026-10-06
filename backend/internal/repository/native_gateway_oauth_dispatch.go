@@ -145,7 +145,8 @@ func (r *accountRepository) QualifyGatewayNativeOAuthDispatch(ctx context.Contex
 	if err != nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	defer tx.Rollback()
+	// Secondary cleanup must preserve the original operation/commit result.
+	defer func() { _ = tx.Rollback() }()
 	_, current, err := gatewayOAuthPhysicalRead(ctx, tx, p.Scope, p.Operation, p.Route.AccountID)
 	if err != nil || !service.SameGatewayNativeDescriptor(current.Route, p.Route) || current.Issuer != p.Issuer || current.Subject != p.Subject {
 		return service.ErrGatewayNativeIdentity
@@ -222,7 +223,8 @@ func (r *accountRepository) ResolveGatewayNativeOAuthCanonical(ctx context.Conte
 	if err != nil {
 		return empty, "", service.ErrGatewayNativeIdentity
 	}
-	defer rows.Close()
+	// Rows.Err below is authoritative; preserve it during secondary close.
+	defer func() { _ = rows.Close() }()
 	scope := service.GatewayNativeCredentialScope{Consumer: consumer, Account: account, Generation: route.Generation}
 	var operation string
 	if !rows.Next() || rows.Scan(&scope.Owner, &operation, &scope.Purpose) != nil || rows.Next() || rows.Err() != nil || !service.GatewayNativeOAuthScopeValid(scope) || !service.GatewayNativeCredentialRefValid(operation) {
