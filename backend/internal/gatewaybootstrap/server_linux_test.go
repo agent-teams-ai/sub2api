@@ -690,8 +690,8 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	adminSvc := service.NewAdminService(nil, nil, nil, rows, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	auth := authorize(c.Peers)
 	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,
-		Enrollment: gatewaytransport.Enrollment{origin, engineIncarnation, c.Profile.QualificationRef},
-		Profile: c.qualifiedProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: 4,
+		Enrollment: gatewaytransport.Enrollment{OriginRef: origin, EngineIncarnation: engineIncarnation, QualificationRef: c.Profile.QualificationRef},
+		Profile:    c.qualifiedProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: 4,
 		CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 16384, CallbackBytes: 65536}
 	a.compose(&cfg)
 	missingCodex := cfg
@@ -703,7 +703,7 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	if err != nil || enrollments.Load() != 1 {
 		t.Fatal("additive startup/enrollment failed", err)
 	}
-	defer transport.Stop(context.Background())
+	defer func() { _ = transport.Stop(context.Background()) }()
 	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: a}
 	server := httptest.NewServer(privateHandler(c.Profile, adminSvc, gateway, custody, transport, auth, mode))
 	defer server.Close()
@@ -730,7 +730,7 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
 		if err != nil || len(data) > 65536 {
 			t.Fatal("composition response read failed", err)
@@ -766,7 +766,7 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 			Admission: gatewaytransport.Admission{ExecutionRef: fmt.Sprintf("composition-execution-%d", i), IssuerEpoch: "fixture-issuer",
 				InvocationRef: "fixture-invocation", AttemptRef: "fixture-attempt", AccountRef: p.Profile, AuthorizationEpoch: 3,
 				SubjectRef: "fixture-subject", PolicyRevision: 4, BindingRevision: 5, ProfileID: p.Profile,
-				Limits: gatewaytransport.Limits{Requests: 2, Concurrency: 1, RequestBytes: p.RequestBytes, OutputBytes: p.OutputBytes, Tokens: p.Tokens},
+				Limits:    gatewaytransport.Limits{Requests: 2, Concurrency: 1, RequestBytes: p.RequestBytes, OutputBytes: p.OutputBytes, Tokens: p.Tokens},
 				ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)}, Descriptor: descriptor,
 			Payload: json.RawMessage(fmt.Sprintf(`{"model":%q,"input":%q,"store":false,"stream":true,"service_tier":"default","max_output_tokens":%d}`,
 				p.Model, strings.Repeat("x", int(p.RequestBytes)-256), p.ProviderTokenUpperBound))}
@@ -831,7 +831,7 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	if err != nil {
 		t.Fatal("OAuth without OpenRouter startup denied", err)
 	}
-	defer withoutRouter.Stop(context.Background())
+	defer func() { _ = withoutRouter.Stop(context.Background()) }()
 	second := httptest.NewServer(privateHandler(c.Profile, adminSvc, gateway, custody, withoutRouter, auth, mode))
 	defer second.Close()
 	create(second, profiles[0], "55555555-5555-4555-8555-555555555555")
@@ -941,14 +941,14 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
 	auth := authorize(c.Peers)
 	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,
-		Enrollment: gatewaytransport.Enrollment{"fixture-origin", "11111111-1111-4111-8111-111111111111", c.Profile.QualificationRef},
-		Profile: c.qualifiedProfile(), Codex: c.codexProfile(), MaxEntries: 4, CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 8192, CallbackBytes: 65536}
+		Enrollment: gatewaytransport.Enrollment{OriginRef: "fixture-origin", EngineIncarnation: "11111111-1111-4111-8111-111111111111", QualificationRef: c.Profile.QualificationRef},
+		Profile:    c.qualifiedProfile(), Codex: c.codexProfile(), MaxEntries: 4, CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 8192, CallbackBytes: 65536}
 	a.compose(&cfg)
 	transport, err := gatewaytransport.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer transport.Stop(context.Background())
+	defer func() { _ = transport.Stop(context.Background()) }()
 	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect, dispatch, a}))
 	defer server.Close()
 	post := func(path string, body any, authenticated bool) (int, []byte) {
@@ -965,7 +965,7 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		data, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, data
 	}
@@ -1032,7 +1032,11 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		_, _ = io.WriteString(w, "controlled vendor secret must not reflect")
 	}))
 	defer tokens.Close()
-	provider := tokens.Client().Transport.(*http.Transport).Clone()
+	tokenTransport, ok := tokens.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("unexpected test HTTP transport type")
+	}
+	provider := tokenTransport.Clone()
 	provider.TLSClientConfig.ServerName = "example.com"
 	provider.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		if address != "auth.openai.com:443" {
@@ -1076,7 +1080,7 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners}
 	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, mode))
 	defer server.Close()
-	defer transport.Stop(context.Background())
+	defer func() { _ = transport.Stop(context.Background()) }()
 	input := `{"operation":"original-mount-operation","owner_ref":"fixture-live-owner","account_ref":"fixture-account","generation":"33333333-3333-4333-8333-333333333333"}`
 	post := func(path, body, role string) (int, []byte) {
 		req, _ := http.NewRequest("POST", server.URL+path, strings.NewReader(body))
@@ -1090,7 +1094,7 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		raw, _ := io.ReadAll(response.Body)
 		return response.StatusCode, raw
 	}

@@ -303,7 +303,9 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			c.Next()
 		}
 		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil || admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "private native bootstrap denied", 503) })
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
+			})
 		}
 	}
 	// Telemetry uses the same management credential, typed consumer context and
@@ -333,7 +335,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			if controller.SetReadDeadline(time.Now().Add(5*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(5*time.Second)) != nil {
 				r.URL.RawQuery = ""
 				r.RequestURI = "/auth/callback"
-				http.Error(w, "private native bootstrap denied", 503)
+				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 				return
 			}
 			callback.ServeHTTP(w, r.WithContext(bounded))
@@ -354,7 +356,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			controller := http.NewResponseController(w)
 			if controller.SetReadDeadline(time.Now().Add(5*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(5*time.Second)) != nil {
-				http.Error(w, "private native bootstrap denied", 503)
+				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 				return
 			}
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -458,6 +460,7 @@ func (t nativeOAuthOwnerTuple) valid() bool {
 	return service.GatewayNativeCredentialRefValid(t.Operation) && service.GatewayNativeCredentialRefValid(t.OwnerRef) &&
 		service.GatewayNativeCredentialRefValid(t.AccountRef) && incarnation.MatchString(t.Generation)
 }
+
 type privateOAuth struct {
 	connect  *service.GatewayNativeOAuthConnect
 	dispatch *service.GatewayNativeOAuthDispatch
