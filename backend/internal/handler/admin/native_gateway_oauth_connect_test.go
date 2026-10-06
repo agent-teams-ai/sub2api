@@ -209,7 +209,9 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 		if f.stallBody {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.(http.Flusher).Flush()
+			flusher, ok := w.(http.Flusher)
+			require.True(t, ok)
+			flusher.Flush()
 			close(f.headersFlushed)
 			select {
 			case <-r.Context().Done():
@@ -221,7 +223,9 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 		_, _ = io.WriteString(w, f.response)
 	}))
 	t.Cleanup(source.Close)
-	transport := source.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := source.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
