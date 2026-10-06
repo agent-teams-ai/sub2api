@@ -725,11 +725,8 @@ func TestOAuthDispatchFixturePinsEveryPQConnection(t *testing.T) {
 				return
 			}
 			go func(conn net.Conn) {
-				defer func() {
-					if closeErr := conn.Close(); closeErr != nil {
-						t.Errorf("close fixture connection: %v", closeErr)
-					}
-				}()
+				// Background protocol teardown must not report after test completion.
+				defer func() { _ = conn.Close() }()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				header := make([]byte, 4)
 				if _, err := io.ReadFull(conn, header); err != nil {
