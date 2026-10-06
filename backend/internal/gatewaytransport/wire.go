@@ -149,7 +149,7 @@ func (a Admission) valid(now time.Time) bool {
 	return err == nil && t.After(now) && identifier.MatchString(a.ExecutionRef) &&
 		identifier.MatchString(a.IssuerEpoch) && identifier.MatchString(a.AccountRef) &&
 		identifier.MatchString(a.InvocationRef) && identifier.MatchString(a.AttemptRef) && identifier.MatchString(a.SubjectRef) &&
-		a.ProfileID == service.GatewayMiMoResponsesProfile &&
+		(a.ProfileID == service.GatewayMiMoResponsesProfile || a.ProfileID == service.GatewayOpenRouterResponsesProfile || a.ProfileID == service.GatewayCodexOAuthResponsesProfile) &&
 		a.AuthorizationEpoch >= 0 && a.AuthorizationEpoch <= maxSafeInteger &&
 		a.PolicyRevision >= 0 && a.PolicyRevision <= maxSafeInteger && a.BindingRevision >= 0 && a.BindingRevision <= maxSafeInteger &&
 		l.Requests >= 1 && l.Requests <= 10000 && l.Concurrency >= 1 && l.Concurrency <= 128 && l.Concurrency <= l.Requests &&

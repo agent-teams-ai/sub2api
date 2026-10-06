@@ -79,15 +79,20 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input Request
-	if strictJSON(data, &input) != nil || !input.Admission.valid(time.Now()) || !identifier.MatchString(input.RequestRef) || !canonicalUUID.MatchString(input.Worker) ||
+	if strictJSON(data, &input) != nil {
+		http.Error(raw, "private native transport denied", http.StatusBadRequest)
+		return
+	}
+	profile, configured := h.profile(input.Admission.ProfileID)
+	if !configured || !input.Admission.valid(time.Now()) || !identifier.MatchString(input.RequestRef) || !canonicalUUID.MatchString(input.Worker) ||
 		input.Descriptor.AccountID < 1 || !canonicalUUID.MatchString(input.Descriptor.Generation) || input.Descriptor.CreatedAt.IsZero() ||
-		input.Descriptor.Profile != h.cfg.Profile.Profile || input.Admission.ProfileID != h.cfg.Profile.Profile || input.Descriptor.Model != h.cfg.Profile.Model || input.Descriptor.BaseURL != h.cfg.Profile.BaseURL ||
-		input.Admission.Limits.RequestBytes > h.cfg.Profile.RequestBytes || input.Admission.Limits.OutputBytes > h.cfg.Profile.OutputBytes || input.Admission.Limits.Tokens > h.cfg.Profile.Tokens ||
+		input.Descriptor.Profile != profile.Profile || input.Descriptor.Model != profile.Model || input.Descriptor.BaseURL != profile.BaseURL ||
+		input.Admission.Limits.RequestBytes > profile.RequestBytes || input.Admission.Limits.OutputBytes > profile.OutputBytes || input.Admission.Limits.Tokens > profile.Tokens ||
 		int64(len(input.Payload)) > input.Admission.Limits.RequestBytes {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
 	}
-	payload, err := qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, h.cfg.Profile.ProviderTokenUpperBound)
+	payload, err := qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound)
 	if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
@@ -127,6 +132,16 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	ctx = service.WithGatewayNativeCustody(ctx, h.cfg.Custody)
 	ctx = service.WithGatewayNativeLifetime(ctx, e.life)
 	ctx = service.WithGatewayNativeProviderReadIdle(ctx, h.cfg.ProviderReadIdle)
+	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
+		ctx, err = h.cfg.OAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
+		if err != nil {
+			h.seal(e)
+			h.finishNoEntry(e)
+			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
+			writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+			return
+		}
+	}
 	c, _ := gin.CreateTestContext(raw)
 	c.Writer = &privateGinWriter{ResponseWriter: c.Writer, raw: raw}
 	c.Request = r.Clone(ctx)
@@ -192,3 +207,19 @@ type privateGinWriter struct {
 
 func (w *privateGinWriter) Unwrap() http.ResponseWriter { return w.raw }
 func (w *privateGinWriter) FlushError() error           { return http.NewResponseController(w.raw).Flush() }
+
+// The persisted one-use callback capability is its sole authorization. It still
+// consumes the same eight management/cleanup slots, never execution capacity.
+func (h *Handler) NativeOAuthCallbackHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/auth/callback" || r.URL.RawPath != "" {
+			http.Error(w, "private native transport denied", http.StatusBadRequest)
+			return
+		}
+		if !h.acquireHTTP(w, r, h.controls) {
+			return
+		}
+		defer func() { <-h.controls }()
+		next.ServeHTTP(w, r)
+	})
+}

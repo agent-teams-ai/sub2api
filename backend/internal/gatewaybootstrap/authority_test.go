@@ -2,6 +2,7 @@ package gatewaybootstrap
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/gatewaytransport"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 func fixtureConfig() Config {
@@ -246,5 +248,158 @@ func TestControlCredentialByteBounds(t *testing.T) {
 				t.Fatal("control header byte bound changed")
 			}
 		})
+	}
+}
+
+func fixtureOAuthConfig() Config {
+	c := fixtureConfig()
+	c.ListenAddress = "127.0.0.1:1455"
+	c.OAuth = &OAuthConfig{IntentKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("I", 32))),
+		Profile: ProfileConfig{Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL,
+			QualificationRef: "codex-fixture-qualification", RequestBytes: 2048, OutputBytes: 3072, Tokens: 50, ProviderTokenUpperBound: 80}}
+	return c
+}
+
+// Nearest FD6 regression: introducing an optional member must not make any
+// accepted MiMo required key, duplicate-name or exact-number check optional.
+func TestOAuthConfigExplicitStrictVariant(t *testing.T) {
+	legacy := fixtureConfig()
+	raw, _ := json.Marshal(legacy)
+	if bytesContain := strings.Contains(string(raw), `"oauth"`); bytesContain {
+		t.Fatal("legacy MiMo wire changed")
+	}
+	var decoded Config
+	if decodeStrict(raw, &decoded) != nil || decoded.OAuth != nil {
+		t.Fatal("legacy strict config failed")
+	}
+	c := fixtureOAuthConfig()
+	raw, _ = json.Marshal(c)
+	if decodeStrict(raw, &decoded) != nil {
+		t.Fatal("explicit OAuth config failed")
+	}
+	if _, err := decoded.validate(); err != nil || decoded.qualifiedProfile() != c.Profile.qualified() ||
+		decoded.codexProfile().Profile != service.GatewayCodexOAuthResponsesProfile || decoded.codexProfile().QualificationRef != c.OAuth.Profile.QualificationRef {
+		t.Fatal("canonical protected profile failed")
+	}
+	profileJSON, err := json.Marshal(c.OAuth.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*Config){
+		func(c *Config) { c.OAuth.Profile.Model = "caller-model" },
+		func(c *Config) { c.OAuth.Profile.BaseURL = "https://chatgpt.com/backend-api/codex/" },
+		func(c *Config) { c.OAuth.Profile = ProfileConfig{} },
+		func(c *Config) { c.OAuth.Profile.QualificationRef = "" },
+		func(c *Config) { c.OAuth.Profile.RequestBytes = 0 },
+		func(c *Config) { c.OAuth.Profile.OutputBytes = 0 },
+		func(c *Config) { c.OAuth.Profile.Tokens = 0 },
+		func(c *Config) { c.OAuth.Profile.ProviderTokenUpperBound = c.OAuth.Profile.Tokens - 1 },
+		func(c *Config) { c.ListenAddress = "127.0.0.1:18081" },
+		func(c *Config) { c.OAuth.IntentKey = c.Custody.Keys[0].Key },
+		func(c *Config) { c.OAuth.IntentKey = base64.StdEncoding.EncodeToString(make([]byte, 31)) },
+		func(c *Config) { c.Peers[0].Role = "native-callback" },
+	} {
+		bad := fixtureOAuthConfig()
+		mutate(&bad)
+		if _, err := bad.validate(); err == nil {
+			t.Fatal("unsafe OAuth config accepted")
+		}
+	}
+	for _, bad := range []string{
+		strings.Replace(string(raw), `"oauth":{`, `"oauth":null,"oauth":{`, 1),
+		strings.Replace(string(raw), `"oauth":{`, `"OAuth":{`, 1),
+		strings.Replace(string(raw), `"oauth":{`, `"oauth":{"unknown":true,`, 1),
+		strings.Replace(string(raw), `"oauth":{`, `"oauth":null,"extra":{`, 1),
+		strings.Replace(string(raw), `"maxEntries":4,`, "", 1),
+		strings.Replace(string(raw), `"maxEntries":4`, `"maxEntries":4.0`, 1),
+		strings.Replace(string(raw), `"intentKey":`, `"IntentKey":`, 1),
+		strings.Replace(string(raw), `,"profile":`+string(profileJSON), "", 1),
+	} {
+		if decodeStrict([]byte(bad), &decoded) == nil {
+			t.Fatal("OAuth variant loosened strict parsing")
+		}
+	}
+}
+
+func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
+	gatewayOwnerFixtureCredentialRaw := make([]byte, 24)
+	if _, err := rand.Read(gatewayOwnerFixtureCredentialRaw); err != nil {
+		t.Fatal("fixture entropy unavailable")
+	}
+	gatewayOwnerFixtureCredential := base64.RawURLEncoding.EncodeToString(gatewayOwnerFixtureCredentialRaw)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var got oauthOwnerBody
+		if r.Method != http.MethodPost || r.URL.Path != "/private/native/v1/oauth-owner-authority" ||
+			r.Header.Get("Authorization") != "Bearer "+gatewayOwnerFixtureCredential || json.NewDecoder(r.Body).Decode(&got) != nil ||
+			got.ConsumerID != "fixture-consumer" || got.AccountRef != "fixture-account" || got.Generation != "33333333-3333-4333-8333-333333333333" {
+			t.Error("owner lookup changed authenticated selectors")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch got.OperationID {
+		case "valid":
+			_, _ = io.WriteString(w, `{"ok":true,"ownerRef":"workspace/owned"}`)
+		case "ack-only":
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "owner-alias":
+			_, _ = io.WriteString(w, `{"ok":true,"OwnerRef":"workspace/owned"}`)
+		case "private-field":
+			_, _ = io.WriteString(w, `{"ok":true,"ownerRef":"workspace/owned","operation":"private"}`)
+		case "oversize":
+			_, _ = io.WriteString(w, strings.Repeat(" ", 1025)+`{"ok":true,"ownerRef":"workspace/owned"}`)
+		}
+	}))
+	defer server.Close()
+	a, err := newAuthority(AuthorityConfig{server.URL, gatewayOwnerFixtureCredential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.client.CloseIdleConnections()
+	for _, op := range []string{"valid", "ack-only", "owner-alias", "private-field", "oversize"} {
+		owner, err := a.AuthorizeNativeOAuthOwner(context.Background(), "fixture-consumer", op, "fixture-account", "33333333-3333-4333-8333-333333333333")
+		if op == "valid" && (err != nil || owner != "workspace/owned") || op != "valid" && (err == nil || owner != "") {
+			t.Fatal("owner-specific reply shape was not enforced", op)
+		}
+	}
+	if calls.Load() != 5 {
+		t.Fatal("owner lookup retried")
+	}
+
+	c := fixtureConfig()
+	c.OpenRouter = &ProfileConfig{BaseURL: service.GatewayOpenRouterBaseURL, Model: service.GatewayOpenRouterModel,
+		QualificationRef: "openrouter-fixture-qualification", RequestBytes: 2048, OutputBytes: 3072, Tokens: 50, ProviderTokenUpperBound: 80}
+	raw, _ := json.Marshal(c)
+	var decoded Config
+	if decodeStrict(raw, &decoded) != nil {
+		t.Fatal("optional finite config failed")
+	}
+	if _, err := decoded.validate(); err != nil || decoded.qualifiedProfile() != c.Profile.qualified() ||
+		decoded.openRouterProfile().Profile != service.GatewayOpenRouterResponsesProfile || decoded.openRouterProfile().Tokens != 50 {
+		t.Fatal("second profile replaced the MiMo tuple or its own limits")
+	}
+	for _, bad := range []string{
+		strings.Replace(string(raw), `"openRouter":{`, `"openRouter":null,"openRouter":{`, 1),
+		strings.Replace(string(raw), `"openRouter":{`, `"OpenRouter":{`, 1),
+		strings.Replace(string(raw), `"openRouter":{`, `"openRouter":{"id":"caller-profile",`, 1),
+		strings.Replace(string(raw), `"openrouter-fixture-qualification"`, `null`, 1),
+	} {
+		if decodeStrict([]byte(bad), &decoded) == nil {
+			t.Fatal("second profile loosened strict config")
+		}
+	}
+	for _, mutate := range []func(*ProfileConfig){
+		func(p *ProfileConfig) { p.BaseURL += "/" },
+		func(p *ProfileConfig) { p.Model = c.Profile.Model },
+		func(p *ProfileConfig) { p.QualificationRef = "" },
+		func(p *ProfileConfig) { p.ProviderTokenUpperBound = p.Tokens - 1 },
+	} {
+		bad := c
+		second := *c.OpenRouter
+		bad.OpenRouter = &second
+		mutate(bad.OpenRouter)
+		if _, err := bad.validate(); err == nil {
+			t.Fatal("cross-tuple or unqualified optional profile accepted")
+		}
 	}
 }

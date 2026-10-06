@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/gatewaytransport"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 // One configured authority, fixed paths, no retry/redirect/environment proxy.
@@ -36,6 +37,17 @@ func newAuthority(c AuthorityConfig, fixture *http.Transport) (*authority, error
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 func (a *authority) post(ctx context.Context, path string, body any) error {
+	var ack struct {
+		OK bool `json:"ok"`
+	}
+	if a.postReply(ctx, path, body, &ack) != nil || !ack.OK {
+		return ErrDenied
+	}
+	return nil
+}
+
+// Owner lookup shares the fixed transport bounds, but has its own exact reply.
+func (a *authority) postReply(ctx context.Context, path string, body, reply any) error {
 	raw, err := json.Marshal(body)
 	if err != nil || len(raw) > 262144 {
 		return ErrDenied
@@ -66,13 +78,33 @@ func (a *authority) post(ctx context.Context, path string, body any) error {
 		return ErrDenied
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1025))
-	var ack struct {
-		OK bool `json:"ok"`
-	}
-	if err != nil || len(data) > 1024 || decodeStrict(data, &ack) != nil || !ack.OK || bounded.Err() != nil {
+	if err != nil || len(data) > 1024 || decodeStrict(data, reply) != nil || bounded.Err() != nil {
 		return ErrDenied
 	}
 	return nil
+}
+
+type oauthOwnerBody struct {
+	ConsumerID  string `json:"consumerId"`
+	OperationID string `json:"operationId"`
+	AccountRef  string `json:"accountRef"`
+	Generation  string `json:"generation"`
+}
+
+func (a *authority) AuthorizeNativeOAuthOwner(ctx context.Context, consumer, operation, account, generation string) (string, error) {
+	if !identifier.MatchString(consumer) || !service.GatewayNativeCredentialRefValid(operation) ||
+		!service.GatewayNativeCredentialRefValid(account) || !incarnation.MatchString(generation) {
+		return "", ErrDenied
+	}
+	var reply struct {
+		OK       bool   `json:"ok"`
+		OwnerRef string `json:"ownerRef"`
+	}
+	if a.postReply(ctx, "/private/native/v1/oauth-owner-authority", oauthOwnerBody{consumer, operation, account, generation}, &reply) != nil ||
+		!reply.OK || !service.GatewayNativeCredentialRefValid(reply.OwnerRef) {
+		return "", ErrDenied
+	}
+	return reply.OwnerRef, nil
 }
 
 type enrollmentBody struct {

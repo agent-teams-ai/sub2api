@@ -14,11 +14,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -29,6 +31,7 @@ import (
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/gatewaytransport"
+	"github.com/Wei-Shaw/sub2api/internal/handler/admin"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -455,4 +458,700 @@ func nativeRuntimeUnknownFixture() string {
 		panic("fixture entropy unavailable")
 	}
 	return hex.EncodeToString(b)
+}
+
+// Controlled mount repository only. F3 PG acceptance remains a separate gate;
+// this fixture observes the real router, constructors and token HTTP boundary.
+type oauthMountJournal struct {
+	service.GatewayNativeOAuthConnectRepository
+	row     service.GatewayNativeOAuthConnectIntent
+	entries int
+	finds   int
+}
+
+func (s *oauthMountJournal) PrepareConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent) (service.GatewayNativeOAuthConnectIntent, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, in.Scope) {
+		return in, ErrDenied
+	}
+	if s.row.Operation == "" {
+		s.row = in
+	}
+	if !service.SameGatewayNativeOAuthConnectIntent(in, s.row) {
+		return in, ErrDenied
+	}
+	return s.row, nil
+}
+func (s *oauthMountJournal) ReadConnectIntent(ctx context.Context, scope service.GatewayNativeCredentialScope, op string) (service.GatewayNativeOAuthConnectIntent, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, scope) || s.row.Scope != scope || s.row.Operation != op {
+		return service.GatewayNativeOAuthConnectIntent{}, ErrDenied
+	}
+	return s.row, nil
+}
+func (s *oauthMountJournal) FindConnectState(_ context.Context, hash string) (service.GatewayNativeOAuthConnectIntent, error) {
+	s.finds++
+	if s.row.StateHash != hash {
+		return service.GatewayNativeOAuthConnectIntent{}, ErrDenied
+	}
+	return s.row, nil
+}
+func (s *oauthMountJournal) EnterConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent) (bool, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, s.row.Scope) || in.Operation != s.row.Operation {
+		return false, ErrDenied
+	}
+	if s.row.State != "prepared" {
+		return false, nil
+	}
+	s.entries++
+	s.row.State = "entered"
+	return true, nil
+}
+func (s *oauthMountJournal) FinishConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent, state string, out service.GatewayNativeOAuthOutcome) (service.GatewayNativeOAuthConnectIntent, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, s.row.Scope) || in.Operation != s.row.Operation {
+		return in, ErrDenied
+	}
+	s.row.State = "unknown"
+	s.row.RecoveryDenied = state == "quarantined"
+	s.row.Envelope = ""
+	return s.row, nil
+}
+
+type oauthMountRows struct {
+	service.AccountRepository
+	service.GatewayNativeOAuthRepository
+}
+
+func (*oauthMountRows) LockGatewayNativeAccount(context.Context, int64) (*service.Account, func(), error) {
+	return nil, nil, ErrDenied
+}
+func (*oauthMountRows) ReplayGatewayNativeOAuth(context.Context, service.GatewayNativeCredentialScope, string, string) (service.GatewayNativeOAuthOutcome, bool, error) {
+	return service.GatewayNativeOAuthOutcome{}, false, nil
+}
+func (*oauthMountRows) ReadGatewayNativeOAuthDispatch(_ context.Context, s service.GatewayNativeCredentialScope, op string) (service.GatewayNativeOAuthOutcome, error) {
+	return service.GatewayNativeOAuthOutcome{Operation: op, Generation: s.Generation, State: "prepared"}, nil
+}
+func (*oauthMountRows) LockGatewayNativeOAuthDispatch(context.Context, service.GatewayNativeCredentialScope, string, int64) (*service.Account, service.GatewayNativeOAuthPhysical, func(), error) {
+	return nil, service.GatewayNativeOAuthPhysical{}, nil, ErrDenied
+}
+func (*oauthMountRows) QualifyGatewayNativeOAuthDispatch(context.Context, service.GatewayNativeOAuthPhysical, int64) error {
+	return ErrDenied
+}
+
+type oauthMountAdmin struct{ service.AdminService }
+
+// Controlled rows behind the real candidate create/read handlers and admin
+// service. This test does not claim SQL custody or provider qualification.
+type additiveHTTPRows struct {
+	service.AdminAccountRepository
+	mu   sync.Mutex
+	rows map[int64]*service.Account
+}
+
+var _ service.GatewayNativeAccountLocker = (*additiveHTTPRows)(nil)
+
+func (s *additiveHTTPRows) LockGatewayNativeAccount(_ context.Context, id int64) (*service.Account, func(), error) {
+	s.mu.Lock()
+	a := s.rows[id]
+	if a == nil {
+		s.mu.Unlock()
+		return nil, nil, ErrDenied
+	}
+	return a, s.mu.Unlock, nil
+}
+
+func (s *additiveHTTPRows) Create(ctx context.Context, a *service.Account) error {
+	consumer, err := service.GatewayNativeConsumer(ctx)
+	if err != nil || consumer != "fixture-consumer" {
+		return ErrDenied
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a.ID = int64(len(s.rows) + 1)
+	a.CreatedAt = time.Date(2026, 10, 6, 0, 0, 0, 123456000, time.UTC)
+	s.rows[a.ID] = a
+	return nil
+}
+
+func (s *additiveHTTPRows) FindByExtraField(_ context.Context, key string, value any) ([]service.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var found []service.Account
+	for _, a := range s.rows {
+		if a.Extra[key] == value {
+			found = append(found, *a)
+		}
+	}
+	return found, nil
+}
+
+// One real HTTP composition: three distinct protected tuples, the MiMo ACK,
+// exact admission limits/caps and candidate create/read with optional OAuth.
+// The authority returns non-dispatch readback; no provider/login/PG call occurs.
+func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
+	c := fixtureOAuthConfig()
+	c.OAuth.Profile = ProfileConfig{Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL,
+		QualificationRef: "codex-composition-fixture", RequestBytes: 8192, OutputBytes: 6144, Tokens: 150, ProviderTokenUpperBound: 300}
+	c.OpenRouter = &ProfileConfig{Model: service.GatewayOpenRouterModel, BaseURL: service.GatewayOpenRouterBaseURL,
+		QualificationRef: "openrouter-composition-fixture", RequestBytes: 2048, OutputBytes: 3072, Tokens: 40, ProviderTokenUpperBound: 80}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Config
+	if decodeStrict(raw, &decoded) != nil {
+		t.Fatal("three-profile protected config rejected")
+	}
+	c = decoded
+	custody, err := c.validate()
+	if err != nil || c.qualifiedProfile() != fixtureConfig().Profile.qualified() {
+		t.Fatal("OAuth replaced the original MiMo qualification/limits", err)
+	}
+	profiles := []gatewaytransport.QualifiedProfile{c.qualifiedProfile(), *c.openRouterProfile(), *c.codexProfile()}
+	const origin = "fixture-origin"
+	const engineIncarnation = "11111111-1111-4111-8111-111111111111"
+	var enrollments, admits, providerEntries atomic.Int32
+	var expected atomic.Pointer[gatewaytransport.Request]
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+c.Authority.Credential || r.Header.Get("Content-Type") != "application/json" {
+			t.Error("unauthenticated composition callback")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		data, readErr := io.ReadAll(io.LimitReader(r.Body, 65537))
+		if readErr != nil || len(data) > 65536 {
+			t.Error("unbounded composition callback")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch r.URL.Path {
+		case "/private/native/v1/enrollment":
+			var got enrollmentBody
+			if decodeStrict(data, &got) != nil || got != (enrollmentBody{origin, engineIncarnation, profiles[0].QualificationRef}) {
+				t.Error("enrollment lost original MiMo receipt")
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			enrollments.Add(1)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "/private/native/v1/admit":
+			var got gatewaytransport.Request
+			var fields map[string]json.RawMessage
+			var native gatewaytransport.NativeBinding
+			var consumer string
+			want := expected.Load()
+			if json.Unmarshal(data, &fields) != nil || len(fields) != 6 || json.Unmarshal(data, &got) != nil ||
+				json.Unmarshal(fields["consumerId"], &consumer) != nil || json.Unmarshal(fields["native"], &native) != nil || want == nil ||
+				consumer != "fixture-consumer" || got.Admission != want.Admission || got.RequestRef != want.RequestRef || got.Worker != want.Worker ||
+				!service.SameGatewayNativeDescriptor(got.Descriptor, want.Descriptor) || native.Generation != want.Descriptor.Generation ||
+				native.OriginRef != origin || native.EngineIncarnation != engineIncarnation || !incarnation.MatchString(native.RequestNonce) {
+				t.Error("callback selected a different admission/profile tuple")
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			admits.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"consumerId": consumer, "admission": got.Admission,
+				"status": map[string]any{"requestRef": got.RequestRef, "effect": "not_dispatched"}})
+		default:
+			t.Error("unexpected authority route", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer node.Close()
+	a, err := newAuthority(AuthorityConfig{node.URL, c.Authority.Credential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.client.CloseIdleConnections()
+	provider := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		providerEntries.Add(1)
+		return nil, ErrDenied
+	}}
+	oauthRows := &oauthMountRows{}
+	verifier := service.NewGatewayNativeOAuthVerifier(provider)
+	key := []byte(strings.Repeat("I", 32))
+	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, oauthRows, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connect, err := service.NewGatewayNativeOAuthConnect(key, provider, &oauthMountJournal{}, enrollment, oauthRows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(oauthRows, custody, verifier, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := &additiveHTTPRows{rows: map[int64]*service.Account{}}
+	u, err := service.NewGatewayNativeLifetimeUpstream(repository.NewHTTPUpstream(&config.Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	adminSvc := service.NewAdminService(nil, nil, nil, rows, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	auth := authorize(c.Peers)
+	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,
+		Enrollment: gatewaytransport.Enrollment{origin, engineIncarnation, c.Profile.QualificationRef},
+		Profile: c.qualifiedProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: 4,
+		CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 16384, CallbackBytes: 65536}
+	a.compose(&cfg)
+	missingCodex := cfg
+	missingCodex.Codex = nil
+	if _, err := gatewaytransport.New(context.Background(), missingCodex); err == nil || enrollments.Load() != 0 {
+		t.Fatal("OAuth inferred its missing qualification/limits or enrolled before validation")
+	}
+	transport, err := gatewaytransport.New(context.Background(), cfg)
+	if err != nil || enrollments.Load() != 1 {
+		t.Fatal("additive startup/enrollment failed", err)
+	}
+	defer transport.Stop(context.Background())
+	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: a}
+	server := httptest.NewServer(privateHandler(c.Profile, adminSvc, gateway, custody, transport, auth, mode))
+	defer server.Close()
+	// Mutation after construction cannot change either optional snapshot.
+	*cfg.OpenRouter = gatewaytransport.QualifiedProfile{}
+	*cfg.Codex = gatewaytransport.QualifiedProfile{}
+	request := func(server *httptest.Server, method, path, role string, body any) (int, []byte) {
+		t.Helper()
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest(method, server.URL+"/private/native/v1/"+path, bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		for _, peer := range c.Peers {
+			if peer.Role == role {
+				req.Header.Set("Authorization", "Bearer "+peer.Credential)
+			}
+		}
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+		if err != nil || len(data) > 65536 {
+			t.Fatal("composition response read failed", err)
+		}
+		return resp.StatusCode, data
+	}
+	create := func(server *httptest.Server, p gatewaytransport.QualifiedProfile, generation string) service.GatewayNativeRoute {
+		t.Helper()
+		code, data := request(server, http.MethodPost, "candidates", "management", map[string]any{
+			"profile": p.Profile, "generation": generation, "name": "composition fixture", "api_key": nativeRuntimeUnknownFixture(),
+			"owner_ref": "fixture-owner", "account_ref": p.Profile})
+		var candidate admin.GatewayNativeCandidate
+		if code != http.StatusOK || json.Unmarshal(data, &candidate) != nil || candidate.Descriptor.Profile != p.Profile ||
+			candidate.Descriptor.BaseURL != p.BaseURL || candidate.Descriptor.Model != p.Model || candidate.Descriptor.Generation != generation ||
+			candidate.State != "inactive" || !candidate.GroupFree || candidate.Schedulable || candidate.ProbesEnabled {
+			t.Fatalf("candidate selected wrong tuple: profile=%s status=%d", p.Profile, code)
+		}
+		code, data = request(server, http.MethodGet, "candidates/"+generation, "management", nil)
+		var read admin.GatewayNativeCandidate
+		if code != http.StatusOK || json.Unmarshal(data, &read) != nil || !service.SameGatewayNativeDescriptor(read.Descriptor, candidate.Descriptor) {
+			t.Fatal("candidate read lost original tuple", code)
+		}
+		return candidate.Descriptor
+	}
+	for i, p := range profiles {
+		generation := fmt.Sprintf("33333333-3333-4333-8333-%012d", i+1)
+		descriptor := service.GatewayNativeRoute{AccountID: 3, Generation: generation,
+			CreatedAt: time.Date(2026, 10, 6, 0, 0, 0, 123456000, time.UTC), Profile: p.Profile, BaseURL: p.BaseURL, Model: p.Model}
+		if i < 2 {
+			descriptor = create(server, p, generation)
+		}
+		input := gatewaytransport.Request{RequestRef: fmt.Sprintf("composition-request-%d", i), Worker: "44444444-4444-4444-8444-444444444444",
+			Admission: gatewaytransport.Admission{ExecutionRef: fmt.Sprintf("composition-execution-%d", i), IssuerEpoch: "fixture-issuer",
+				InvocationRef: "fixture-invocation", AttemptRef: "fixture-attempt", AccountRef: p.Profile, AuthorizationEpoch: 3,
+				SubjectRef: "fixture-subject", PolicyRevision: 4, BindingRevision: 5, ProfileID: p.Profile,
+				Limits: gatewaytransport.Limits{Requests: 2, Concurrency: 1, RequestBytes: p.RequestBytes, OutputBytes: p.OutputBytes, Tokens: p.Tokens},
+				ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)}, Descriptor: descriptor,
+			Payload: json.RawMessage(fmt.Sprintf(`{"model":%q,"input":%q,"store":false,"stream":true,"service_tier":"default","max_output_tokens":%d}`,
+				p.Model, strings.Repeat("x", int(p.RequestBytes)-256), p.ProviderTokenUpperBound))}
+		for _, mutate := range []func(*gatewaytransport.Request){
+			func(r *gatewaytransport.Request) { r.Admission.Limits.RequestBytes++ },
+			func(r *gatewaytransport.Request) { r.Admission.Limits.OutputBytes++ },
+			func(r *gatewaytransport.Request) { r.Admission.Limits.Tokens++ },
+			func(r *gatewaytransport.Request) { r.Descriptor.BaseURL = "https://caller.invalid" },
+			func(r *gatewaytransport.Request) { r.Descriptor.Model = "caller-model" },
+			func(r *gatewaytransport.Request) { r.Admission.ProfileID = "caller-profile" },
+			func(r *gatewaytransport.Request) { r.Admission.ProfileID = profiles[(i+1)%len(profiles)].Profile },
+			func(r *gatewaytransport.Request) {
+				r.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"store":false,"stream":true,"service_tier":"default","max_output_tokens":%d}`, p.Model, p.ProviderTokenUpperBound+1))
+			},
+		} {
+			bad := input
+			mutate(&bad)
+			code, _ := request(server, http.MethodPost, "transports", "execution", bad)
+			if code != http.StatusBadRequest || admits.Load() != int32(i) {
+				t.Fatal("cross-tuple or excessive bound reached admission callback", p.Profile, code)
+			}
+		}
+		expected.Store(&input)
+		code, data := request(server, http.MethodPost, "transports", "execution", input)
+		var receipt gatewaytransport.Receipt
+		if code != http.StatusAccepted || json.Unmarshal(data, &receipt) != nil || receipt.RequestRef != input.RequestRef ||
+			receipt.Phase != "closed" || receipt.Lifetime.Entered || admits.Load() != int32(i+1) {
+			t.Fatal("own profile admission tuple rejected", p.Profile, code)
+		}
+	}
+	// OAuth without OpenRouter must retain MiMo candidate creation and readback.
+	c.OpenRouter = nil
+	if _, err := c.validate(); err != nil {
+		t.Fatal("OAuth without OpenRouter config denied", err)
+	}
+	cfg.OpenRouter, cfg.Codex = nil, c.codexProfile()
+	withoutRouter, err := gatewaytransport.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal("OAuth without OpenRouter startup denied", err)
+	}
+	defer withoutRouter.Stop(context.Background())
+	second := httptest.NewServer(privateHandler(c.Profile, adminSvc, gateway, custody, withoutRouter, auth, mode))
+	defer second.Close()
+	create(second, profiles[0], "55555555-5555-4555-8555-555555555555")
+	if code, _ := request(second, http.MethodGet, "candidates/33333333-3333-4333-8333-000000000002", "management", nil); code != http.StatusConflict {
+		t.Fatal("unconfigured OpenRouter candidate remained readable", code)
+	}
+	if enrollments.Load() != 2 || admits.Load() != 3 || providerEntries.Load() != 0 {
+		t.Fatal("composition retried authority or entered provider")
+	}
+}
+
+type oauthMountOwner struct{ live bool }
+
+func (s *oauthMountOwner) AuthorizeNativeOAuthOwner(_ context.Context, consumer, operation, account, generation string) (string, error) {
+	if !s.live || consumer != "fixture-consumer" {
+		return "", ErrDenied
+	}
+	return "fixture-live-owner", nil
+}
+
+type oauthSelectorJournal struct {
+	service.GatewayNativeOAuthConnectRepository
+	mu   sync.Mutex
+	rows map[string]*oauthMountJournal
+}
+
+func (s *oauthSelectorJournal) PrepareConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent) (service.GatewayNativeOAuthConnectIntent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rows[in.Operation] == nil {
+		s.rows[in.Operation] = &oauthMountJournal{}
+	}
+	return s.rows[in.Operation].PrepareConnect(ctx, in)
+}
+
+func (s *oauthSelectorJournal) ReadConnectIntent(ctx context.Context, scope service.GatewayNativeCredentialScope, op string) (service.GatewayNativeOAuthConnectIntent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rows[op] == nil {
+		return service.GatewayNativeOAuthConnectIntent{}, ErrDenied
+	}
+	return s.rows[op].ReadConnectIntent(ctx, scope, op)
+}
+
+// Real native POST -> authenticated HTTP owner callback -> real pending handlers.
+// Controlled committed relations are not a SQL/current-management-grant receipt.
+func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
+	c := fixtureOAuthConfig()
+	custody, err := c.validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := nativeOAuthOwnerTuple{"operation-a", "owner-a", "account-a", "33333333-3333-4333-8333-333333333333"}
+	second := nativeOAuthOwnerTuple{"operation-b", "owner-b", "account-b", "44444444-4444-4444-8444-444444444444"}
+	var lookups, tokenEntries atomic.Int32
+	var grantLive atomic.Bool
+	grantLive.Store(true)
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/private/native/v1/enrollment" {
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		}
+		lookups.Add(1)
+		var selectors oauthOwnerBody
+		if r.Method != http.MethodPost || r.URL.Path != "/private/native/v1/oauth-owner-authority" ||
+			r.Header.Get("Authorization") != "Bearer "+c.Authority.Credential || json.NewDecoder(r.Body).Decode(&selectors) != nil ||
+			selectors.ConsumerID != "fixture-consumer" || !grantLive.Load() {
+			w.WriteHeader(403)
+			return
+		}
+		for _, saved := range []nativeOAuthOwnerTuple{first, second} {
+			if selectors.OperationID == saved.Operation && selectors.AccountRef == saved.AccountRef && selectors.Generation == saved.Generation {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ownerRef": saved.OwnerRef})
+				return
+			}
+		}
+		w.WriteHeader(403)
+	}))
+	defer node.Close()
+	a, err := newAuthority(AuthorityConfig{node.URL, c.Authority.Credential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.client.CloseIdleConnections()
+	provider := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		tokenEntries.Add(1)
+		return nil, ErrDenied
+	}}
+	rows := &oauthMountRows{}
+	verifier := service.NewGatewayNativeOAuthVerifier(provider)
+	key := []byte(strings.Repeat("I", 32))
+	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, rows, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &oauthSelectorJournal{rows: map[string]*oauthMountJournal{}}
+	connect, err := service.NewGatewayNativeOAuthConnect(key, provider, journal, enrollment, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(rows, custody, verifier, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := service.NewGatewayNativeLifetimeUpstream(repository.NewHTTPUpstream(&config.Config{}))
+	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	auth := authorize(c.Peers)
+	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,
+		Enrollment: gatewaytransport.Enrollment{"fixture-origin", "11111111-1111-4111-8111-111111111111", c.Profile.QualificationRef},
+		Profile: c.qualifiedProfile(), Codex: c.codexProfile(), MaxEntries: 4, CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 8192, CallbackBytes: 65536}
+	a.compose(&cfg)
+	transport, err := gatewaytransport.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Stop(context.Background())
+	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect, dispatch, a}))
+	defer server.Close()
+	post := func(path string, body any, authenticated bool) (int, []byte) {
+		raw, _ := json.Marshal(body)
+		if original, ok := body.(json.RawMessage); ok {
+			raw = original
+		}
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/private/native/v1/oauth/connect"+path, bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		if authenticated {
+			req.Header.Set("Authorization", "Bearer "+c.Peers[0].Credential)
+		}
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+	if code, _ := post("", first, false); code != 403 || lookups.Load() != 0 {
+		t.Fatal("owner callback ran before consumer authentication")
+	}
+	for _, tuple := range []nativeOAuthOwnerTuple{first, second} {
+		for _, path := range []string{"", "/read", "/descriptor"} {
+			code, raw := post(path, tuple, true)
+			if code != 200 || path == "/descriptor" && (!bytes.Contains(raw, []byte(`"qualification":"pending"`)) || bytes.Contains(raw, []byte(`"native"`))) {
+				t.Fatal("exact selector or restored body lost pending relation", tuple.Operation, path, code)
+			}
+		}
+	}
+	for _, mutate := range []func(*nativeOAuthOwnerTuple){
+		func(t *nativeOAuthOwnerTuple) { t.Operation = second.Operation },
+		func(t *nativeOAuthOwnerTuple) { t.AccountRef = second.AccountRef },
+		func(t *nativeOAuthOwnerTuple) { t.Generation = second.Generation },
+		func(t *nativeOAuthOwnerTuple) { t.OwnerRef = second.OwnerRef },
+	} {
+		bad := first
+		mutate(&bad)
+		if code, _ := post("/read", bad, true); code != 403 {
+			t.Fatal("foreign selector/body owner gained authority", code)
+		}
+	}
+	before := lookups.Load()
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"operation":"operation-a","Operation":"operation-b","owner_ref":"owner-a","account_ref":"account-a","generation":"` + first.Generation + `"}`),
+		json.RawMessage(`{"operation":"operation-a","owner_ref":"owner-a","account_ref":"account-a","generation":"` + first.Generation + `","endpoint":"caller"}`),
+		json.RawMessage(strings.Repeat(" ", 4097) + `{}`),
+	} {
+		if code, _ := post("", raw, true); code != 400 {
+			t.Fatal("noncanonical/oversize body reached owner lookup", code)
+		}
+	}
+	if lookups.Load() != before {
+		t.Fatal("malformed body reached callback")
+	}
+	grantLive.Store(false)
+	if code, _ := post("/descriptor", second, true); code != 403 || tokenEntries.Load() != 0 {
+		t.Fatal("retired grant or selector denial entered token exchange")
+	}
+}
+
+// Regression: an opt-in route was absent behind the MiMo-only router, callback
+// query was blanket-denied, or body owner_ref could authorize another owner.
+func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
+	c := fixtureOAuthConfig()
+	custody, err := c.validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokenEntries atomic.Int32
+	tokens := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEntries.Add(1)
+		if r.Host != "auth.openai.com" || r.URL.Path != "/oauth/token" || r.Method != "POST" {
+			t.Error("wrong fixed code exchange")
+		}
+		if r.ParseForm() != nil || r.PostForm.Get("redirect_uri") != service.GatewayOAuthConnectRedirect {
+			t.Error("changed callback URI")
+		}
+		w.WriteHeader(400)
+		_, _ = io.WriteString(w, "controlled vendor secret must not reflect")
+	}))
+	defer tokens.Close()
+	provider := tokens.Client().Transport.(*http.Transport).Clone()
+	provider.TLSClientConfig.ServerName = "example.com"
+	provider.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address != "auth.openai.com:443" {
+			return nil, ErrDenied
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, tokens.Listener.Addr().String())
+	}
+	defer provider.CloseIdleConnections()
+	rows := &oauthMountRows{}
+	verifier := service.NewGatewayNativeOAuthVerifier(provider)
+	intentKey := []byte(strings.Repeat("I", 32))
+	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, rows, intentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &oauthMountJournal{}
+	connect, err := service.NewGatewayNativeOAuthConnect(intentKey, provider, journal, enrollment, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(rows, custody, verifier, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := &oauthMountOwner{live: true}
+	upstream, _ := service.NewGatewayNativeLifetimeUpstream(repository.NewHTTPUpstream(&config.Config{}))
+	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, upstream, nil, nil, nil, nil, nil, nil, nil, nil)
+	authority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer authority.Close()
+	a, _ := newAuthority(AuthorityConfig{authority.URL, c.Authority.Credential}, nil)
+	auth := authorize(c.Peers)
+	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth, Enrollment: gatewaytransport.Enrollment{OriginRef: "fixture-origin", EngineIncarnation: "11111111-1111-4111-8111-111111111111", QualificationRef: c.Profile.QualificationRef}, Profile: c.qualifiedProfile(), Codex: c.codexProfile(), MaxEntries: 4, CallbackTimeout: time.Second, IOTimeout: time.Second, CleanupTimeout: time.Second, EnvelopeBytes: 8192, CallbackBytes: 65536}
+	a.compose(&cfg)
+	transport, err := gatewaytransport.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners}
+	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, mode))
+	defer server.Close()
+	defer transport.Stop(context.Background())
+	input := `{"operation":"original-mount-operation","owner_ref":"fixture-live-owner","account_ref":"fixture-account","generation":"33333333-3333-4333-8333-333333333333"}`
+	post := func(path, body, role string) (int, []byte) {
+		req, _ := http.NewRequest("POST", server.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for _, p := range c.Peers {
+			if p.Role == role {
+				req.Header.Set("Authorization", "Bearer "+p.Credential)
+			}
+		}
+		response, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		raw, _ := io.ReadAll(response.Body)
+		return response.StatusCode, raw
+	}
+	path := "/private/native/v1/oauth/connect"
+	for _, role := range []string{"execution", "cleanup", "missing"} {
+		status, _ := post(path, input, role)
+		if status != 403 {
+			t.Fatal("non-management connected", role, status)
+		}
+	}
+	status, _ := post(path, strings.Replace(input, "fixture-live-owner", "caller-owner", 1), "management")
+	if status != 403 {
+		t.Fatal("caller owner became authority", status)
+	}
+	owners.live = false
+	status, _ = post(path, input, "management")
+	if status != 403 {
+		t.Fatal("retired owner mapping connected")
+	}
+	owners.live = true
+	status, raw := post(path, input, "management")
+	if status != 200 {
+		t.Fatal("opt-in connect absent", status, string(raw))
+	}
+	var begun service.GatewayNativeOAuthConnectResult
+	if json.Unmarshal(raw, &begun) != nil || begun.Operation != "original-mount-operation" {
+		t.Fatal("operation changed")
+	}
+	authorizeURL, err := url.Parse(begun.AuthorizeURL)
+	if err != nil || authorizeURL.Query().Get("redirect_uri") != "http://localhost:1455/auth/callback" {
+		t.Fatal("fixed localhost callback changed")
+	}
+	query := url.Values{"code": {"controlled-code-marker"}, "state": {authorizeURL.Query().Get("state")}}.Encode()
+	// No bearer; caller owner mapping is now retired. Capability reconstructs
+	// original persisted consumer/owner, and it never chooses a new operation.
+	owners.live = false
+	for range 2 {
+		response, err := server.Client().Get(server.URL + "/auth/callback?" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != 200 || response.Header.Get("Referrer-Policy") != "no-referrer" || bytes.Contains(data, []byte("controlled-code-marker")) || bytes.Contains(data, []byte("original-mount-operation")) || bytes.Contains(data, []byte("vendor secret")) {
+			t.Fatal("callback capability/reflection failed")
+		}
+	}
+	if tokenEntries.Load() != 1 || journal.entries != 1 || journal.row.Operation != "original-mount-operation" || journal.row.State != "unknown" {
+		t.Fatal("callback rearmed or changed original operation")
+	}
+	owners.live = true
+	status, raw = post(path+"/read", input, "management")
+	if status != 200 || !bytes.Contains(raw, []byte(`"operation":"original-mount-operation"`)) || !bytes.Contains(raw, []byte(`"state":"unknown"`)) {
+		t.Fatal("original readback lost")
+	}
+	for _, bad := range []string{
+		"/auth/callback?" + query + "&state=duplicate",
+		"/auth/callback?code=controlled-code-marker&%73tate=" + authorizeURL.Query().Get("state"),
+		"/auth/%63allback?" + query,
+		"/auth/callback?" + strings.Repeat("x", 8193),
+		"/private/native/v1/oauth/connect/read?" + query,
+	} {
+		response, err := server.Client().Get(server.URL + bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != 400 || bytes.Contains(data, []byte("controlled-code-marker")) {
+			t.Fatal("callback alias or query reflection accepted", response.StatusCode)
+		}
+	}
+	mode.owners = nil
+	status, _ = post(path, input, "management")
+	if status != 403 {
+		t.Fatal("missing actual owner seam did not fail closed")
+	}
+	legacy := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth))
+	defer legacy.Close()
+	response, err := legacy.Client().Get(legacy.URL + "/auth/callback?" + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 400 {
+		t.Fatal("legacy callback exception opened")
+	}
 }

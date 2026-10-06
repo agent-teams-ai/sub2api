@@ -75,12 +75,29 @@ func (h *AccountHandler) RejectGatewayNativeAdmin(c *gin.Context) {
 func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminService, gateway *service.OpenAIGatewayService,
 	profile GatewayNativeProfile, authorize gin.HandlerFunc,
 	admit func(*gin.Context, service.GatewayNativeRoute) error,
-	settle func(*gin.Context, bool, error), custody *service.GatewayNativeCredentialCustody) {
-	u, err := url.Parse(profile.BaseURL)
+	settle func(*gin.Context, bool, error), custody *service.GatewayNativeCredentialCustody, openRouter ...GatewayNativeProfile) {
 	if group == nil || admin == nil || gateway == nil || authorize == nil || admit == nil || settle == nil || custody == nil ||
-		(profile.ID != service.GatewayMiMoResponsesProfile && profile.ID != service.GatewayLegacyBridgeProfile) || strings.TrimSpace(profile.Model) == "" ||
-		err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		!gatewayNativeProfileValid(profile) || len(openRouter) > 1 || len(openRouter) == 1 &&
+		(openRouter[0].ID != service.GatewayOpenRouterResponsesProfile || profile.ID == openRouter[0].ID || !gatewayNativeProfileValid(openRouter[0])) {
 		panic("invalid private native gateway composition")
+	}
+	// Capture at most one optional preset. No request owns a URL/model or catalog.
+	var second GatewayNativeProfile
+	if len(openRouter) == 1 {
+		second = openRouter[0]
+	}
+	selectProfile := func(id string) (GatewayNativeProfile, bool) {
+		if id == profile.ID {
+			return profile, true
+		}
+		if second.ID != "" && id == second.ID {
+			return second, true
+		}
+		return GatewayNativeProfile{}, false
+	}
+	validDescriptor := func(d service.GatewayNativeRoute) bool {
+		selected, ok := selectProfile(d.Profile)
+		return ok && d.BaseURL == selected.BaseURL && d.Model == selected.Model
 	}
 	fail := func(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"code": "native_candidate_quarantined"})
@@ -102,7 +119,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			return nil, false
 		}
 		d, err := service.GatewayNativeDescriptor(a)
-		if err != nil || d.Profile != profile.ID || d.Model != profile.Model || d.BaseURL != profile.BaseURL {
+		if err != nil || !validDescriptor(d) {
 			fail(c)
 			return nil, false
 		}
@@ -110,7 +127,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	}
 	emit := func(c *gin.Context, a *service.Account) {
 		d, err := service.GatewayNativeDescriptor(a)
-		if err != nil {
+		if err != nil || !validDescriptor(d) {
 			fail(c)
 			return
 		}
@@ -123,7 +140,9 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	})
 	routes.POST("/candidates", func(c *gin.Context) {
 		var req gatewayNativeCreate
-		if nativeGatewayDecode(c, &req) != nil || req.Profile != profile.ID || req.Name == "" || len(req.Name) > 400 ||
+		decodeErr := nativeGatewayDecode(c, &req)
+		selected, configured := selectProfile(req.Profile)
+		if decodeErr != nil || !configured || req.Name == "" || len(req.Name) > 400 ||
 			!service.GatewayNativeIngressKeyValid(req.APIKey) || !service.GatewayNativeCredentialRefValid(req.OwnerRef) || !service.GatewayNativeCredentialRefValid(req.AccountRef) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"code": "invalid_native_candidate"})
 			return
@@ -141,16 +160,16 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		// No stock idempotency coordinator: it retains vendor responses and permits
 		// expired/retryable reclaim. The DB unique generation is the final one-row guard.
 		mode, passthrough := "force_responses", true
-		if profile.ID == service.GatewayLegacyBridgeProfile {
+		if selected.ID == service.GatewayLegacyBridgeProfile {
 			mode, passthrough = "force_chat_completions", false
 		}
 		disabled := false
 		a, err := admin.CreateAccount(service.WithGatewayNativeControl(c.Request.Context()), &service.CreateAccountInput{
 			Name: req.Name, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
-			Credentials: map[string]any{"api_key": envelope, "base_url": profile.BaseURL},
-			Extra: map[string]any{service.GatewayGenerationExtraKey: req.Generation, service.GatewayProfileExtraKey: profile.ID,
+			Credentials: map[string]any{"api_key": envelope, "base_url": selected.BaseURL},
+			Extra: map[string]any{service.GatewayGenerationExtraKey: req.Generation, service.GatewayProfileExtraKey: selected.ID,
 				service.GatewayCredentialScopeExtraKey: scope.Metadata(),
-				service.GatewayModelExtraKey:           profile.Model, "openai_responses_mode": mode, "openai_passthrough": passthrough,
+				service.GatewayModelExtraKey:           selected.Model, "openai_responses_mode": mode, "openai_passthrough": passthrough,
 				"native_api_key_cancel_on_disconnect": true, "openai_preserve_compatible_reasoning": true},
 			Concurrency: 1, SkipDefaultGroupBind: true, ProbeEnabled: &disabled,
 		})
@@ -166,7 +185,9 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			return
 		}
 		persistedScope, scopeErr := service.GatewayNativeCredentialScopeForAccount(persisted)
-		if a == nil || persisted.ID != a.ID || scopeErr != nil || persistedScope != scope || persisted.GetCredential("api_key") != envelope {
+		persistedDescriptor, descriptorErr := service.GatewayNativeDescriptor(persisted)
+		if a == nil || persisted.ID != a.ID || scopeErr != nil || persistedScope != scope || persisted.GetCredential("api_key") != envelope ||
+			descriptorErr != nil || persistedDescriptor.Profile != selected.ID || persistedDescriptor.BaseURL != selected.BaseURL || persistedDescriptor.Model != selected.Model {
 			fail(c)
 			return
 		}
@@ -209,7 +230,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			Descriptor service.GatewayNativeRoute `json:"descriptor"`
 		}
 		if nativeGatewayDecode(c, &req) != nil || req.Descriptor.Generation != c.Param("generation") ||
-			req.Descriptor.Profile != profile.ID || req.Descriptor.BaseURL != profile.BaseURL || req.Descriptor.Model != profile.Model {
+			!validDescriptor(req.Descriptor) {
 			fail(c)
 			return
 		}
@@ -222,7 +243,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	})
 	routes.POST("/responses", func(c *gin.Context) {
 		var req gatewayNativeDispatchRequest
-		if nativeGatewayDecode(c, &req) != nil || req.Descriptor.Profile != profile.ID || req.Descriptor.BaseURL != profile.BaseURL || req.Descriptor.Model != profile.Model {
+		if nativeGatewayDecode(c, &req) != nil || !validDescriptor(req.Descriptor) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"code": "invalid_native_route"})
 			return
 		}
@@ -243,6 +264,12 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{"code": code})
 		}
 	})
+}
+
+func gatewayNativeProfileValid(p GatewayNativeProfile) bool {
+	u, err := url.Parse(p.BaseURL)
+	return service.GatewayNativeAPIKeyProfileValid(p.ID, p.BaseURL, p.Model) && err == nil &&
+		u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == ""
 }
 
 // Strict bounded private ingress, including exactly one JSON value. Never return
