@@ -171,7 +171,7 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 		}
 	case reflect.String:
 		var s string
-		if json.Unmarshal(raw, &s) != nil || strings.ContainsRune(s, utf8.RuneError) {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &s) != nil || strings.ContainsRune(s, utf8.RuneError) {
 			return ErrDenied
 		}
 	case reflect.Bool:

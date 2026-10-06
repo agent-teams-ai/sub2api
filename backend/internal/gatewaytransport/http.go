@@ -116,17 +116,19 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	}
 	permitted, err := h.admit(ctx, peer.ConsumerID, e)
 	if err != nil || !permitted {
-		h.seal(e)
 		// Positive no Forward/body entry, independently of whether SQL claimed.
+		// Record it before cancellation so the original keepalive connection is
+		// not interrupted when there is no forwarding I/O to unblock.
 		h.finishNoEntry(e)
+		h.seal(e)
 		_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
 		writeReceipt(raw, h.receipt(peer.ConsumerID, e))
 		return
 	}
 	ctx, err = service.WithGatewayNativeConsumer(ctx, peer.ConsumerID)
 	if err != nil {
-		h.seal(e)
 		h.finishNoEntry(e)
+		h.seal(e)
 		return
 	}
 	ctx = service.WithGatewayNativeCustody(ctx, h.cfg.Custody)
@@ -135,8 +137,8 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
 		ctx, err = h.cfg.OAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
 		if err != nil {
-			h.seal(e)
 			h.finishNoEntry(e)
+			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
 			writeReceipt(raw, h.receipt(peer.ConsumerID, e))
 			return

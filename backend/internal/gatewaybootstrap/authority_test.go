@@ -378,14 +378,14 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		decoded.openRouterProfile().Profile != service.GatewayOpenRouterResponsesProfile || decoded.openRouterProfile().Tokens != 50 {
 		t.Fatal("second profile replaced the MiMo tuple or its own limits")
 	}
-	for _, bad := range []string{
+	for i, bad := range []string{
 		strings.Replace(string(raw), `"openRouter":{`, `"openRouter":null,"openRouter":{`, 1),
 		strings.Replace(string(raw), `"openRouter":{`, `"OpenRouter":{`, 1),
 		strings.Replace(string(raw), `"openRouter":{`, `"openRouter":{"id":"caller-profile",`, 1),
 		strings.Replace(string(raw), `"openrouter-fixture-qualification"`, `null`, 1),
 	} {
 		if decodeStrict([]byte(bad), &decoded) == nil {
-			t.Fatal("second profile loosened strict config")
+			t.Fatal("second profile loosened strict config", i)
 		}
 	}
 	for _, mutate := range []func(*ProfileConfig){

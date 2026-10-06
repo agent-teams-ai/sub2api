@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
@@ -583,6 +584,27 @@ func (s *additiveHTTPRows) FindByExtraField(_ context.Context, key string, value
 	return found, nil
 }
 
+// Delegate to the real HTTP socket, then let its background read observe an
+// expired deadline before net/http can abort that read during handler return.
+// This makes accidental connection-context cancellation observable without
+// manufacturing cancellation or changing the transport's lifetime observer.
+type compositionHTTPWriter struct {
+	http.ResponseWriter
+	ctx context.Context
+}
+
+func (w *compositionHTTPWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *compositionHTTPWriter) SetReadDeadline(deadline time.Time) error {
+	err := http.NewResponseController(w.ResponseWriter).SetReadDeadline(deadline)
+	if err == nil && !deadline.IsZero() && !deadline.After(time.Now()) {
+		select {
+		case <-w.ctx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+	return err
+}
+
 // One real HTTP composition: three distinct protected tuples, the MiMo ACK,
 // exact admission limits/caps and candidate create/read with optional OAuth.
 // The authority returns non-dispatch readback; no provider/login/PG call occurs.
@@ -705,11 +727,25 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	}
 	defer func() { _ = transport.Stop(context.Background()) }()
 	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: a}
-	server := httptest.NewServer(privateHandler(c.Profile, adminSvc, gateway, custody, transport, auth, mode))
+	handler := privateHandler(c.Profile, adminSvc, gateway, custody, transport, auth, mode)
+	var observeNoEntry atomic.Bool
+	type contextObservation struct{ before, after bool }
+	observations := make(chan contextObservation, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !observeNoEntry.Load() {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		before := r.Context().Err() == nil
+		handler.ServeHTTP(&compositionHTTPWriter{ResponseWriter: w, ctx: r.Context()}, r)
+		observations <- contextObservation{before, r.Context().Err() == nil}
+	}))
 	defer server.Close()
 	// Mutation after construction cannot change either optional snapshot.
 	*cfg.OpenRouter = gatewaytransport.QualifiedProfile{}
 	*cfg.Codex = gatewaytransport.QualifiedProfile{}
+	var firstNoEntryConn net.Conn
+	var liveContexts, sameConnections int
 	request := func(server *httptest.Server, method, path, role string, body any) (int, []byte) {
 		t.Helper()
 		raw, err := json.Marshal(body)
@@ -726,6 +762,14 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+peer.Credential)
 			}
 		}
+		observed := observeNoEntry.Load()
+		var connection net.Conn
+		var reused bool
+		if observed {
+			req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+				GotConn: func(info httptrace.GotConnInfo) { connection, reused = info.Conn, info.Reused },
+			}))
+		}
 		resp, err := server.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -734,6 +778,17 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
 		if err != nil || len(data) > 65536 {
 			t.Fatal("composition response read failed", err)
+		}
+		if observed {
+			observation := <-observations
+			if observation.before && observation.after {
+				liveContexts++
+			}
+			if firstNoEntryConn == nil {
+				firstNoEntryConn = connection
+			} else if connection == firstNoEntryConn && reused {
+				sameConnections++
+			}
 		}
 		return resp.StatusCode, data
 	}
@@ -790,7 +845,9 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 			}
 		}
 		expected.Store(&input)
+		observeNoEntry.Store(true)
 		code, data := request(server, http.MethodPost, "transports", "execution", input)
+		observeNoEntry.Store(false)
 		var receipt gatewaytransport.Receipt
 		decodeErr := json.Unmarshal(data, &receipt)
 		requestRefMatches := receipt.RequestRef == input.RequestRef
@@ -820,6 +877,16 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		if admissionCount != int32(i+1) {
 			t.Fatalf("own profile admission count: got=%d want=%d", admissionCount, i+1)
 		}
+		if receipt.Status == nil || receipt.Status.RequestRef != input.RequestRef || receipt.Status.Effect != "not_dispatched" {
+			t.Fatal("own profile missing authenticated not_dispatched readback")
+		}
+		if !receipt.Sealed || !receipt.Lifetime.ContextDone || !receipt.Lifetime.Sealed ||
+			!receipt.Lifetime.ForwardingReturned || !receipt.Lifetime.BodyKnown || !receipt.Lifetime.BodyClosed || receipt.Lifetime.CloseFailed {
+			t.Fatal("own profile no-entry receipt lost positive closure")
+		}
+	}
+	if liveContexts != len(profiles) || sameConnections != len(profiles)-1 {
+		t.Fatalf("no-entry keepalive: liveContexts=%d sameConnections=%d", liveContexts, sameConnections)
 	}
 	// OAuth without OpenRouter must retain MiMo candidate creation and readback.
 	c.OpenRouter = nil
