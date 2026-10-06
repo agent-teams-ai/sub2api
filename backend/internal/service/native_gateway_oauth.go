@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
- "crypto/rand"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
@@ -14,7 +14,7 @@ import (
 	"errors"
 	"io"
 	"math"
- "math/big"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,7 +37,10 @@ var ErrGatewayOAuthConflict = errors.New("gateway oauth enrollment conflict")
 
 // Only Verify produces a nonzero identity. This upstream principal is not RR
 // owner authority, an account-check ID, a workspace, or dispatch qualification.
-type GatewayNativeOAuthIdentity struct { issuer, subject string; expiresAt time.Time }
+type GatewayNativeOAuthIdentity struct {
+	issuer, subject string
+	expiresAt       time.Time
+}
 
 func (i GatewayNativeOAuthIdentity) Principal() (string, string) { return i.issuer, i.subject }
 func (i GatewayNativeOAuthIdentity) Verified() bool {
@@ -373,8 +376,8 @@ type GatewayNativeOAuthBundle struct {
 	RefreshToken      string          `json:"refresh_token"`
 	IDToken           string          `json:"id_token"`
 	SensitiveMetadata json.RawMessage `json:"sensitive_metadata"`
- // Only a fresh fixed-origin token exchange sets this; never part of replay bytes.
- requestStarted time.Time
+	// Only a fresh fixed-origin token exchange sets this; never part of replay bytes.
+	requestStarted time.Time
 }
 
 func (b GatewayNativeOAuthBundle) bytes() ([]byte, error) {
@@ -490,21 +493,31 @@ func (e *GatewayNativeOAuthEnrollment) Stage(ctx context.Context, s GatewayNativ
 		return outcome, err
 	}
 	metadata, err := gatewayOAuthJSON(snapshot.SensitiveMetadata)
- if err != nil { return GatewayNativeOAuthOutcome{}, err }
- for name := range metadata { if strings.EqualFold(name,gatewayOAuthTimingMember) { return GatewayNativeOAuthOutcome{},ErrGatewayNativeIdentity } }
- identity, err := e.verifier.Verify(ctx, snapshot.IDToken)
+	if err != nil {
+		return GatewayNativeOAuthOutcome{}, err
+	}
+	for name := range metadata {
+		if strings.EqualFold(name, gatewayOAuthTimingMember) {
+			return GatewayNativeOAuthOutcome{}, ErrGatewayNativeIdentity
+		}
+	}
+	identity, err := e.verifier.Verify(ctx, snapshot.IDToken)
 	if err != nil {
 		return GatewayNativeOAuthOutcome{}, err
 	}
 	// Replay commitment above remains the original four-field input. Enrichment
- // occurs only after fresh verification, without another JWKS read or clock.
- if !b.requestStarted.IsZero() {
-  snapshot, err = gatewayOAuthTimedBundle(snapshot, b.requestStarted, identity, e.custody)
-  if err != nil { return GatewayNativeOAuthOutcome{}, err }
-  raw, err = snapshot.bytes()
-  if err != nil { return GatewayNativeOAuthOutcome{}, err }
- }
- envelope, err := e.custody.sealOAuthBytes(s, raw)
+	// occurs only after fresh verification, without another JWKS read or clock.
+	if !b.requestStarted.IsZero() {
+		snapshot, err = gatewayOAuthTimedBundle(snapshot, b.requestStarted, identity, e.custody)
+		if err != nil {
+			return GatewayNativeOAuthOutcome{}, err
+		}
+		raw, err = snapshot.bytes()
+		if err != nil {
+			return GatewayNativeOAuthOutcome{}, err
+		}
+	}
+	envelope, err := e.custody.sealOAuthBytes(s, raw)
 	if err != nil {
 		return GatewayNativeOAuthOutcome{}, err
 	}
@@ -518,84 +531,134 @@ const gatewayOAuthTimingMember = "gateway_refresh_timing_v1"
 const gatewayOAuthRefreshLead = 60 * time.Second
 
 type gatewayOAuthTiming struct {
- RequestStarted string `json:"request_started"`
- AccessExpires string `json:"access_expires"`
- IDExpires string `json:"id_expires"`
- EngineProof string `json:"engine_proof"`
+	RequestStarted string `json:"request_started"`
+	AccessExpires  string `json:"access_expires"`
+	IDExpires      string `json:"id_expires"`
+	EngineProof    string `json:"engine_proof"`
 }
 
 func gatewayOAuthTimedBundle(b GatewayNativeOAuthBundle, started time.Time, identity GatewayNativeOAuthIdentity, custody *GatewayNativeCredentialCustody) (GatewayNativeOAuthBundle, error) {
- fields, err := gatewayOAuthJSON(b.SensitiveMetadata)
- if err != nil || started.IsZero() || !identity.Verified() || identity.expiresAt.IsZero() || identity.expiresAt.Year()>9999 { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
- for name := range fields { if strings.EqualFold(name, gatewayOAuthTimingMember) { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity } }
- seconds, ok := gatewayOAuthSeconds(fields["expires_in"])
- if !ok || seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
- duration := time.Duration(seconds)*time.Second
- expiry := started.Add(duration)
- if !expiry.After(started) || expiry.Year()>9999 || started.Year()<1 { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
- timing := gatewayOAuthTiming{RequestStarted:started.UTC().Format(time.RFC3339Nano), AccessExpires:expiry.UTC().Format(time.RFC3339Nano), IDExpires:identity.expiresAt.UTC().Format(time.RFC3339Nano)}
- // Old provider metadata may already contain the reserved spelling. An inner
- // domain-separated AEAD proof establishes fresh engine provenance as well as
- // binding exact dates to the whole original bundle, using existing custody.
- aad,err:=gatewayOAuthTimingAAD(b,timing)
- if err!=nil || custody==nil || custody.keys[custody.active]==nil { return GatewayNativeOAuthBundle{},ErrGatewayNativeIdentity }
- aead:=custody.keys[custody.active]
- nonce:=make([]byte,aead.NonceSize())
- if _,err=rand.Read(nonce); err!=nil { return GatewayNativeOAuthBundle{},ErrGatewayNativeIdentity }
- proof:=aead.Seal(nil,nonce,nil,aad)
- timing.EngineProof=custody.active+"."+base64.RawURLEncoding.EncodeToString(nonce)+"."+base64.RawURLEncoding.EncodeToString(proof)
- fields[gatewayOAuthTimingMember], err = json.Marshal(timing)
- if err != nil { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
- b.SensitiveMetadata, err = json.Marshal(fields)
- b.requestStarted = time.Time{}
- if err != nil { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
- return b, nil
+	fields, err := gatewayOAuthJSON(b.SensitiveMetadata)
+	if err != nil || started.IsZero() || !identity.Verified() || identity.expiresAt.IsZero() || identity.expiresAt.Year() > 9999 {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	for name := range fields {
+		if strings.EqualFold(name, gatewayOAuthTimingMember) {
+			return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+		}
+	}
+	seconds, ok := gatewayOAuthSeconds(fields["expires_in"])
+	if !ok || seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	duration := time.Duration(seconds) * time.Second
+	expiry := started.Add(duration)
+	if !expiry.After(started) || expiry.Year() > 9999 || started.Year() < 1 {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	timing := gatewayOAuthTiming{RequestStarted: started.UTC().Format(time.RFC3339Nano), AccessExpires: expiry.UTC().Format(time.RFC3339Nano), IDExpires: identity.expiresAt.UTC().Format(time.RFC3339Nano)}
+	// Old provider metadata may already contain the reserved spelling. An inner
+	// domain-separated AEAD proof establishes fresh engine provenance as well as
+	// binding exact dates to the whole original bundle, using existing custody.
+	aad, err := gatewayOAuthTimingAAD(b, timing)
+	if err != nil || custody == nil || custody.keys[custody.active] == nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	aead := custody.keys[custody.active]
+	nonce := make([]byte, aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	proof := aead.Seal(nil, nonce, nil, aad)
+	timing.EngineProof = custody.active + "." + base64.RawURLEncoding.EncodeToString(nonce) + "." + base64.RawURLEncoding.EncodeToString(proof)
+	fields[gatewayOAuthTimingMember], err = json.Marshal(timing)
+	if err != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	b.SensitiveMetadata, err = json.Marshal(fields)
+	b.requestStarted = time.Time{}
+	if err != nil {
+		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
+	}
+	return b, nil
 }
 
 func gatewayOAuthBundleDue(b GatewayNativeOAuthBundle, now time.Time, custody *GatewayNativeCredentialCustody) (bool, bool) {
- fields, err := gatewayOAuthJSON(b.SensitiveMetadata)
- if err != nil { return false, false }
- raw, exists := fields[gatewayOAuthTimingMember]
- if !exists { return false, false }
- timingFields, err := gatewayOAuthJSON(raw)
- if err != nil || len(timingFields)!=4 { return false, false }
- var times [3]time.Time
- for i, name := range []string{"request_started", "access_expires", "id_expires"} {
-  value, ok := gatewayOAuthString(timingFields,name)
-  if !ok { return false, false }
-  times[i], err = time.Parse(time.RFC3339Nano,value)
-  if err != nil || times[i].IsZero() || times[i].UTC().Format(time.RFC3339Nano)!=value { return false, false }
- }
- var timing gatewayOAuthTiming
- if json.Unmarshal(raw,&timing)!=nil || custody==nil { return false,false }
- parts:=strings.Split(timing.EngineProof,".")
- if len(parts)!=3 || custody.keys[parts[0]]==nil { return false,false }
- nonce,err:=base64.RawURLEncoding.Strict().DecodeString(parts[1])
- if err!=nil { return false,false }
- proof,err:=base64.RawURLEncoding.Strict().DecodeString(parts[2])
- aead:=custody.keys[parts[0]]
- if err!=nil || len(nonce)!=aead.NonceSize() || len(proof)!=aead.Overhead() { return false,false }
- delete(fields,gatewayOAuthTimingMember)
- original:=b
- original.SensitiveMetadata,err=json.Marshal(fields)
- if err!=nil { return false,false }
- aad,err:=gatewayOAuthTimingAAD(original,timing)
- if err!=nil { return false,false }
- if _,err=aead.Open(nil,nonce,proof,aad); err!=nil { return false,false }
- seconds, ok := gatewayOAuthSeconds(fields["expires_in"])
- if !ok || seconds<=0 || seconds>math.MaxInt64/int64(time.Second) || !times[0].Add(time.Duration(seconds)*time.Second).Equal(times[1]) { return false,false }
- expiry := times[1]
- if times[2].Before(expiry) { expiry=times[2] }
- return !now.Before(expiry.Add(-gatewayOAuthRefreshLead)), true
+	fields, err := gatewayOAuthJSON(b.SensitiveMetadata)
+	if err != nil {
+		return false, false
+	}
+	raw, exists := fields[gatewayOAuthTimingMember]
+	if !exists {
+		return false, false
+	}
+	timingFields, err := gatewayOAuthJSON(raw)
+	if err != nil || len(timingFields) != 4 {
+		return false, false
+	}
+	var times [3]time.Time
+	for i, name := range []string{"request_started", "access_expires", "id_expires"} {
+		value, ok := gatewayOAuthString(timingFields, name)
+		if !ok {
+			return false, false
+		}
+		times[i], err = time.Parse(time.RFC3339Nano, value)
+		if err != nil || times[i].IsZero() || times[i].UTC().Format(time.RFC3339Nano) != value {
+			return false, false
+		}
+	}
+	var timing gatewayOAuthTiming
+	if json.Unmarshal(raw, &timing) != nil || custody == nil {
+		return false, false
+	}
+	parts := strings.Split(timing.EngineProof, ".")
+	if len(parts) != 3 || custody.keys[parts[0]] == nil {
+		return false, false
+	}
+	nonce, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
+	if err != nil {
+		return false, false
+	}
+	proof, err := base64.RawURLEncoding.Strict().DecodeString(parts[2])
+	aead := custody.keys[parts[0]]
+	if err != nil || len(nonce) != aead.NonceSize() || len(proof) != aead.Overhead() {
+		return false, false
+	}
+	delete(fields, gatewayOAuthTimingMember)
+	original := b
+	original.SensitiveMetadata, err = json.Marshal(fields)
+	if err != nil {
+		return false, false
+	}
+	aad, err := gatewayOAuthTimingAAD(original, timing)
+	if err != nil {
+		return false, false
+	}
+	if _, err = aead.Open(nil, nonce, proof, aad); err != nil {
+		return false, false
+	}
+	seconds, ok := gatewayOAuthSeconds(fields["expires_in"])
+	if !ok || seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) || !times[0].Add(time.Duration(seconds)*time.Second).Equal(times[1]) {
+		return false, false
+	}
+	expiry := times[1]
+	if times[2].Before(expiry) {
+		expiry = times[2]
+	}
+	return !now.Before(expiry.Add(-gatewayOAuthRefreshLead)), true
 }
 
-func gatewayOAuthTimingAAD(b GatewayNativeOAuthBundle,timing gatewayOAuthTiming)([]byte,error){
- raw,err:=b.bytes()
- if err!=nil { return nil,err }
- timing.EngineProof=""
- dates,err:=json.Marshal(timing)
- if err!=nil { return nil,ErrGatewayNativeIdentity }
- digest:=sha256.Sum256(raw)
- aad:=append([]byte("account-gateway/native/oauth-refresh-timing/v1\x00"),digest[:]...)
- return append(aad,dates...),nil
+func gatewayOAuthTimingAAD(b GatewayNativeOAuthBundle, timing gatewayOAuthTiming) ([]byte, error) {
+	raw, err := b.bytes()
+	if err != nil {
+		return nil, err
+	}
+	timing.EngineProof = ""
+	dates, err := json.Marshal(timing)
+	if err != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	digest := sha256.Sum256(raw)
+	aad := append([]byte("account-gateway/native/oauth-refresh-timing/v1\x00"), digest[:]...)
+	return append(aad, dates...), nil
 }

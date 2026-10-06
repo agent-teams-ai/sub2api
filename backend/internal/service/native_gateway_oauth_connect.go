@@ -376,7 +376,7 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	started := s.now()
- response, err := s.client.Do(request)
+	response, err := s.client.Do(request)
 	if err != nil {
 		return deny()
 	}

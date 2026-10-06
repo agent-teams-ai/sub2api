@@ -109,13 +109,20 @@ func (a *authority) AuthorizeNativeOAuthOwner(ctx context.Context, consumer, ope
 
 // Refresh uses active-generation owner authority, separate from staging connect
 // authority and the shared ACK protocol. Origin/credential/bounds stay fixed.
-func (a *authority) AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string,error) {
- if !identifier.MatchString(consumer) || !service.GatewayNativeCredentialRefValid(operation) ||
- !service.GatewayNativeCredentialRefValid(account) || !incarnation.MatchString(generation) { return "",ErrDenied }
- var reply struct { OK bool `json:"ok"`; OwnerRef string `json:"ownerRef"` }
- if a.postReply(ctx,"/private/native/v1/oauth-refresh-authority",oauthOwnerBody{consumer,operation,account,generation},&reply)!=nil ||
- !reply.OK || !service.GatewayNativeCredentialRefValid(reply.OwnerRef) { return "",ErrDenied }
- return reply.OwnerRef,nil
+func (a *authority) AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string, error) {
+	if !identifier.MatchString(consumer) || !service.GatewayNativeCredentialRefValid(operation) ||
+		!service.GatewayNativeCredentialRefValid(account) || !incarnation.MatchString(generation) {
+		return "", ErrDenied
+	}
+	var reply struct {
+		OK       bool   `json:"ok"`
+		OwnerRef string `json:"ownerRef"`
+	}
+	if a.postReply(ctx, "/private/native/v1/oauth-refresh-authority", oauthOwnerBody{consumer, operation, account, generation}, &reply) != nil ||
+		!reply.OK || !service.GatewayNativeCredentialRefValid(reply.OwnerRef) {
+		return "", ErrDenied
+	}
+	return reply.OwnerRef, nil
 }
 
 type enrollmentBody struct {

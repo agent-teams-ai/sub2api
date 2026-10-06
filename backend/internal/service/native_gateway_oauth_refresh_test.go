@@ -24,7 +24,7 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	var mode atomic.Int32
 	var tokenCalls, jwksCalls, destinationCalls atomic.Int32
 	var receivedHeaders atomic.Bool
- var verifyClockAdvance atomic.Bool
+	var verifyClockAdvance atomic.Bool
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { destinationCalls.Add(1) }))
 	defer destination.Close()
 	refresh := gatewayOAuthGuardFixtureOpaque()
@@ -37,7 +37,9 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 		require.Equal(t, "auth.openai.com", r.Host)
 		if r.URL.Path == "/.well-known/jwks.json" {
 			jwksCalls.Add(1)
- if mode.Load()==14 { verifyClockAdvance.Store(true) }
+			if mode.Load() == 14 {
+				verifyClockAdvance.Store(true)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
 			return
 		}
@@ -80,14 +82,14 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 			<-r.Context().Done()
 			return
 		case 10:
- response[gatewayOAuthTimingMember]=map[string]any{"request_started":now.Format(time.RFC3339Nano)}
- case 11:
- response["expires_in"]=0
- case 12:
- response["expires_in"]=int64(9223372036854775807)
- case 13:
- delete(response,"expires_in")
- case 7:
+			response[gatewayOAuthTimingMember] = map[string]any{"request_started": now.Format(time.RFC3339Nano)}
+		case 11:
+			response["expires_in"] = 0
+		case 12:
+			response["expires_in"] = int64(9223372036854775807)
+		case 13:
+			delete(response, "expires_in")
+		case 7:
 			_, _ = w.Write([]byte(`{"access_token":"a","Access_token":"b"}`))
 			return
 		}
@@ -108,7 +110,12 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	verifier := NewGatewayNativeOAuthVerifier(transport)
- verifier.now=func()time.Time{ if verifyClockAdvance.Load(){ return now.Add(2*time.Hour) }; return now }
+	verifier.now = func() time.Time {
+		if verifyClockAdvance.Load() {
+			return now.Add(2 * time.Hour)
+		}
+		return now
+	}
 	// exchange shares the exact production constructor's fixed client policy.
 	custodyKey := make([]byte, 32)
 	_, err := rand.Read(custodyKey)
@@ -127,45 +134,50 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	require.Contains(t, string(bundle.SensitiveMetadata), "private_account_hint")
 	require.NotContains(t, string(bundle.SensitiveMetadata), nextAccess)
 	require.Equal(t, int32(1), jwksCalls.Load())
- // Signed ID expiry wins over access expiry, which is fixed at request start.
- metadata,err:=gatewayOAuthJSON(bundle.SensitiveMetadata)
- require.NoError(t,err)
- var timing gatewayOAuthTiming
- require.NoError(t,json.Unmarshal(metadata[gatewayOAuthTimingMember],&timing))
- require.Equal(t,now.Add(time.Hour).Format(time.RFC3339Nano),timing.IDExpires)
- tokenStarted,err:=time.Parse(time.RFC3339Nano,timing.RequestStarted)
- require.NoError(t,err)
- accessExpires,err:=time.Parse(time.RFC3339Nano,timing.AccessExpires)
- require.NoError(t,err); require.True(t,accessExpires.Equal(tokenStarted.Add(time.Hour)))
- due,qualified:=gatewayOAuthBundleDue(bundle,now.Add(time.Hour-61*time.Second),custody)
- require.True(t,qualified); require.False(t,due)
- due,qualified=gatewayOAuthBundleDue(bundle,now.Add(time.Hour-60*time.Second),custody)
- require.True(t,qualified); require.True(t,due)
- // Historical provider metadata, even when encrypted, cannot forge fresh timing.
- legacy:=bundle
- legacyMetadata:=map[string]any{"expires_in":3600,gatewayOAuthTimingMember:map[string]any{
- "request_started":timing.RequestStarted,"access_expires":timing.AccessExpires,"id_expires":timing.IDExpires,"engine_proof":"provider-controlled"}}
- legacy.SensitiveMetadata,err=json.Marshal(legacyMetadata)
- require.NoError(t,err)
- due,qualified=gatewayOAuthBundleDue(legacy,time.Now().Add(24*time.Hour),custody)
- require.False(t,qualified); require.False(t,due)
- // Dates and whole-bundle bytes are bound by the engine proof; raw JWT text or
- // changing either the date or access token cannot become timing authority.
- changed:=bundle
- changed.AccessToken=gatewayOAuthGuardFixtureOpaque()
- _,qualified=gatewayOAuthBundleDue(changed,time.Now(),custody)
- require.False(t,qualified)
- timing.IDExpires=now.Add(-time.Hour).Format(time.RFC3339Nano)
- metadata[gatewayOAuthTimingMember],err=json.Marshal(timing)
- require.NoError(t,err)
- changed=bundle; changed.SensitiveMetadata,err=json.Marshal(metadata)
- require.NoError(t,err)
- _,qualified=gatewayOAuthBundleDue(changed,time.Now(),custody)
- require.False(t,qualified)
+	// Signed ID expiry wins over access expiry, which is fixed at request start.
+	metadata, err := gatewayOAuthJSON(bundle.SensitiveMetadata)
+	require.NoError(t, err)
+	var timing gatewayOAuthTiming
+	require.NoError(t, json.Unmarshal(metadata[gatewayOAuthTimingMember], &timing))
+	require.Equal(t, now.Add(time.Hour).Format(time.RFC3339Nano), timing.IDExpires)
+	tokenStarted, err := time.Parse(time.RFC3339Nano, timing.RequestStarted)
+	require.NoError(t, err)
+	accessExpires, err := time.Parse(time.RFC3339Nano, timing.AccessExpires)
+	require.NoError(t, err)
+	require.True(t, accessExpires.Equal(tokenStarted.Add(time.Hour)))
+	due, qualified := gatewayOAuthBundleDue(bundle, now.Add(time.Hour-61*time.Second), custody)
+	require.True(t, qualified)
+	require.False(t, due)
+	due, qualified = gatewayOAuthBundleDue(bundle, now.Add(time.Hour-60*time.Second), custody)
+	require.True(t, qualified)
+	require.True(t, due)
+	// Historical provider metadata, even when encrypted, cannot forge fresh timing.
+	legacy := bundle
+	legacyMetadata := map[string]any{"expires_in": 3600, gatewayOAuthTimingMember: map[string]any{
+		"request_started": timing.RequestStarted, "access_expires": timing.AccessExpires, "id_expires": timing.IDExpires, "engine_proof": "provider-controlled"}}
+	legacy.SensitiveMetadata, err = json.Marshal(legacyMetadata)
+	require.NoError(t, err)
+	due, qualified = gatewayOAuthBundleDue(legacy, time.Now().Add(24*time.Hour), custody)
+	require.False(t, qualified)
+	require.False(t, due)
+	// Dates and whole-bundle bytes are bound by the engine proof; raw JWT text or
+	// changing either the date or access token cannot become timing authority.
+	changed := bundle
+	changed.AccessToken = gatewayOAuthGuardFixtureOpaque()
+	_, qualified = gatewayOAuthBundleDue(changed, time.Now(), custody)
+	require.False(t, qualified)
+	timing.IDExpires = now.Add(-time.Hour).Format(time.RFC3339Nano)
+	metadata[gatewayOAuthTimingMember], err = json.Marshal(timing)
+	require.NoError(t, err)
+	changed = bundle
+	changed.SensitiveMetadata, err = json.Marshal(metadata)
+	require.NoError(t, err)
+	_, qualified = gatewayOAuthBundleDue(changed, time.Now(), custody)
+	require.False(t, qualified)
 	for _, tc := range []struct {
 		name string
 		mode int32
-	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"header deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}, {"reserved provider metadata",10}, {"zero expiry",11}, {"overflow expiry",12}, {"missing expiry",13}} {
+	}{{"signed foreign principal", 1}, {"missing fresh ID token", 2}, {"redirect", 3}, {"body overflow", 4}, {"header deadline", 5}, {"missing refresh token", 6}, {"ambiguous JSON", 7}, {"malformed expiry", 8}, {"reserved provider metadata", 10}, {"zero expiry", 11}, {"overflow expiry", 12}, {"missing expiry", 13}} {
 		t.Run(tc.name, func(t *testing.T) {
 			mode.Store(tc.mode)
 			budget := 100 * time.Millisecond
@@ -206,7 +218,7 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	fresh := GatewayNativeOAuthBundle{
 		AccessToken: nextAccess, RefreshToken: nextRefresh, IDToken: goodID,
 		SensitiveMetadata: json.RawMessage(`{"expires_in":3600,"private_account_hint":"fresh-exchange"}`),
-		requestStarted: now.Add(-30 * time.Second),
+		requestStarted:    now.Add(-30 * time.Second),
 	}
 	jwksBeforeEnrollment := jwksCalls.Load()
 	accepted, err := enrollment.Stage(ownerCtx, scope, "timed-original-enrollment", fresh)
@@ -241,13 +253,13 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	verifyClockAdvance.Store(false)
 
 	// A delayed JWKS crosses signed expiry: the verifier must fail, rather than
- // moving the absolute deadline forward to verification/response completion.
- mode.Store(14)
- _,err=s.exchange(context.Background(),refresh,GatewayOAuthIssuer,"reserved-subject")
- require.ErrorIs(t,err,ErrGatewayNativeIdentity)
- require.True(t,verifyClockAdvance.Load())
- verifyClockAdvance.Store(false)
- // These scenarios observe service/repository context contracts using actual
+	// moving the absolute deadline forward to verification/response completion.
+	mode.Store(14)
+	_, err = s.exchange(context.Background(), refresh, GatewayOAuthIssuer, "reserved-subject")
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.True(t, verifyClockAdvance.Load())
+	verifyClockAdvance.Store(false)
+	// These scenarios observe service/repository context contracts using actual
 	// signed HTTP and custody. Durable SQL publication is proved only by real PG.
 	for _, tc := range []struct {
 		name     string

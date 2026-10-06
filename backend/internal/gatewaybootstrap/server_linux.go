@@ -287,9 +287,11 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
 			var owner string
-   if c.Request.URL.Path=="/private/native/v1/oauth/refresh" {
-    owner,err=oauth.owners.AuthorizeNativeOAuthRefreshOwner(bounded,peer.ConsumerID,tuple.Operation,tuple.AccountRef,tuple.Generation)
-   } else { owner,err=oauth.owners.AuthorizeNativeOAuthOwner(bounded,peer.ConsumerID,tuple.Operation,tuple.AccountRef,tuple.Generation) }
+			if c.Request.URL.Path == "/private/native/v1/oauth/refresh" {
+				owner, err = oauth.owners.AuthorizeNativeOAuthRefreshOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
+			} else {
+				owner, err = oauth.owners.AuthorizeNativeOAuthOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
+			}
 			if err != nil || bounded.Err() != nil || owner != tuple.OwnerRef {
 				c.AbortWithStatus(http.StatusForbidden)
 				return
@@ -305,7 +307,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			c.Request = c.Request.WithContext(ctx)
 			c.Next()
 		}
-		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil || admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil || (oauth.refresh!=nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""),oauth.refresh,authorizeOAuth)!=nil) {
+		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil || admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil || (oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 			})
@@ -352,7 +354,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 		switch {
 		case r.URL.Path == "/private/native/v1/runtime":
 			management.ServeHTTP(w, r)
-		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || (oauth.refresh!=nil && r.URL.Path=="/private/native/v1/oauth/refresh")):
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
@@ -451,7 +453,7 @@ func (c *boundedConn) Close() error {
 // Selectors carry no owner authority, including before physical creation.
 type NativeOAuthOwnerAuthority interface {
 	AuthorizeNativeOAuthOwner(ctx context.Context, consumer, operation, account, generation string) (string, error)
- AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string,error)
+	AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string, error)
 }
 type nativeOAuthOwnerTuple struct {
 	Operation  string `json:"operation"`
@@ -469,7 +471,7 @@ type privateOAuth struct {
 	connect  *service.GatewayNativeOAuthConnect
 	dispatch *service.GatewayNativeOAuthDispatch
 	owners   NativeOAuthOwnerAuthority
- refresh *service.GatewayNativeOAuthRefresh
+	refresh  *service.GatewayNativeOAuthRefresh
 }
 
 func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *service.GatewayNativeCredentialCustody, cfg *OAuthConfig, owners NativeOAuthOwnerAuthority) (*privateOAuth, error) {
@@ -504,10 +506,16 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 	if err != nil {
 		return nil, ErrDenied
 	}
-	f2,ok:=repo.(service.GatewayNativeOAuthRefreshRepository)
- if !ok { return nil,ErrDenied }
- if _,ok:=repo.(service.GatewayNativeOAuthRefreshResolver); !ok { return nil,ErrDenied }
- refresh,err:=service.NewGatewayNativeOAuthRefresh(f2,custody,verifier,providerTransport)
- if err!=nil { return nil,ErrDenied }
- return &privateOAuth{connect: connect, dispatch: dispatch, owners: owners,refresh:refresh}, nil
+	f2, ok := repo.(service.GatewayNativeOAuthRefreshRepository)
+	if !ok {
+		return nil, ErrDenied
+	}
+	if _, ok := repo.(service.GatewayNativeOAuthRefreshResolver); !ok {
+		return nil, ErrDenied
+	}
+	refresh, err := service.NewGatewayNativeOAuthRefresh(f2, custody, verifier, providerTransport)
+	if err != nil {
+		return nil, ErrDenied
+	}
+	return &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh}, nil
 }

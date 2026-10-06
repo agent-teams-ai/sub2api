@@ -328,15 +328,17 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 	}
 	gatewayOwnerFixtureCredential := base64.RawURLEncoding.EncodeToString(gatewayOwnerFixtureCredentialRaw)
 	var calls atomic.Int32
- var refreshCall atomic.Bool
+	var refreshCall atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		var got oauthOwnerBody
- expectedPath:="/private/native/v1/oauth-owner-authority"
- if refreshCall.Load(){expectedPath="/private/native/v1/oauth-refresh-authority"}
- body,readErr:=io.ReadAll(r.Body)
-		if r.Method != http.MethodPost || r.URL.Path!=expectedPath ||
-			r.Header.Get("Authorization") != "Bearer "+gatewayOwnerFixtureCredential || (readErr!=nil || decodeStrict(body,&got)!=nil) ||
+		expectedPath := "/private/native/v1/oauth-owner-authority"
+		if refreshCall.Load() {
+			expectedPath = "/private/native/v1/oauth-refresh-authority"
+		}
+		body, readErr := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != expectedPath ||
+			r.Header.Get("Authorization") != "Bearer "+gatewayOwnerFixtureCredential || (readErr != nil || decodeStrict(body, &got) != nil) ||
 			got.ConsumerID != "fixture-consumer" || got.AccountRef != "fixture-account" || got.Generation != "33333333-3333-4333-8333-333333333333" {
 			t.Error("owner lookup changed authenticated selectors")
 		}
@@ -360,16 +362,16 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.client.CloseIdleConnections()
-	for index,authorize:=range []func(context.Context,string,string,string,string)(string,error){a.AuthorizeNativeOAuthOwner,a.AuthorizeNativeOAuthRefreshOwner} {
- refreshCall.Store(index==1)
- for _, op := range []string{"valid", "ack-only", "owner-alias", "private-field", "oversize"} {
-		owner, err := authorize(context.Background(), "fixture-consumer", op, "fixture-account", "33333333-3333-4333-8333-333333333333")
-		if op == "valid" && (err != nil || owner != "workspace/owned") || op != "valid" && (err == nil || owner != "") {
-			t.Fatal("owner-specific reply shape was not enforced", op)
+	for index, authorize := range []func(context.Context, string, string, string, string) (string, error){a.AuthorizeNativeOAuthOwner, a.AuthorizeNativeOAuthRefreshOwner} {
+		refreshCall.Store(index == 1)
+		for _, op := range []string{"valid", "ack-only", "owner-alias", "private-field", "oversize"} {
+			owner, err := authorize(context.Background(), "fixture-consumer", op, "fixture-account", "33333333-3333-4333-8333-333333333333")
+			if op == "valid" && (err != nil || owner != "workspace/owned") || op != "valid" && (err == nil || owner != "") {
+				t.Fatal("owner-specific reply shape was not enforced", op)
+			}
 		}
 	}
-	}
- if calls.Load() != 10 {
+	if calls.Load() != 10 {
 		t.Fatal("owner lookup retried")
 	}
 

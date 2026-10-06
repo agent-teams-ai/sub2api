@@ -390,25 +390,39 @@ var _ service.GatewayNativeOAuthRefreshRepository = (*accountRepository)(nil)
 
 // Resolve after locking the exact physical account. The completed F3 commitment
 // and F4 qualification are read afresh after any dispatch/refresh lock wait.
-func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution,error) {
- var out service.GatewayNativeOAuthRefreshResolution
- deny := func() (service.GatewayNativeOAuthRefreshResolution,error) { return service.GatewayNativeOAuthRefreshResolution{},service.ErrGatewayNativeIdentity }
- if !service.GatewayNativeOAuthScopeAuthorized(ctx,scope) || !service.GatewayNativeCredentialRefValid(operation) { return deny() }
- db,ok := r.sql.(interface { BeginTx(context.Context,*sql.TxOptions)(*sql.Tx,error) })
- if !ok { return deny() }
- tx,err := db.BeginTx(ctx,&sql.TxOptions{Isolation:sql.LevelReadCommitted})
- if err!=nil { return deny() }
- defer func(){ _=tx.Rollback() }()
- // Find the one immutable connect birth, then lock before reading version/F2.
- var id int64
- err=tx.QueryRowContext(ctx,`SELECT r.account_id FROM gateway_oauth_connect_intents c
+func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution, error) {
+	var out service.GatewayNativeOAuthRefreshResolution
+	deny := func() (service.GatewayNativeOAuthRefreshResolution, error) {
+		return service.GatewayNativeOAuthRefreshResolution{}, service.ErrGatewayNativeIdentity
+	}
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, scope) || !service.GatewayNativeCredentialRefValid(operation) {
+		return deny()
+	}
+	db, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return deny()
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return deny()
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Find the one immutable connect birth, then lock before reading version/F2.
+	var id int64
+	err = tx.QueryRowContext(ctx, `SELECT r.account_id FROM gateway_oauth_connect_intents c
  JOIN gateway_oauth_identity_reservations r ON r.consumer=c.consumer AND r.operation_ref=c.enrollment_operation
  WHERE c.consumer=$1 AND c.owner_ref=$2 AND c.account_ref=$3 AND c.generation=$4 AND c.operation_ref=$5
- AND c.state='completed' AND NOT c.recovery_denied AND c.purpose=$6`,scope.Consumer,scope.Owner,scope.Account,scope.Generation,operation,scope.Purpose).Scan(&id)
- if err!=nil { return deny() }
- var locked int64
- if tx.QueryRowContext(ctx,`SELECT id FROM accounts WHERE id=$1 FOR UPDATE`,id).Scan(&locked)!=nil { return deny() }
- rows,err:=tx.QueryContext(ctx,`SELECT a.id,a.created_at,gateway_oauth_credential_version(a.credentials),a.credentials->>'oauth_bundle'
+ AND c.state='completed' AND NOT c.recovery_denied AND c.purpose=$6`, scope.Consumer, scope.Owner, scope.Account, scope.Generation, operation, scope.Purpose).Scan(&id)
+	if err != nil {
+		return deny()
+	}
+	var locked int64
+	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, id).Scan(&locked) != nil {
+		return deny()
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.created_at,gateway_oauth_credential_version(a.credentials),a.credentials->>'oauth_bundle'
  FROM accounts a JOIN gateway_oauth_identity_reservations r ON r.account_id=a.id
  JOIN gateway_oauth_connect_intents c ON c.consumer=r.consumer AND c.owner_ref=r.owner_ref
  AND c.account_ref=r.account_ref AND c.generation=r.generation
@@ -430,28 +444,42 @@ func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context
  AND a.extra->'gateway_credential_scope_v1'=jsonb_build_object('consumer',r.consumer,'owner',r.owner_ref,'account',r.account_ref,'generation',r.generation,'purpose',c.purpose)
  AND gateway_oauth_credential_version(a.credentials)>0
  AND NOT EXISTS(SELECT 1 FROM account_groups g WHERE g.account_id=a.id)
- LIMIT 2`,id,scope.Consumer,scope.Owner,scope.Account,scope.Generation,operation,scope.Purpose,
- service.GatewayCodexOAuthResponsesProfile,service.GatewayCodexOAuthBaseURL,service.GatewayCodexOAuthModel,service.GatewayCodexOAuthQualification)
- if err!=nil { return deny() }
- if !rows.Next() || rows.Scan(&out.AccountID,&out.CreatedAt,&out.Version,&out.Envelope)!=nil || rows.Next() || rows.Err()!=nil { _=rows.Close(); return deny() }
- if rows.Close()!=nil { return deny() }
- // UNIQUE(account_id,expected_version) is authoritative, including an old
- // reference whose completion ACK was lost and whose current version is newer.
- attempt:=service.GatewayNativeOAuthRefreshIntent{}
- var consumer,owner,account,generation string
- err=tx.QueryRowContext(ctx,`SELECT account_id,native_created_at,consumer,owner_ref,account_ref,generation,
+ LIMIT 2`, id, scope.Consumer, scope.Owner, scope.Account, scope.Generation, operation, scope.Purpose,
+		service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthBaseURL, service.GatewayCodexOAuthModel, service.GatewayCodexOAuthQualification)
+	if err != nil {
+		return deny()
+	}
+	if !rows.Next() || rows.Scan(&out.AccountID, &out.CreatedAt, &out.Version, &out.Envelope) != nil || rows.Next() || rows.Err() != nil {
+		_ = rows.Close()
+		return deny()
+	}
+	if rows.Close() != nil {
+		return deny()
+	}
+	// UNIQUE(account_id,expected_version) is authoritative, including an old
+	// reference whose completion ACK was lost and whose current version is newer.
+	attempt := service.GatewayNativeOAuthRefreshIntent{}
+	var consumer, owner, account, generation string
+	err = tx.QueryRowContext(ctx, `SELECT account_id,native_created_at,consumer,owner_ref,account_ref,generation,
  expected_version,operation_ref,intent_ref,state FROM gateway_oauth_refresh_attempts
- WHERE account_id=$1 ORDER BY expected_version DESC LIMIT 1 FOR UPDATE`,id).Scan(
- &attempt.AccountID,&attempt.CreatedAt,&consumer,&owner,&account,&generation,&attempt.ExpectedVersion,&attempt.Operation,&attempt.Intent,&out.State)
- if err!=nil && err!=sql.ErrNoRows { return deny() }
- if err==nil {
-  attempt.Scope=scope
-  if consumer!=scope.Consumer || owner!=scope.Owner || account!=scope.Account || generation!=scope.Generation ||
-   attempt.AccountID!=out.AccountID || !attempt.CreatedAt.Equal(out.CreatedAt) || !attempt.Authorized(ctx) ||
-   (out.State=="completed" && attempt.ExpectedVersion+1!=out.Version) || (out.State!="completed" && attempt.ExpectedVersion!=out.Version) { return deny() }
-  out.Attempt=&attempt
- }
- if tx.Commit()!=nil { return deny() }
- return out,nil
+ WHERE account_id=$1 ORDER BY expected_version DESC LIMIT 1 FOR UPDATE`, id).Scan(
+		&attempt.AccountID, &attempt.CreatedAt, &consumer, &owner, &account, &generation, &attempt.ExpectedVersion, &attempt.Operation, &attempt.Intent, &out.State)
+	if err != nil && err != sql.ErrNoRows {
+		return deny()
+	}
+	if err == nil {
+		attempt.Scope = scope
+		if consumer != scope.Consumer || owner != scope.Owner || account != scope.Account || generation != scope.Generation ||
+			attempt.AccountID != out.AccountID || !attempt.CreatedAt.Equal(out.CreatedAt) || !attempt.Authorized(ctx) ||
+			(out.State == "completed" && attempt.ExpectedVersion+1 != out.Version) || (out.State != "completed" && attempt.ExpectedVersion != out.Version) {
+			return deny()
+		}
+		out.Attempt = &attempt
+	}
+	if tx.Commit() != nil {
+		return deny()
+	}
+	return out, nil
 }
+
 var _ service.GatewayNativeOAuthRefreshResolver = (*accountRepository)(nil)
