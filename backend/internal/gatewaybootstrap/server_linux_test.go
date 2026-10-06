@@ -1295,9 +1295,9 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if status != 403 {
 		t.Fatal("missing actual owner seam did not fail closed")
 	}
-	legacy := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth))
-	defer legacy.Close()
-	response, err := legacy.Client().Get(legacy.URL + "/auth/callback?" + query)
+	legacyServer := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth))
+	defer legacyServer.Close()
+	response, err := legacyServer.Client().Get(legacyServer.URL + "/auth/callback?" + query)
 	if err != nil {
 		t.Fatal(err)
 	}
