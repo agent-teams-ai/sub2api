@@ -342,7 +342,6 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 		enrollment.repository = connectEnrollmentRepository{enrollment.repository, s.repository, &in}
 		out, stageErr := enrollment.Stage(bounded, in.Scope, in.EnrollmentOperation, bundle)
 		quarantine = errors.Is(stageErr, ErrGatewayOAuthConflict) || in.EnrollmentMAC == ""
-		bundle = GatewayNativeOAuthBundle{}
 		if stageErr == nil {
 			saved, finishErr := s.repository.FinishConnect(bounded, in, "completed", out)
 			if finishErr == nil {

@@ -203,7 +203,7 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 		require.Len(t, r.PostForm.Get("code_verifier"), 128)
 		require.True(t, openai.GenerateCodeChallenge(r.PostForm.Get("code_verifier")) == f.challenge)
 		if f.redirect {
-			http.Redirect(w, r, destination.URL+"/stolen", 302)
+			http.Redirect(w, r, destination.URL+"/stolen", http.StatusFound)
 			return
 		}
 		if f.stallBody {

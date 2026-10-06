@@ -198,7 +198,8 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	})
 	repository, err := NewGatewayNativeOAuthConnectRepository(db)
 	require.NoError(t, err)
-	f1 := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	f1, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
 	verifier, bundleFor := oauthPGFixture(t)
 	bundle := bundleFor("f3-controlled-principal")
 	var exchanges atomic.Int32
@@ -215,7 +216,9 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": bundle.AccessToken, "refresh_token": bundle.RefreshToken, "id_token": bundle.IDToken, "token_type": "Bearer", "expires_in": 3600, "scope": openai.DefaultScopes, "private": "f3-controlled-metadata"})
 	}))
 	defer server.Close()
-	transport := server.Client().Transport.(*http.Transport).Clone()
+	transportBase, ok := server.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := transportBase.Clone()
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"
 	defer transport.CloseIdleConnections()
