@@ -637,7 +637,8 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Empty(t, idle.RefreshRef)
 	require.Zero(t, calls.Load())
 	require.EqualValues(t, 1, accountChecks.Load())
-	resolver := repo.(service.GatewayNativeOAuthRefreshResolver)
+	resolver, ok := repo.(service.GatewayNativeOAuthRefreshResolver)
+	require.True(t, ok)
 	// Same numeric ID with one microsecond birth difference is not authority.
 	wrong := in
 	wrong.CreatedAt = wrong.CreatedAt.Add(time.Microsecond)
@@ -1046,5 +1047,9 @@ func (b *oauthRefreshConnectBinding) StageGatewayNativeOAuth(ctx context.Context
 	return b.GatewayNativeOAuthRepository.StageGatewayNativeOAuth(ctx, in)
 }
 func (r *oauthRefreshLostACK) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution, error) {
-	return r.GatewayNativeOAuthRefreshRepository.(service.GatewayNativeOAuthRefreshResolver).ResolveGatewayNativeOAuthRefresh(ctx, scope, operation)
+	resolver, ok := r.GatewayNativeOAuthRefreshRepository.(service.GatewayNativeOAuthRefreshResolver)
+	if !ok {
+		return service.GatewayNativeOAuthRefreshResolution{}, errors.New("refresh test repository does not implement resolver")
+	}
+	return resolver.ResolveGatewayNativeOAuthRefresh(ctx, scope, operation)
 }
