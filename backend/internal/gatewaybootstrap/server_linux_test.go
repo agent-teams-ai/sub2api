@@ -792,9 +792,33 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		expected.Store(&input)
 		code, data := request(server, http.MethodPost, "transports", "execution", input)
 		var receipt gatewaytransport.Receipt
-		if code != http.StatusAccepted || json.Unmarshal(data, &receipt) != nil || receipt.RequestRef != input.RequestRef ||
-			receipt.Phase != "closed" || receipt.Lifetime.Entered || admits.Load() != int32(i+1) {
-			t.Fatal("own profile admission tuple rejected", p.Profile, code)
+		decodeErr := json.Unmarshal(data, &receipt)
+		requestRefMatches := receipt.RequestRef == input.RequestRef
+		phase := "invalid"
+		switch receipt.Phase {
+		case "reserved", "admitted", "entered", "closed":
+			phase = receipt.Phase
+		}
+		admissionCount := admits.Load()
+		t.Logf("profileIndex=%d status=%d responseBytes=%d decoded=%t decodeErrorType=%T requestRefMatches=%t phase=%s entered=%t admissionCount=%d",
+			i, code, len(data), decodeErr == nil, decodeErr, requestRefMatches, phase, receipt.Lifetime.Entered, admissionCount)
+		if code != http.StatusAccepted {
+			t.Fatalf("own profile admission HTTP status: got=%d want=%d", code, http.StatusAccepted)
+		}
+		if decodeErr != nil {
+			t.Fatalf("own profile receipt decode: decoded=false errorType=%T responseBytes=%d", decodeErr, len(data))
+		}
+		if !requestRefMatches {
+			t.Fatal("own profile receipt requestRefMatches=false")
+		}
+		if receipt.Phase != "closed" {
+			t.Fatalf("own profile receipt phase: got=%s want=closed", phase)
+		}
+		if receipt.Lifetime.Entered {
+			t.Fatal("own profile receipt entered=true")
+		}
+		if admissionCount != int32(i+1) {
+			t.Fatalf("own profile admission count: got=%d want=%d", admissionCount, i+1)
 		}
 	}
 	// OAuth without OpenRouter must retain MiMo candidate creation and readback.
