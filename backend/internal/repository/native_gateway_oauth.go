@@ -181,7 +181,9 @@ func (r *accountRepository) gatewayRefreshTx(ctx context.Context, in service.Gat
 	}
 	var id int64
 	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, in.AccountID).Scan(&id) != nil {
-		tx.Rollback()
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			return nil, service.ErrGatewayNativeIdentity
+		}
 		return nil, service.ErrGatewayNativeIdentity
 	}
 	return tx, nil
@@ -206,13 +208,17 @@ func gatewayRefreshRead(ctx context.Context, tx *sql.Tx, in service.GatewayNativ
 	}
 	return out, true, nil
 }
-func (r *accountRepository) PrepareGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent) (service.GatewayNativeOAuthRefreshPrepared, error) {
+func (r *accountRepository) PrepareGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent) (result service.GatewayNativeOAuthRefreshPrepared, retErr error) {
 	var empty service.GatewayNativeOAuthRefreshPrepared
 	tx, err := r.gatewayRefreshTx(ctx, in)
 	if err != nil {
 		return empty, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			result, retErr = empty, service.ErrGatewayNativeIdentity
+		}
+	}()
 	out, found, err := gatewayRefreshRead(ctx, tx, in)
 	if err != nil {
 		return empty, err
@@ -276,12 +282,16 @@ func (r *accountRepository) PrepareGatewayNativeOAuthRefresh(ctx context.Context
 	}
 	return out, nil
 }
-func (r *accountRepository) EnterGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) (bool, error) {
+func (r *accountRepository) EnterGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) (entered bool, retErr error) {
 	tx, err := r.gatewayRefreshTx(ctx, in)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			entered, retErr = false, service.ErrGatewayNativeIdentity
+		}
+	}()
 	out, found, err := gatewayRefreshRead(ctx, tx, in)
 	if err != nil {
 		return false, err
@@ -303,13 +313,17 @@ func (r *accountRepository) EnterGatewayNativeOAuthRefresh(ctx context.Context, 
 	}
 	return n == 1, nil
 }
-func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64, envelope string) (service.GatewayNativeOAuthRefreshOutcome, error) {
+func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64, envelope string) (outcome service.GatewayNativeOAuthRefreshOutcome, retErr error) {
 	var empty service.GatewayNativeOAuthRefreshOutcome
 	tx, err := r.gatewayRefreshTx(ctx, in)
 	if err != nil {
 		return empty, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			outcome, retErr = empty, service.ErrGatewayNativeIdentity
+		}
+	}()
 	out, found, err := gatewayRefreshRead(ctx, tx, in)
 	if err != nil {
 		return empty, err
@@ -344,12 +358,16 @@ func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Contex
 	}
 	return service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: in.ExpectedVersion + 1}, nil
 }
-func (r *accountRepository) UnknownGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) error {
+func (r *accountRepository) UnknownGatewayNativeOAuthRefresh(ctx context.Context, in service.GatewayNativeOAuthRefreshIntent, fence int64) (retErr error) {
 	tx, err := r.gatewayRefreshTx(ctx, in)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			retErr = service.ErrGatewayNativeIdentity
+		}
+	}()
 	out, found, err := gatewayRefreshRead(ctx, tx, in)
 	if err != nil {
 		return err

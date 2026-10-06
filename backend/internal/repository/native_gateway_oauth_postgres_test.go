@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -504,14 +505,16 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	defer cancel()
 	db, err := sql.Open("postgres", dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	db.SetMaxOpenConns(4)
 	var tables int
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`).Scan(&tables))
 	require.Zero(t, tables)
 	require.NoError(t, ApplyMigrations(ctx, db))
-	repo := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
-	refreshRepo := repo.(service.GatewayNativeOAuthRefreshRepository)
+	repo, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
+	refreshRepo, ok := repo.(service.GatewayNativeOAuthRefreshRepository)
+	require.True(t, ok)
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	require.NoError(t, err)
@@ -796,7 +799,11 @@ func (r *oauthRefreshHeldCommit) CompleteGatewayNativeOAuthRefresh(ctx context.C
 	defer cancel()
 	tx, err := r.db.BeginTx(holdCtx, nil)
 	require.NoError(r.t, err)
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			require.NoError(r.t, err)
+		}
+	}()
 	var id int64
 	require.NoError(r.t, tx.QueryRowContext(holdCtx, `SELECT id FROM accounts WHERE id=$1 AND created_at=$2 FOR UPDATE`, in.AccountID, in.CreatedAt).Scan(&id))
 	var deadline time.Time
@@ -855,7 +862,9 @@ func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http
 		handler(w, r, bundleFor)
 	}))
 	t.Cleanup(server.Close)
-	transport := server.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := server.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		require.Equal(t, "auth.openai.com:443", address)
