@@ -375,7 +375,8 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
-	response, err := s.client.Do(request)
+	started := s.now()
+ response, err := s.client.Do(request)
 	if err != nil {
 		return deny()
 	}
@@ -399,7 +400,7 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 		return deny()
 	}
 	if expiry, exists := m["expires_in"]; exists {
-		if _, ok := gatewayOAuthSeconds(expiry); !ok {
+		if n, ok := gatewayOAuthSeconds(expiry); !ok || n <= 0 {
 			return deny()
 		}
 	}
@@ -433,7 +434,7 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 	if err != nil {
 		return deny()
 	}
-	bundle := GatewayNativeOAuthBundle{AccessToken: access, RefreshToken: refresh, IDToken: id, SensitiveMetadata: metadata}
+	bundle := GatewayNativeOAuthBundle{AccessToken: access, RefreshToken: refresh, IDToken: id, SensitiveMetadata: metadata, requestStarted: started}
 	if _, err := bundle.bytes(); err != nil {
 		return deny()
 	}

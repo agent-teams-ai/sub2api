@@ -517,6 +517,8 @@ func (s *oauthMountJournal) FinishConnect(ctx context.Context, in service.Gatewa
 }
 
 type oauthMountRows struct {
+ service.GatewayNativeOAuthRefreshRepository
+ refreshResolution service.GatewayNativeOAuthRefreshResolution
 	service.AccountRepository
 	service.GatewayNativeOAuthRepository
 }
@@ -1016,7 +1018,7 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = transport.Stop(context.Background()) }()
-	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect, dispatch, a}))
+	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect:connect, dispatch:dispatch, owners:a}))
 	defer server.Close()
 	post := func(path string, body any, authenticated bool) (int, []byte) {
 		raw, _ := json.Marshal(body)
@@ -1144,7 +1146,15 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners}
+	scope:=service.GatewayNativeCredentialScope{Consumer:"fixture-consumer",Owner:"fixture-live-owner",Account:"fixture-account",Generation:"33333333-3333-4333-8333-333333333333",Purpose:service.GatewayOAuthBundlePurpose}
+ opaque:=func()string{ raw:=make([]byte,24); if _,err:=rand.Read(raw);err!=nil{t.Fatal(err)}; return hex.EncodeToString(raw) }
+ legacy:=service.GatewayNativeOAuthBundle{AccessToken:opaque(),RefreshToken:opaque(),IDToken:opaque(),SensitiveMetadata:json.RawMessage(`{"expires_in":3600}`)}
+ legacyEnvelope,err:=custody.SealOAuthBundle(scope,legacy)
+ if err!=nil {t.Fatal(err)}
+ rows.refreshResolution=service.GatewayNativeOAuthRefreshResolution{AccountID:1,CreatedAt:time.Now().Truncate(time.Microsecond),Version:1,Envelope:legacyEnvelope}
+ refresh,err:=service.NewGatewayNativeOAuthRefresh(rows,custody,verifier,provider)
+ if err!=nil {t.Fatal(err)}
+ mode := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners,refresh:refresh}
 	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, mode))
 	defer server.Close()
 	defer func() { _ = transport.Stop(context.Background()) }()
@@ -1165,7 +1175,31 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		raw, _ := io.ReadAll(response.Body)
 		return response.StatusCode, raw
 	}
-	path := "/private/native/v1/oauth/connect"
+	refreshPath:="/private/native/v1/oauth/refresh"
+ for _,role:=range []string{"execution","cleanup","missing"} {
+  status,_:=post(refreshPath,input,role)
+  if status!=403 {t.Fatal("non-management maintenance",role,status)}
+ }
+ for _,body:=range []string{
+  strings.Replace(input,`"operation":`,`"Operation":`,1),
+  strings.TrimSuffix(input,"}")+`,"version":1}`,
+  strings.TrimSuffix(input,"}")+`,"operation":"duplicate"}`,
+  strings.Replace(input,`"owner_ref":"fixture-live-owner",`,"",1),
+ } {
+  status,_:=post(refreshPath,body,"management")
+  if status!=400 {t.Fatal("refresh accepted expanded/ambiguous selectors",status)}
+ }
+ refreshStatus,refreshRaw:=post(refreshPath,input,"management")
+ if refreshStatus!=200 {t.Fatal("opt-in maintenance route absent",refreshStatus)}
+ var safe map[string]json.RawMessage
+ if json.Unmarshal(refreshRaw,&safe)!=nil || len(safe)!=3 || string(safe["state"])!=`"idle"` ||
+ string(safe["operation"])!=`"original-mount-operation"` || string(safe["account_ref"])!=`"fixture-account"` {t.Fatal("refresh exposed nonfinite reply")}
+ if tokenEntries.Load()!=0 {t.Fatal("unqualified legacy timing entered provider")}
+ owners.live=false
+ refreshStatus,_=post(refreshPath,input,"management")
+ if refreshStatus!=403 {t.Fatal("revoked live refresh owner retained authority",refreshStatus)}
+ owners.live=true
+ path := "/private/native/v1/oauth/connect"
 	for _, role := range []string{"execution", "cleanup", "missing"} {
 		status, _ := post(path, input, role)
 		if status != 403 {
@@ -1249,4 +1283,13 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if response.StatusCode != 400 {
 		t.Fatal("legacy callback exception opened")
 	}
+}
+
+func (s *oauthMountOwner) AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string,error) {
+ return s.AuthorizeNativeOAuthOwner(ctx,consumer,operation,account,generation)
+}
+
+func (s *oauthMountRows) ResolveGatewayNativeOAuthRefresh(ctx context.Context,scope service.GatewayNativeCredentialScope,operation string)(service.GatewayNativeOAuthRefreshResolution,error){
+ if !service.GatewayNativeOAuthScopeAuthorized(ctx,scope) || operation!="original-mount-operation" { return service.GatewayNativeOAuthRefreshResolution{},ErrDenied }
+ return s.refreshResolution,nil
 }

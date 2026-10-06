@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/tls"
+ "crypto/sha256"
+ "encoding/hex"
 	"encoding/json"
 	"io"
 	"math"
@@ -132,7 +134,8 @@ func (s *GatewayNativeOAuthRefresh) exchange(ctx context.Context, refresh, issue
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	response, err := s.client.Do(req)
+	started := time.Now()
+ response, err := s.client.Do(req)
 	if err != nil {
 		return deny()
 	}
@@ -145,12 +148,13 @@ func (s *GatewayNativeOAuthRefresh) exchange(ctx context.Context, refresh, issue
 	if err != nil || !gatewayOAuthCanonical(fields, "access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope") {
 		return deny()
 	}
-	access, aok := gatewayOAuthString(fields, "access_token")
+	for name := range fields { if strings.EqualFold(name,gatewayOAuthTimingMember) { return deny() } }
+ access, aok := gatewayOAuthString(fields, "access_token")
 	nextRefresh, rok := gatewayOAuthString(fields, "refresh_token")
 	id, iok := gatewayOAuthString(fields, "id_token")
 	kind, kok := gatewayOAuthString(fields, "token_type")
-	_, expiresOK := gatewayOAuthSeconds(fields["expires_in"])
-	if !aok || !rok || !iok || !kok || !expiresOK || !strings.EqualFold(kind, "Bearer") {
+	seconds, expiresOK := gatewayOAuthSeconds(fields["expires_in"])
+	if !aok || !rok || !iok || !kok || !expiresOK || seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) || !strings.EqualFold(kind, "Bearer") {
 		return deny()
 	}
 	// This staging contract requires a returned refresh token. Omission is unknown
@@ -172,5 +176,68 @@ func (s *GatewayNativeOAuthRefresh) exchange(ctx context.Context, refresh, issue
 	if _, err = bundle.bytes(); err != nil {
 		return deny()
 	}
-	return bundle, nil
+	return gatewayOAuthTimedBundle(bundle, started, identity, s.custody)
+}
+
+// This projection is private to the engine; HTTP uses the separate finite reply.
+type GatewayNativeOAuthRefreshResolution struct {
+ AccountID int64
+ CreatedAt time.Time
+ Version int64
+ Envelope string
+ Attempt *GatewayNativeOAuthRefreshIntent
+ State string
+}
+type GatewayNativeOAuthRefreshResolver interface {
+ ResolveGatewayNativeOAuthRefresh(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthRefreshResolution, error)
+}
+type GatewayNativeOAuthMaintenanceOutcome struct {
+ Operation string `json:"operation"`
+ AccountRef string `json:"account_ref"`
+ State string `json:"state"`
+ RefreshRef string `json:"refresh_ref,omitempty"`
+}
+
+// Engine-only references use canonical immutable physical birth/scope/version.
+// JSON array framing prevents ambiguous concatenation; no credential bytes enter.
+func gatewayOAuthRotation(scope GatewayNativeCredentialScope, id int64, birth time.Time, version int64) GatewayNativeOAuthRefreshIntent {
+ raw, _ := json.Marshal([]any{scope.Consumer,scope.Owner,scope.Account,scope.Generation,scope.Purpose,id,birth.UTC().Format(time.RFC3339Nano),version})
+ reference := func(domain string) string {
+  digest := sha256.Sum256(append([]byte(domain+"\x00"),raw...))
+  return hex.EncodeToString(digest[:])
+ }
+ return GatewayNativeOAuthRefreshIntent{Scope:scope,AccountID:id,CreatedAt:birth,ExpectedVersion:version,
+ Operation:reference("account-gateway/native/oauth-rotation-operation/v1"),Intent:reference("account-gateway/native/oauth-rotation-intent/v1")}
+}
+
+// Maintain takes only the original connect selectors. It never qualifies a row,
+// exports custody, or accepts a caller-selected version/rotation operation.
+func (s *GatewayNativeOAuthRefresh) Maintain(ctx context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthMaintenanceOutcome,error) {
+ out := GatewayNativeOAuthMaintenanceOutcome{Operation:operation,AccountRef:scope.Account,State:"idle"}
+ if s==nil || !GatewayNativeOAuthScopeAuthorized(ctx,scope) || !GatewayNativeCredentialRefValid(operation) { return out,ErrGatewayNativeIdentity }
+ resolver, ok := s.repository.(GatewayNativeOAuthRefreshResolver)
+ if !ok { return out,ErrGatewayNativeIdentity }
+ current,err := resolver.ResolveGatewayNativeOAuthRefresh(ctx,scope,operation)
+ if err!=nil { return out,err }
+ // Every unresolved attempt is reconstructed before considering current expiry
+ // or version. ENTERED/UNKNOWN cannot re-enter, even while their deadline is live.
+ if current.Attempt!=nil && current.State!="completed" && current.State!="prepared" {
+  result,err := s.Refresh(ctx,*current.Attempt)
+  out.State=result.State; out.RefreshRef=current.Attempt.Operation
+  return out,err
+ }
+ previous,err := s.custody.openOAuthVersion(current.Envelope,scope,current.Version)
+ if err!=nil { return out,ErrGatewayNativeIdentity }
+ due,qualified := gatewayOAuthBundleDue(previous,time.Now(),s.custody)
+ if !qualified || !due {
+  if current.Attempt!=nil { out.State=current.State; out.RefreshRef=current.Attempt.Operation }
+  return out,nil
+ }
+ in := gatewayOAuthRotation(scope,current.AccountID,current.CreatedAt,current.Version)
+ // A completed ACK can be lost while a new caller knows no F2 reference.
+ // Current-version attempts, including legacy references, remain authoritative.
+ if current.Attempt!=nil && current.Attempt.ExpectedVersion==current.Version { in=*current.Attempt }
+ result,err := s.Refresh(ctx,in)
+ out.State=result.State; out.RefreshRef=in.Operation
+ return out,err
 }
