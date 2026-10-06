@@ -46,7 +46,9 @@ func NEWTESTRegistry(callback *httptest.Server, cap int) *Handler {
 			return nil
 		},
 		AuthorizeCleanup:   func(context.Context, string, Proof, CleanupLease) error { return nil },
-		AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return nil }}, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey), callback: callback.Client()}
+		AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return nil }},
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers),
+		entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey), callback: callback.Client()}
 }
 func NEWTESTReserve(t *testing.T, h *Handler, r Request) (*reservation, bool, error) {
 	t.Helper()

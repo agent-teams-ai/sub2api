@@ -44,6 +44,7 @@ type Config struct {
 	AcknowledgeOwnerClosure                    func(context.Context, string, Proof, Receipt) error
 	MaxEntries                                 int
 	CallbackTimeout, IOTimeout, CleanupTimeout time.Duration
+	ProviderReadIdle                           time.Duration
 	EnvelopeBytes, CallbackBytes               int64
 }
 
@@ -162,15 +163,28 @@ type Receipt struct {
 }
 
 type Handler struct {
-	cfg      Config
-	mu       sync.Mutex
-	entries  map[transportKey]*reservation
-	requests map[requestKey]transportKey
-	stopping bool
-	callback *http.Client
+	cfg        Config
+	mu         sync.Mutex
+	entries    map[transportKey]*reservation
+	requests   map[requestKey]transportKey
+	stopping   bool
+	callback   *http.Client
+	executions chan struct{}
+	controls   chan struct{}
 }
 
+// Local HTTP work bounds, not account occupancy or memory qualification. The
+// 32 execution handlers and 8 shared management/cleanup/owner handlers fit
+// within bootstrap's existing 128-connection listener. Retained registry
+// evidence has its independent MaxEntries bound and is never released here.
+const privateExecutionHandlers = 32
+const privateControlHandlers = 8
+
 func New(ctx context.Context, cfg Config) (*Handler, error) {
+	// Existing private I/O policy is the backward-compatible trusted default.
+	if cfg.ProviderReadIdle == 0 {
+		cfg.ProviderReadIdle = cfg.IOTimeout
+	}
 	p := cfg.Profile
 	u, err := url.Parse(cfg.CallbackOrigin)
 	if ctx == nil || err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || len(cfg.CallbackOrigin) > 2048 || u.Path != "" && u.Path != "/" ||
@@ -183,6 +197,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		p.ProviderTokenUpperBound < p.Tokens || p.ProviderTokenUpperBound > 10000000 ||
 		cfg.MaxEntries < 1 || cfg.MaxEntries > 10000 || cfg.EnvelopeBytes < 1 || cfg.EnvelopeBytes > 5<<20 || cfg.CallbackBytes < 1 || cfg.CallbackBytes > 262144 ||
 		cfg.CallbackTimeout <= 0 || cfg.CallbackTimeout > 30*time.Second || cfg.IOTimeout <= 0 || cfg.IOTimeout > 30*time.Second ||
+		cfg.ProviderReadIdle <= 0 || cfg.ProviderReadIdle > cfg.IOTimeout ||
 		cfg.CleanupTimeout <= 0 || cfg.CleanupTimeout > 30*time.Second || len(cfg.CallbackCredential) < 1 || len(cfg.CallbackCredential) > 2048 || !bearerToken.MatchString(cfg.CallbackCredential) {
 		return nil, errDenied
 	}
@@ -197,8 +212,9 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	}
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 16384,
 		DialContext: (&net.Dialer{Timeout: cfg.CallbackTimeout}).DialContext, TLSHandshakeTimeout: cfg.CallbackTimeout, ResponseHeaderTimeout: cfg.CallbackTimeout}
-	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 // Reserve before callback/claim. The secondary request identity prevents a new
