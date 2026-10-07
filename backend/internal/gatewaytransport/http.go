@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -101,7 +102,13 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	// The original writer implements deadlines even when the Gin writer does not
 	// implement Unwrap. Cancellation interrupts both a blocked write and read.
-	interrupt := func() { _ = controller.SetWriteDeadline(time.Now()); _ = controller.SetReadDeadline(time.Now()) }
+	var deadlineMu sync.Mutex
+	interrupt := func() {
+		deadlineMu.Lock()
+		defer deadlineMu.Unlock()
+		_ = controller.SetWriteDeadline(time.Now())
+		_ = controller.SetReadDeadline(time.Now())
+	}
 	e, first, err := h.reserve(peer.ConsumerID, input, ctx, cancel, interrupt)
 	if err != nil || !first {
 		// Do not interrupt the response writer for this duplicate's own receipt.
@@ -144,15 +151,28 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	c, _ := gin.CreateTestContext(raw)
-	c.Writer = &privateGinWriter{ResponseWriter: c.Writer, raw: raw}
-	c.Request = r.Clone(ctx)
-	// Deadline writes are bounded from the original approved request lifetime.
-	writeDeadline := time.Now().Add(h.cfg.IOTimeout)
-	if deadline.Before(writeDeadline) {
-		writeDeadline = deadline
+	// Renew each output operation, never the approved lifetime. Serialize with
+	// cancellation so a later renewal cannot undo its blocked-I/O interrupt.
+	renewWriteDeadline := func() error {
+		deadlineMu.Lock()
+		defer deadlineMu.Unlock()
+		if ctx.Err() != nil || e.life.Snapshot().Sealed {
+			return context.Canceled
+		}
+		writeDeadline := time.Now().Add(h.cfg.IOTimeout)
+		if deadline.Before(writeDeadline) {
+			writeDeadline = deadline
+		}
+		return controller.SetWriteDeadline(writeDeadline)
 	}
-	_ = controller.SetWriteDeadline(writeDeadline)
+	if renewWriteDeadline() != nil {
+		h.finishNoEntry(e)
+		h.seal(e)
+		return
+	}
+	c, _ := gin.CreateTestContext(raw)
+	c.Writer = &privateGinWriter{ResponseWriter: c.Writer, raw: raw, renewWriteDeadline: renewWriteDeadline}
+	c.Request = r.Clone(ctx)
 	raw.Header().Set("X-Gateway-Request-Ref", input.RequestRef)
 	_, _, _ = h.cfg.Gateway.ForwardGatewayRoute(ctx, c, input.Descriptor, payload)
 	// Service observation records forward return/physical Close and terminal
@@ -204,11 +224,23 @@ func writeReceipt(w http.ResponseWriter, r Receipt) {
 
 type privateGinWriter struct {
 	gin.ResponseWriter
-	raw http.ResponseWriter
+	raw                http.ResponseWriter
+	renewWriteDeadline func() error
 }
 
 func (w *privateGinWriter) Unwrap() http.ResponseWriter { return w.raw }
-func (w *privateGinWriter) FlushError() error           { return http.NewResponseController(w.raw).Flush() }
+func (w *privateGinWriter) Write(data []byte) (int, error) {
+	if err := w.renewWriteDeadline(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(data)
+}
+func (w *privateGinWriter) FlushError() error {
+	if err := w.renewWriteDeadline(); err != nil {
+		return err
+	}
+	return http.NewResponseController(w.raw).Flush()
+}
 
 // The persisted one-use callback capability is its sole authorization. It still
 // consumes the same eight management/cleanup slots, never execution capacity.
