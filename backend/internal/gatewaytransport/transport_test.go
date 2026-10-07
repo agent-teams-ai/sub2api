@@ -270,8 +270,12 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		func(r *Request) { r.Admission.ProfileID = service.GatewayMiMoResponsesProfile },
 		func(r *Request) { r.Descriptor.BaseURL = primary.BaseURL },
 		func(r *Request) { r.Descriptor.Model = primary.Model },
-		func(r *Request) { r.Payload = json.RawMessage(strings.Replace(string(r.Payload), service.GatewayOpenRouterModel, primary.Model, 1)) },
-		func(r *Request) { r.Payload = json.RawMessage(strings.TrimSuffix(string(r.Payload), "}") + `,"max_output_tokens":81}`) },
+		func(r *Request) {
+			r.Payload = json.RawMessage(strings.Replace(string(r.Payload), service.GatewayOpenRouterModel, primary.Model, 1))
+		},
+		func(r *Request) {
+			r.Payload = json.RawMessage(strings.TrimSuffix(string(r.Payload), "}") + `,"max_output_tokens":81}`)
+		},
 		func(r *Request) { r.Admission.Limits.Tokens = 41 },
 		func(r *Request) { r.Admission.Limits.RequestBytes = 2049 },
 		func(r *Request) { r.Admission.Limits.OutputBytes = 2049 },
@@ -354,7 +358,7 @@ func (b *ownerCloseFailure) Close() error {
 func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 	// Regression: partial provider output stalls forever despite server IdleTimeout;
 	// timeout is mistaken for completion or releases unknown occupied evidence.
-	for _, mode := range []string{"completed", "paused", "held", "closeFailed", "idle", "idleCloseFailed", "idleBlockedClose"} {
+	for _, mode := range []string{"completed", "paused", "steadyBeyondIO", "held", "closeFailed", "idle", "idleCloseFailed", "idleBlockedClose"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, acks atomic.Int32
 			closeGate := make(chan struct{})
@@ -373,7 +377,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				default:
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
-				if mode == "held" || strings.HasPrefix(mode, "idle") || mode == "paused" {
+				if mode == "held" || strings.HasPrefix(mode, "idle") || mode == "paused" || mode == "steadyBeyondIO" {
 					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
 				} else {
 					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
@@ -384,6 +388,23 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 					return
 				}
 				flusher.Flush()
+				if mode == "steadyBeyondIO" {
+					// Active Responses output lasts longer than one downstream I/O
+					// timeout, without exceeding the trusted expiry or read-idle.
+					for i := 0; i < 6; i++ {
+						select {
+						case <-time.After(250 * time.Millisecond):
+						case <-r.Context().Done():
+							return
+						}
+						if _, err := io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"); err != nil {
+							return
+						}
+						flusher.Flush()
+					}
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+					flusher.Flush()
+				}
 				if mode == "paused" {
 					// A legitimate reasoning pause longer than the old hardcoded
 					// second must survive the trusted two-second fixture policy.
@@ -489,6 +510,10 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 			if mode == "paused" {
 				cfg.ProviderReadIdle = 2 * time.Second
 			}
+			if mode == "steadyBeyondIO" {
+				cfg.IOTimeout = time.Second
+				cfg.ProviderReadIdle = 750 * time.Millisecond
+			}
 			h, err := New(context.Background(), cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -591,8 +616,11 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 			}
 			select {
 			case result := <-done:
-				if (mode == "completed" || mode == "paused") && (result.err != nil || result.code != 200) {
+				if (mode == "completed" || mode == "paused" || mode == "steadyBeyondIO") && (result.err != nil || result.code != 200) {
 					t.Fatal("actual completed stream failed", result.code, result.err)
+				}
+				if mode == "steadyBeyondIO" && (result.duration <= cfg.IOTimeout || !bytes.Contains(result.body, []byte("response.completed"))) {
+					t.Fatal("active stream failed to deliver completion beyond one I/O timeout", result.duration)
 				}
 				if strings.HasPrefix(mode, "idle") && bytes.Contains(result.body, []byte("response.completed")) {
 					t.Fatal("read-idle delivered a false completed event")
@@ -647,7 +675,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				if code != 202 || !receipt.Acknowledged || receipt.Phase != "closed" || acks.Load() != 1 {
 					t.Fatal("original closed proof not acknowledged")
 				}
-				if (mode == "completed" || mode == "paused") && (receipt.Effect != "completed" || !receipt.Lifetime.Completed) {
+				if (mode == "completed" || mode == "paused" || mode == "steadyBeyondIO") && (receipt.Effect != "completed" || !receipt.Lifetime.Completed) {
 					t.Fatal("completed native outcome lost")
 				}
 				if code, _ := call("/ack-owner", fixtureExecutionToken, request); code != 202 {
@@ -1138,14 +1166,14 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			}))
 			defer callback.Close()
 			cfg := Config{Gateway: gateway, Custody: custody, OAuth: oauth, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, "fixture-qualification"},
-				Profile: QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "fixture-model", BaseURL: "https://fixture.invalid", QualificationRef: "fixture-qualification", RequestBytes: 2048, OutputBytes: 3072, Tokens: 50, ProviderTokenUpperBound: 80},
-				Codex: &QualifiedProfile{Profile: service.GatewayCodexOAuthResponsesProfile, Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL, QualificationRef: "codex-fixture-qualification", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200},
+				Profile:    QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "fixture-model", BaseURL: "https://fixture.invalid", QualificationRef: "fixture-qualification", RequestBytes: 2048, OutputBytes: 3072, Tokens: 50, ProviderTokenUpperBound: 80},
+				Codex:      &QualifiedProfile{Profile: service.GatewayCodexOAuthResponsesProfile, Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL, QualificationRef: "codex-fixture-qualification", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200},
 				MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken, CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, CleanupTimeout: time.Second, Authorize: func(r *http.Request) (Peer, error) {
-				if r.Header.Get("Authorization") != "Bearer "+fixtureExecutionToken {
-					return Peer{}, errDenied
-				}
-				return Peer{"fixture-consumer", "execution"}, nil
-			}, VerifyEnrollment: func(context.Context, Enrollment) error { return nil }, VerifyDispatch: func(context.Context, string, Proof, time.Time) error { return nil }, AuthorizeCleanup: func(context.Context, string, Proof, CleanupLease) error { return errDenied }, AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied }}
+					if r.Header.Get("Authorization") != "Bearer "+fixtureExecutionToken {
+						return Peer{}, errDenied
+					}
+					return Peer{"fixture-consumer", "execution"}, nil
+				}, VerifyEnrollment: func(context.Context, Enrollment) error { return nil }, VerifyDispatch: func(context.Context, string, Proof, time.Time) error { return nil }, AuthorizeCleanup: func(context.Context, string, Proof, CleanupLease) error { return errDenied }, AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied }}
 			for _, bad := range []QualifiedProfile{{Profile: "arbitrary-profile", Model: service.GatewayCodexOAuthModel, BaseURL: service.GatewayCodexOAuthBaseURL}, {Profile: service.GatewayCodexOAuthResponsesProfile, Model: "wrong-model", BaseURL: service.GatewayCodexOAuthBaseURL}, {Profile: service.GatewayCodexOAuthResponsesProfile, Model: service.GatewayCodexOAuthModel, BaseURL: "https://caller.invalid"}} {
 				wrong := cfg
 				wrong.Codex = &bad
