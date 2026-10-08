@@ -593,7 +593,10 @@ func TestSanitizeOpenAIResponsesToolParameterTypes_RewriteCountIndependentOfHits
 	// so goroutines left by other service tests cannot contaminate its sample.
 	const childMarker = "RR_TOOL_SCHEMA_ALLOCATION_TEST_CHILD"
 	if os.Getenv(childMarker) != "1" {
-		child := exec.Command(os.Args[0],
+		// Resolve the running test binary instead of trusting caller-supplied argv[0].
+		executable, err := os.Executable()
+		require.NoError(t, err)
+		child := exec.Command(executable,
 			"-test.run=^TestSanitizeOpenAIResponsesToolParameterTypes_RewriteCountIndependentOfHits$",
 			"-test.count=1", "-test.timeout=30s")
 		child.Env = append(os.Environ(), childMarker+"=1")
