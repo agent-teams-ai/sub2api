@@ -19,12 +19,13 @@ import (
 // Engine credential version is independent of immutable birth generation and
 // owner authorizationEpoch. This component has no inference/activation route.
 type GatewayNativeOAuthRefreshIntent struct {
-	Scope           GatewayNativeCredentialScope
-	AccountID       int64
-	CreatedAt       time.Time
-	ExpectedVersion int64
-	Operation       string
-	Intent          string
+	Scope            GatewayNativeCredentialScope
+	AccountID        int64
+	CreatedAt        time.Time
+	ExpectedVersion  int64
+	Operation        string
+	Intent           string
+	ConnectOperation string
 }
 
 func (in GatewayNativeOAuthRefreshIntent) Authorized(ctx context.Context) bool {
@@ -57,10 +58,11 @@ type GatewayNativeOAuthRefreshRepository interface {
 	UnknownGatewayNativeOAuthRefresh(context.Context, GatewayNativeOAuthRefreshIntent, int64) error
 }
 type GatewayNativeOAuthRefresh struct {
-	repository GatewayNativeOAuthRefreshRepository
-	custody    *GatewayNativeCredentialCustody
-	verifier   *GatewayNativeOAuthVerifier
-	client     *http.Client
+	repository     GatewayNativeOAuthRefreshRepository
+	custody        *GatewayNativeCredentialCustody
+	verifier       *GatewayNativeOAuthVerifier
+	client         *http.Client
+	authorizeEntry GatewayNativeOAuthEntryAuthorizer
 }
 
 func NewGatewayNativeOAuthRefresh(r GatewayNativeOAuthRefreshRepository, c *GatewayNativeCredentialCustody, v *GatewayNativeOAuthVerifier, transport http.RoundTripper) (*GatewayNativeOAuthRefresh, error) {
@@ -93,6 +95,9 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	if err != nil {
 		return unknown()
 	} // invalid AEAD makes zero token/JWKS calls
+	if ctx.Err() != nil || (s.authorizeEntry != nil && s.authorizeEntry(ctx, in.Scope, in.ConnectOperation) != nil) {
+		return unknown()
+	}
 	entered, err := s.repository.EnterGatewayNativeOAuthRefresh(ctx, in, prepared.Fence)
 	if err != nil {
 		return unknown()
@@ -102,6 +107,9 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	}
 	callCtx, cancel := context.WithDeadline(ctx, prepared.Deadline)
 	defer cancel()
+	if callCtx.Err() != nil {
+		return unknown()
+	}
 	next, err := s.exchange(callCtx, previous.RefreshToken, prepared.Issuer, prepared.Subject)
 	if err != nil {
 		return unknown()
@@ -232,7 +240,9 @@ func (s *GatewayNativeOAuthRefresh) Maintain(ctx context.Context, scope GatewayN
 	// Every unresolved attempt is reconstructed before considering current expiry
 	// or version. ENTERED/UNKNOWN cannot re-enter, even while their deadline is live.
 	if current.Attempt != nil && current.State != "completed" && current.State != "prepared" {
-		result, err := s.Refresh(ctx, *current.Attempt)
+		attempt := *current.Attempt
+		attempt.ConnectOperation = operation
+		result, err := s.Refresh(ctx, attempt)
 		out.State = result.State
 		out.RefreshRef = current.Attempt.Operation
 		return out, err
@@ -255,8 +265,17 @@ func (s *GatewayNativeOAuthRefresh) Maintain(ctx context.Context, scope GatewayN
 	if current.Attempt != nil && current.Attempt.ExpectedVersion == current.Version {
 		in = *current.Attempt
 	}
+	in.ConnectOperation = operation
 	result, err := s.Refresh(ctx, in)
 	out.State = result.State
 	out.RefreshRef = in.Operation
 	return out, err
+}
+
+func (s *GatewayNativeOAuthRefresh) SetEntryAuthorizer(authorize GatewayNativeOAuthEntryAuthorizer) error {
+	if s == nil || authorize == nil {
+		return ErrGatewayNativeIdentity
+	}
+	s.authorizeEntry = authorize
+	return nil
 }

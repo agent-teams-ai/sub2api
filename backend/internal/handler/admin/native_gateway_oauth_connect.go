@@ -177,3 +177,76 @@ func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *ser
 	})
 	return nil
 }
+
+// Cleanup has its own purpose/role authorization, never connect owner policy.
+func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect *service.GatewayNativeOAuthConnect, authorize gin.HandlerFunc, authority service.GatewayNativeOAuthCleanupAuthorizer) error {
+	if group == nil || group.BasePath() != "/" || connect == nil || authorize == nil || authority == nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST("/private/native/v1/oauth/connect/cleanup", authorize, func(c *gin.Context) {
+		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_cleanup_unavailable"}) }
+		c.Header("Cache-Control", "no-store")
+		if c.Request.URL.RawQuery != "" {
+			fail()
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 4097))
+		if err != nil || len(raw) > 4096 || !utf8.Valid(raw) {
+			fail()
+			return
+		}
+		d := json.NewDecoder(bytes.NewReader(raw))
+		tok, err := d.Token()
+		if err != nil || tok != json.Delim('{') {
+			fail()
+			return
+		}
+		fields := map[string]string{}
+		for d.More() {
+			tok, err = d.Token()
+			name, ok := tok.(string)
+			if err != nil || !ok {
+				fail()
+				return
+			}
+			if _, duplicate := fields[name]; duplicate {
+				fail()
+				return
+			}
+			switch name {
+			case "operation", "owner_ref", "account_ref", "generation", "cleanup_ref", "cleanup_token", "action":
+			default:
+				fail()
+				return
+			}
+			var value string
+			if d.Decode(&value) != nil || !service.GatewayNativeCredentialRefValid(value) {
+				fail()
+				return
+			}
+			fields[name] = value
+		}
+		tok, err = d.Token()
+		if err != nil || tok != json.Delim('}') || len(fields) != 7 {
+			fail()
+			return
+		}
+		if _, err = d.Token(); err != io.EOF {
+			fail()
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail()
+			return
+		}
+		in := service.GatewayNativeOAuthCleanupRequest{Scope: service.GatewayNativeCredentialScope{Consumer: consumer, Owner: fields["owner_ref"], Account: fields["account_ref"], Generation: fields["generation"], Purpose: service.GatewayOAuthBundlePurpose}, Operation: fields["operation"], Action: fields["action"], CleanupRef: fields["cleanup_ref"], CleanupToken: fields["cleanup_token"]}
+		out, err := connect.Cleanup(c.Request.Context(), in, authority)
+		if err != nil {
+			fail()
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	})
+	return nil
+}

@@ -878,6 +878,26 @@ func TestGatewayNativeIngressHeldBodiesReserveControlAndReleaseOnAbort(t *testin
 	if resp.StatusCode != 503 {
 		t.Fatal("management did not share the bounded reserved control budget")
 	}
+	// Failure: the new OAuth cleanup mount could allocate separate unlimited
+	// control capacity, or accept management/execution role as cleanup authority.
+	cleanup := httptest.NewServer(h.CleanupHandler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("saturated OAuth cleanup entered handler") })))
+	defer cleanup.Close()
+	for _, tc := range []struct {
+		token string
+		want  int
+	}{{fixtureCleanupToken, 503}, {fixtureExecutionToken, 403}, {gatewayIngressGuardFixture1, 403}} {
+		req, _ := http.NewRequest("POST", cleanup.URL, strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+tc.token)
+		response, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != tc.want {
+			t.Fatalf("cleanup purpose/control budget status %d, want %d", response.StatusCode, tc.want)
+		}
+	}
+
 	_ = held[0].Close()
 	by := time.Now().Add(2 * time.Second)
 	for {

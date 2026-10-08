@@ -63,6 +63,20 @@ jobs:
           go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeReviewReasoningHTTPRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis.log
           test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningHTTPRedis /p' /tmp/native-redis.log | wc -l)" -eq 1
 
+      - name: OAuth joined descriptor wire and PostgreSQL connect lifecycle
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_OAUTH_CONNECT_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_oauth_connect_test_ci?sslmode=disable
+        run: |
+          set -o pipefail
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_oauth_connect_test_ci
+          go test -tags unit ./internal/handler/admin -run '^TestGatewayOAuthDescriptorHTTPJoinedSuccessWire$' -count=1 -v | tee "$RUNNER_TEMP/native-oauth-joined-wire.log"
+          test "$(grep -c '^--- PASS: TestGatewayOAuthDescriptorHTTPJoinedSuccessWire ' "$RUNNER_TEMP/native-oauth-joined-wire.log")" -eq 1
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-joined-wire.log"
+          go test -tags unit ./internal/repository -run '^TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-oauth-connect-pg.log"
+          test "$(grep -c '^--- PASS: TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart ' "$RUNNER_TEMP/native-oauth-connect-pg.log")" -eq 1
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-connect-pg.log"
+
       - name: Encrypted native custody and actual backup restore
         working-directory: backend
         env:

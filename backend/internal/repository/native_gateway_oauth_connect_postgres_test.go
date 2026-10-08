@@ -299,6 +299,154 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	_, err = restarted.CompleteCallback(ctx, state, "another-code")
 	require.NoError(t, err)
 	require.Equal(t, int32(1), exchanges.Load())
+
+	// Failure: actual accepted custody can be unknown to the consumer after a
+	// lost mapping ACK; unbound cleanup must discover the same birth without
+	// deleting it, then a fresh mapped lease can erase it idempotently.
+	t.Run("purpose cleanup discovers unbound custody and retains birth", func(t *testing.T) {
+		in := service.GatewayNativeOAuthCleanupRequest{Scope: scope, Operation: "f3-operation", Action: "read", CleanupRef: "cleanup-ref", CleanupToken: "current-token"}
+		var mapped *service.GatewayNativeRoute
+		var callbacks int
+		authority := func(_ context.Context, got service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			callbacks++
+			require.Equal(t, in, got)
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: scope.Owner, LeaseExpiresAt: time.Now().Add(time.Second), Native: mapped}, nil
+		}
+		read, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.NotNil(t, read.Native)
+		require.Equal(t, original.AccountID, read.Native.AccountID)
+		require.Equal(t, "f3-operation", read.Operation)
+		require.Equal(t, scope.Account, read.Account)
+		require.False(t, read.CredentialsErased)
+		require.Equal(t, "pending", read.Closure)
+		originalBirth := *read.Native
+		in.Action = "erase"
+		unbound, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, &originalBirth, unbound.Native)
+		require.False(t, unbound.CredentialsErased)
+		var custodyPresent bool
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT deleted_at IS NULL AND credentials ? 'oauth_bundle' FROM accounts WHERE id=$1`, original.AccountID).Scan(&custodyPresent))
+		require.True(t, custodyPresent)
+		mapped = &originalBirth
+		// Post-lock callback denial cannot produce a mutation or closed receipt.
+		checks := 0
+		_, err = restarted.Cleanup(owner, in, func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			checks++
+			if checks > 1 {
+				return service.GatewayNativeOAuthCleanupAuthority{}, service.ErrGatewayNativeIdentity
+			}
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: scope.Owner, LeaseExpiresAt: time.Now().Add(time.Second), Native: mapped}, nil
+		})
+		require.Error(t, err)
+		require.Equal(t, 2, checks)
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT deleted_at IS NULL AND credentials ? 'oauth_bundle' FROM accounts WHERE id=$1`, original.AccountID).Scan(&custodyPresent))
+		require.True(t, custodyPresent)
+
+		// Failure: a short cleanup lease may expire while the account lock is held.
+		// Cancellation must release the waiter without any ciphertext mutation.
+		lock, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		var locked int64
+		require.NoError(t, lock.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, original.AccountID).Scan(&locked))
+		lease := time.Now().Add(100 * time.Millisecond)
+		authorized := make(chan struct{}, 1)
+		finished := make(chan error, 1)
+		go func() {
+			_, cleanupErr := restarted.Cleanup(owner, in, func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+				select {
+				case authorized <- struct{}{}:
+				default:
+				}
+				return service.GatewayNativeOAuthCleanupAuthority{Owner: scope.Owner, LeaseExpiresAt: lease, Native: mapped}, nil
+			})
+			finished <- cleanupErr
+		}()
+		select {
+		case <-authorized:
+		case <-ctx.Done():
+			t.Fatal("cleanup authority did not enter")
+		}
+		select {
+		case cleanupErr := <-finished:
+			require.Error(t, cleanupErr)
+		case <-time.After(time.Second):
+			t.Fatal("cleanup exceeded exact lease while waiting for account lock")
+		}
+		require.NoError(t, lock.Commit())
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT deleted_at IS NULL AND credentials ? 'oauth_bundle' FROM accounts WHERE id=$1`, original.AccountID).Scan(&custodyPresent))
+		require.True(t, custodyPresent)
+		refreshRepo, ok := f1.(service.GatewayNativeOAuthRefreshRepository)
+		require.True(t, ok)
+		rotation := service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: originalBirth.AccountID, CreatedAt: originalBirth.CreatedAt, ExpectedVersion: 1, Operation: "prepared-before-cleanup", Intent: "rotation-intent"}
+
+		// A short accepted fixture deadline exercises the real migration244 fence
+		// without waiting the production15s TTL. This INSERT is fixture setup only.
+		_, err = db.ExecContext(ctx, `INSERT INTO gateway_oauth_refresh_attempts(account_id,native_created_at,consumer,owner_ref,account_ref,generation,operation_ref,intent_ref,expected_version,fence,state,deadline) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,1,'prepared',clock_timestamp()+interval '1 second')`, rotation.AccountID, rotation.CreatedAt, scope.Consumer, scope.Owner, scope.Account, scope.Generation, rotation.Operation, rotation.Intent)
+		require.NoError(t, err)
+		preparedRefresh, err := refreshRepo.PrepareGatewayNativeOAuthRefresh(owner, rotation)
+		require.NoError(t, err)
+		require.False(t, preparedRefresh.Claimed)
+		// Owner/decrypt/Enter denial before a committed entry preserves prepared.
+		require.NoError(t, refreshRepo.UnknownGatewayNativeOAuthRefresh(owner, rotation, preparedRefresh.Fence))
+		var attemptState string
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT state FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2`, scope.Consumer, rotation.Operation).Scan(&attemptState))
+		require.Equal(t, "prepared", attemptState)
+		erased, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.True(t, erased.CredentialsErased)
+		require.Equal(t, "closed", erased.Closure)
+		require.Equal(t, &originalBirth, erased.Native)
+		// A stale worker failure cannot degrade prepared+tombstone NoEffect proof.
+		require.NoError(t, refreshRepo.UnknownGatewayNativeOAuthRefresh(owner, rotation, preparedRefresh.Fence))
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT state FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2`, scope.Consumer, rotation.Operation).Scan(&attemptState))
+		require.Equal(t, "prepared", attemptState)
+		entered, err := refreshRepo.EnterGatewayNativeOAuthRefresh(owner, rotation, preparedRefresh.Fence)
+		require.Error(t, err)
+		require.False(t, entered)
+		_, err = refreshRepo.CompleteGatewayNativeOAuthRefresh(owner, rotation, preparedRefresh.Fence, preparedRefresh.Envelope)
+		require.Error(t, err)
+		wrongFence := preparedRefresh.Fence + 1
+		require.Error(t, refreshRepo.UnknownGatewayNativeOAuthRefresh(owner, rotation, wrongFence))
+
+		replay, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, erased, replay)
+		in.Action = "read"
+		retained, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, erased, retained)
+		require.GreaterOrEqual(t, callbacks, 7)
+		saved, err := restartedRepo.ReadConnectIntent(owner, scope, "f3-operation")
+		require.NoError(t, err)
+		require.Equal(t, completed, saved)
+		var reservations int
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_identity_reservations WHERE consumer=$1 AND operation_ref=$2 AND account_id=$3`, scope.Consumer, prepared.EnrollmentOperation, original.AccountID).Scan(&reservations))
+		require.Equal(t, 1, reservations)
+
+		// Expired prepared cannot reclaim a deleted birth or change its fence, and
+		// stale failure handling cannot destroy the retained no-entry evidence.
+		timer := time.NewTimer(time.Until(preparedRefresh.Deadline))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			t.Fatal("short prepared expiry interrupted")
+		}
+		_, err = refreshRepo.PrepareGatewayNativeOAuthRefresh(owner, rotation)
+		require.Error(t, err)
+		var retainedFence int64
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT state,fence FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2`, scope.Consumer, rotation.Operation).Scan(&attemptState, &retainedFence))
+		require.Equal(t, "prepared", attemptState)
+		require.Equal(t, preparedRefresh.Fence, retainedFence)
+		in.Action = "read"
+		expiredRead, err := restarted.Cleanup(owner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, "closed", expiredRead.Closure)
+		require.True(t, expiredRead.CredentialsErased)
+		require.Equal(t, int32(1), exchanges.Load())
+	})
 	// Completed readback survives later safe F1 erasure without changing outcome.
 	require.NoError(t, f1.EraseGatewayNativeOAuth(owner, scope, prepared.EnrollmentOperation))
 	afterErase, err := restarted.ReadConnect(owner, scope, "f3-operation")
@@ -335,6 +483,140 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	require.Equal(t, 2, entries)
 	require.NotEqual(t, prepared.StateHash, evidence.StateHash)
 
+	// Failure: sealing an entered unknown intent could discard provider ambiguity,
+	// rewrite an immutable replay tombstone or allow late Stage to acquire custody.
+	t.Run("entered unknown cleanup seals without fake closure", func(t *testing.T) {
+		in := service.GatewayNativeOAuthCleanupRequest{Scope: unknownScope, Operation: "crash-operation", Action: "erase", CleanupRef: "crash-cleanup", CleanupToken: "current-token"}
+		authority := func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: unknownScope.Owner, LeaseExpiresAt: time.Now().Add(time.Second)}, nil
+		}
+		sealed, err := restarted.Cleanup(unknownOwner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, "unknown", sealed.Closure)
+		require.True(t, sealed.CredentialsErased)
+		require.Nil(t, sealed.Native)
+		saved, err := restartedRepo.ReadConnectIntent(unknownOwner, unknownScope, "crash-operation")
+		require.NoError(t, err)
+		require.True(t, saved.RecoveryDenied)
+		require.Empty(t, saved.Envelope)
+		repeat, err := restarted.Cleanup(unknownOwner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, sealed, repeat)
+		retained, err := restartedRepo.ReadConnectIntent(unknownOwner, unknownScope, "crash-operation")
+		require.NoError(t, err)
+		require.Equal(t, saved, retained)
+		_, err = restartedRepo.BindConnectEnrollment(unknownOwner, saved, strings.Repeat("a", 64))
+		require.Error(t, err)
+	})
+
+	// Failure: a committed refresh Enter may lose its ACK; erasure must fence
+	// publication while retaining unknown effect and the exact physical birth.
+	t.Run("entered refresh cleanup never claims closure or republishes", func(t *testing.T) {
+		enteredOwner, enteredScope := oauthPGScope(t, "entered-cleanup-consumer", "entered-cleanup-owner", "entered-cleanup-account")
+		_, err := restarted.BeginConnect(enteredOwner, enteredScope, "entered-cleanup-operation")
+		require.NoError(t, err)
+		intent, err := restartedRepo.ReadConnectIntent(enteredOwner, enteredScope, "entered-cleanup-operation")
+		require.NoError(t, err)
+		won, err := restartedRepo.EnterConnect(enteredOwner, intent)
+		require.NoError(t, err)
+		require.True(t, won)
+		binding := &oauthRefreshConnectBinding{GatewayNativeOAuthRepository: f1, journal: restartedRepo, intent: intent}
+		bound, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, binding, key)
+		require.NoError(t, err)
+		native, err := bound.Stage(enteredOwner, enteredScope, intent.EnrollmentOperation, bundleFor("entered-cleanup-principal"))
+		require.NoError(t, err)
+		_, err = restartedRepo.FinishConnect(enteredOwner, binding.intent, "completed", native)
+		require.NoError(t, err)
+		request := service.GatewayNativeOAuthCleanupRequest{Scope: enteredScope, Operation: intent.Operation, Action: "read", CleanupRef: "entered-cleanup", CleanupToken: "current-token"}
+		var mapped *service.GatewayNativeRoute
+		authority := func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: enteredScope.Owner, LeaseExpiresAt: time.Now().Add(time.Second), Native: mapped}, nil
+		}
+		read, err := restarted.Cleanup(enteredOwner, request, authority)
+		require.NoError(t, err)
+		require.NotNil(t, read.Native)
+		mapped = read.Native
+		refreshRepo, ok := f1.(service.GatewayNativeOAuthRefreshRepository)
+		require.True(t, ok)
+		rotation := service.GatewayNativeOAuthRefreshIntent{Scope: enteredScope, AccountID: mapped.AccountID, CreatedAt: mapped.CreatedAt, ExpectedVersion: 1, Operation: "lost-enter-ack", Intent: "rotation-intent"}
+		prepared, err := refreshRepo.PrepareGatewayNativeOAuthRefresh(enteredOwner, rotation)
+		require.NoError(t, err)
+		entered, err := refreshRepo.EnterGatewayNativeOAuthRefresh(enteredOwner, rotation, prepared.Fence)
+		require.NoError(t, err)
+		require.True(t, entered)
+		request.Action = "erase"
+		erased, err := restarted.Cleanup(enteredOwner, request, authority)
+		require.NoError(t, err)
+		require.True(t, erased.CredentialsErased)
+		require.Equal(t, "unknown", erased.Closure)
+		require.Equal(t, mapped, erased.Native)
+		require.NoError(t, refreshRepo.UnknownGatewayNativeOAuthRefresh(enteredOwner, rotation, prepared.Fence))
+		replay, err := restarted.Cleanup(enteredOwner, request, authority)
+		require.NoError(t, err)
+		require.Equal(t, erased, replay)
+		_, err = refreshRepo.CompleteGatewayNativeOAuthRefresh(enteredOwner, rotation, prepared.Fence, prepared.Envelope)
+		require.Error(t, err)
+		entered, err = refreshRepo.EnterGatewayNativeOAuthRefresh(enteredOwner, rotation, prepared.Fence)
+		require.Error(t, err)
+		require.False(t, entered)
+		var retainedState string
+		var erasedBirth bool
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT f.state,a.credentials='{}'::jsonb AND a.deleted_at IS NOT NULL FROM gateway_oauth_refresh_attempts f JOIN accounts a ON a.id=f.account_id WHERE f.consumer=$1 AND f.operation_ref=$2`, enteredScope.Consumer, rotation.Operation).Scan(&retainedState, &erasedBirth))
+		require.Equal(t, "unknown", retainedState)
+		require.True(t, erasedBirth)
+		require.Equal(t, int32(1), exchanges.Load())
+	})
+	// Failure: early prepared cancellation violates immutable TTL and could forge
+	// NoEffect. Real expiry is positive no-entry; no polling/sleep is necessary.
+	t.Run("prepared cleanup preserves TTL then proves real expiry", func(t *testing.T) {
+		expiredOwner, expiredScope := oauthPGScope(t, "expiry-cleanup-consumer", "expiry-cleanup-owner", "expiry-cleanup-account")
+		_, err := restarted.BeginConnect(expiredOwner, expiredScope, "expiry-cleanup-operation")
+		require.NoError(t, err)
+		live, err := restartedRepo.ReadConnectIntent(expiredOwner, expiredScope, "expiry-cleanup-operation")
+		require.NoError(t, err)
+		in := service.GatewayNativeOAuthCleanupRequest{Scope: expiredScope, Operation: live.Operation, Action: "erase", CleanupRef: "expiry-cleanup", CleanupToken: "current-token"}
+		authority := func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: expiredScope.Owner, LeaseExpiresAt: time.Now().Add(time.Second)}, nil
+		}
+		pending, err := restarted.Cleanup(expiredOwner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, "pending", pending.Closure)
+		require.False(t, pending.CredentialsErased)
+		saved, err := restartedRepo.ReadConnectIntent(expiredOwner, expiredScope, live.Operation)
+		require.NoError(t, err)
+		require.Equal(t, live, saved)
+		// The existing fixture may INSERT a fresh shorter deadline under migration
+		// 245; it must never UPDATE an already accepted prepared deadline.
+		expiredOperation := "short-expiry-operation"
+		short := live
+		short.Operation = expiredOperation
+		short.EnrollmentOperation = "connect-" + uuid.NewString()
+		short.StateHash = strings.Repeat("b", 64)
+		short.Deadline = time.Now().UTC().Truncate(time.Microsecond).Add(time.Second)
+		_, err = restartedRepo.PrepareConnect(expiredOwner, short)
+		require.NoError(t, err)
+		// Wait only the accepted short test TTL, never poll inside the handler.
+		timer := time.NewTimer(time.Until(short.Deadline))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			t.Fatal("fixture expiry deadline interrupted")
+		}
+		in.Operation = expiredOperation
+		closed, err := restarted.Cleanup(expiredOwner, in, authority)
+		require.NoError(t, err)
+		require.Equal(t, "closed", closed.Closure)
+		require.True(t, closed.CredentialsErased)
+		require.Nil(t, closed.Native)
+		after, err := restartedRepo.ReadConnectIntent(expiredOwner, expiredScope, expiredOperation)
+		require.NoError(t, err)
+		require.Equal(t, "expired", after.State)
+		require.Empty(t, after.Envelope)
+		won, err := restartedRepo.EnterConnect(expiredOwner, after)
+		require.NoError(t, err)
+		require.False(t, won)
+	})
 	// Real F1 A exists under the same caller operation/scope. F3 B exchanges
 	// once and hits the actual principal/generation conflict; A is never B's ACK.
 	priorOwner, priorScope := oauthPGScope(t, "prior-consumer", "prior-owner", "prior-logical")

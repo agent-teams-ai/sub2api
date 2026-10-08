@@ -186,9 +186,17 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 // owner read/cancel/ack. Authentication precedes admission and body buffering;
 // the existing management router still establishes protected consumer scope.
 func (h *Handler) ManagementHandler(next http.Handler) http.Handler {
+	return h.controlHandler("management", next)
+}
+
+// OAuth cleanup shares the reserved controls but accepts only cleanup peers.
+func (h *Handler) CleanupHandler(next http.Handler) http.Handler {
+	return h.controlHandler("cleanup", next)
+}
+func (h *Handler) controlHandler(role string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		peer, err := h.cfg.Authorize(r)
-		if err != nil || peer.Role != "management" || !identifier.MatchString(peer.ConsumerID) {
+		if err != nil || peer.Role != role || !identifier.MatchString(peer.ConsumerID) {
 			http.Error(w, "private native transport denied", http.StatusForbidden)
 			return
 		}
