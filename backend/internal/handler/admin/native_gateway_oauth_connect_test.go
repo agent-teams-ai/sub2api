@@ -139,6 +139,9 @@ func (r *connectHTTPEnrollmentStore) ReadGatewayNativeOAuth(ctx context.Context,
 
 type connectHTTPFixture struct {
 	router         *gin.Engine
+	custody        *service.GatewayNativeCredentialCustody
+	transport      *http.Transport
+	checks         atomic.Int32
 	store          *connectHTTPStore
 	enrolled       *connectHTTPEnrollmentStore
 	connect        *service.GatewayNativeOAuthConnect
@@ -182,6 +185,12 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { f.destination.Add(1); w.WriteHeader(200) }))
 	t.Cleanup(destination.Close)
 	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/backend-api/accounts/check/v4-2023-04-27" {
+			f.checks.Add(1)
+			require.Equal(t, "chatgpt.com", r.Host)
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{"fixture": map[string]any{"account": map[string]any{"account_id": "11111111-1111-4111-8111-111111111111", "is_default": true}, "entitlement": map[string]any{"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339Nano)}}}})
+			return
+		}
 		require.Equal(t, "auth.openai.com", r.Host)
 		if r.URL.Path == "/.well-known/jwks.json" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
@@ -229,7 +238,7 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address == "auth.openai.com:443" {
+		if address == "auth.openai.com:443" || address == "chatgpt.com:443" {
 			address = source.Listener.Addr().String()
 		} else if address != destination.Listener.Addr().String() {
 			return nil, fmt.Errorf("unexpected fixture destination")
@@ -242,6 +251,8 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	enrollment, err := service.NewGatewayNativeOAuthEnrollment(service.NewGatewayNativeOAuthVerifier(transport), custody, f.enrolled, connectHTTPRandom(t, 32))
 	require.NoError(t, err)
 	f.enrollment = enrollment
+	f.custody = custody
+	f.transport = transport
 	f.connect, err = service.NewGatewayNativeOAuthConnect(connectHTTPRandom(t, 32), transport, f.store, enrollment, f.enrolled)
 	require.NoError(t, err)
 	gin.SetMode(gin.TestMode)
@@ -499,4 +510,96 @@ func gatewayConnectStageFixtureOpaque() string {
 		panic("fixture entropy unavailable")
 	}
 	return hex.EncodeToString(b)
+}
+
+// Failure: an accepted PKCE capability could enter token HTTP after live logical
+// owner policy was revoked during enrollment. Exercise the actual callback.
+func TestGatewayNativeOAuthCallbackRechecksLiveOwnerBeforeEntry(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	state := f.begin(t)
+	var checks int
+	require.NoError(t, f.connect.SetEntryAuthorizer(func(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) error {
+		checks++
+		require.Equal(t, f.scope, scope)
+		require.Equal(t, "operation", operation)
+		return service.ErrGatewayNativeIdentity
+	}))
+	response := f.request(t, "/auth/callback?state="+state+"&code=fixture-code", "", false)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, 1, checks)
+	require.Equal(t, "prepared", f.store.row.State)
+	require.Zero(t, f.tokens.Load())
+	require.Zero(t, f.enrolled.calls)
+	require.NotContains(t, response.Body.String(), state)
+}
+
+type cleanupHTTPReadback struct {
+	connectHTTPEnrollmentStore
+	calls int
+}
+
+func (s *cleanupHTTPReadback) CleanupGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthCleanupRequest, authorize service.GatewayNativeOAuthCleanupAuthorizer) (service.GatewayNativeOAuthCleanupResult, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, in.Scope) {
+		return service.GatewayNativeOAuthCleanupResult{}, service.ErrGatewayNativeIdentity
+	}
+	_, err := authorize(ctx, in)
+	if err != nil {
+		return service.GatewayNativeOAuthCleanupResult{}, err
+	}
+	s.calls++
+	return service.GatewayNativeOAuthCleanupResult{Operation: in.Operation, Account: in.Scope.Account, Closure: "pending"}, nil
+}
+
+// Failure: cleanup parsing could accept duplicate/escaped aliases, arbitrary
+// selectors or oversized input before purpose authority. SQL behavior is tested
+// separately; this boundary checks actual protected handler output and entry.
+func TestGatewayNativeOAuthCleanupHTTPStrictFiniteInput(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	r := &cleanupHTTPReadback{}
+	key := connectHTTPRandom(t, 32)
+	connect, err := service.NewGatewayNativeOAuthConnect(key, nil, f.store, f.enrollment, r)
+	require.NoError(t, err)
+	authorize := func(c *gin.Context) {
+		if c.GetHeader("Authorization") != "Bearer fixture-cleanup" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		ctx, e := service.WithGatewayNativeConsumer(c.Request.Context(), f.scope.Consumer)
+		require.NoError(t, e)
+		ctx, e = service.WithGatewayNativeOAuthOwner(ctx, f.scope.Owner)
+		require.NoError(t, e)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+	authority := func(_ context.Context, in service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+		require.Equal(t, f.scope, in.Scope)
+		require.Equal(t, "cleanup-claim", in.CleanupRef)
+		require.Equal(t, "claim-token", in.CleanupToken)
+		return service.GatewayNativeOAuthCleanupAuthority{Owner: f.scope.Owner, LeaseExpiresAt: time.Now().Add(time.Second)}, nil
+	}
+	require.NoError(t, RegisterGatewayNativeOAuthCleanupRoute(f.router.Group(""), connect, authorize, authority))
+	body := strings.TrimSuffix(f.input(), "}") + `,"action":"read","cleanup_ref":"cleanup-claim","cleanup_token":"claim-token"}`
+	send := func(body, bearer string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/private/native/v1/oauth/connect/cleanup", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		w := httptest.NewRecorder()
+		f.router.ServeHTTP(w, req)
+		return w
+	}
+	require.Equal(t, http.StatusOK, send(body, "fixture-cleanup").Code)
+	require.Equal(t, 1, r.calls)
+	for _, bad := range []string{
+		strings.TrimSuffix(body, "}") + `,"operation":"other"}`,
+		strings.TrimSuffix(body, "}") + `,"oper\u0061tion":"other"}`,
+		strings.TrimSuffix(body, "}") + `,"worker":"caller-worker"}`,
+		strings.Replace(body, `"action":"read"`, `"action":"cancel"`, 1),
+		strings.Replace(body, `"cleanup_token":"claim-token"`, `"cleanup_token":"`+strings.Repeat("x", 4096)+`"`, 1),
+	} {
+		require.NotEqual(t, http.StatusOK, send(bad, "fixture-cleanup").Code)
+		require.Equal(t, 1, r.calls)
+	}
+	for _, role := range []string{"fixture-owner", "fixture-execution", ""} {
+		require.Equal(t, http.StatusForbidden, send(body, role).Code)
+		require.Equal(t, 1, r.calls)
+	}
 }

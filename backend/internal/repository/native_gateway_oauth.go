@@ -375,11 +375,14 @@ func (r *accountRepository) UnknownGatewayNativeOAuthRefresh(ctx context.Context
 	if !found || out.Fence != fence {
 		return service.ErrGatewayOAuthConflict
 	}
-	if out.Outcome.State == "completed" || out.Outcome.State == "unknown" {
+	// A current prepared row is durable no-entry evidence. A lost Enter ACK
+	// reads entered here, while policy/decrypt/pre-entry denial must not turn
+	// prepared into ambiguity or destroy cleanup's tombstone/no-entry proof.
+	if out.Outcome.State == "prepared" || out.Outcome.State == "completed" || out.Outcome.State == "unknown" {
 		return nil
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='unknown'
-  WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state IN ('prepared','entered')`, in.Scope.Consumer, in.Operation, fence)
+  WHERE consumer=$1 AND operation_ref=$2 AND fence=$3 AND state='entered'`, in.Scope.Consumer, in.Operation, fence)
 	if err != nil || tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity
 	}
@@ -483,3 +486,207 @@ func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context
 }
 
 var _ service.GatewayNativeOAuthRefreshResolver = (*accountRepository)(nil)
+
+// Cleanup resolves the original connect internally. The enrollment operation,
+// reservation commitment and credential version never become ingress selectors.
+func (r *accountRepository) CleanupGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthCleanupRequest, authorize service.GatewayNativeOAuthCleanupAuthorizer) (out service.GatewayNativeOAuthCleanupResult, retErr error) {
+	deny := func() (service.GatewayNativeOAuthCleanupResult, error) {
+		return service.GatewayNativeOAuthCleanupResult{}, service.ErrGatewayNativeIdentity
+	}
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, in.Scope) || !service.GatewayNativeOAuthCleanupRequestValid(in) || authorize == nil {
+		return deny()
+	}
+	grant, err := authorize(ctx, in)
+	if err != nil || grant.Owner != in.Scope.Owner || !time.Now().Before(grant.LeaseExpiresAt) {
+		return deny()
+	}
+	bounded, cancel := context.WithDeadline(ctx, grant.LeaseExpiresAt)
+	defer cancel()
+	effectiveDeadline, _ := bounded.Deadline()
+	db, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return deny()
+	}
+	tx, err := db.BeginTx(bounded, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return deny()
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			out, retErr = deny()
+		}
+	}()
+	args := []any{in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose}
+	where := ` WHERE consumer=$1 AND operation_ref=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND purpose=$6`
+	intent, err := scanConnect(tx.QueryRowContext(bounded, `SELECT `+connectColumns+` FROM gateway_oauth_connect_intents`+where, args...))
+	if err != nil {
+		return deny()
+	}
+	// Stage's INSERT trigger takes this lock before its connect row lock. Taking
+	// it first prevents late custody from appearing after a sealed unknown intent.
+	if _, err = tx.ExecContext(bounded, `SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(1) || $2,245))`, in.Scope.Consumer, intent.EnrollmentOperation); err != nil {
+		return deny()
+	}
+	var id int64
+	err = tx.QueryRowContext(bounded, `SELECT COALESCE(account_id,0) FROM gateway_oauth_identity_reservations WHERE consumer=$1 AND operation_ref=$2`, in.Scope.Consumer, intent.EnrollmentOperation).Scan(&id)
+	if err != nil && err != sql.ErrNoRows {
+		return deny()
+	}
+	// Account first, then connect and attempts, matching dispatch/refresh. Each
+	// statement observes facts committed by the preceding lock holder.
+	if id > 0 {
+		var locked int64
+		if tx.QueryRowContext(bounded, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, id).Scan(&locked) != nil {
+			return deny()
+		}
+	}
+	intent, err = scanConnect(tx.QueryRowContext(bounded, `SELECT `+connectColumns+` FROM gateway_oauth_connect_intents`+where+` FOR UPDATE`, args...))
+	if err != nil {
+		return deny()
+	}
+	out = service.GatewayNativeOAuthCleanupResult{Operation: in.Operation, Account: in.Scope.Account, Closure: "pending"}
+	if id > 0 {
+		var route service.GatewayNativeRoute
+		var erased bool
+		// Independent identity read: no decryption, qualification or provider call.
+		err = tx.QueryRowContext(bounded, `SELECT a.id,a.created_at,r.generation,a.deleted_at IS NOT NULL AND a.credentials='{}'::jsonb
+ FROM accounts a JOIN gateway_oauth_identity_reservations r ON r.account_id=a.id
+ WHERE a.id=$1 AND r.consumer=$2 AND r.owner_ref=$3 AND r.account_ref=$4 AND r.generation=$5 AND r.operation_ref=$6 AND r.intent_mac=$7
+ AND a.extra->>'gateway_generation_v1'=r.generation AND a.extra->>'gateway_profile_v1'='openai-oidc-oauth-staging-v1'
+ AND a.extra->'gateway_credential_scope_v1'=jsonb_build_object('consumer',r.consumer,'owner',r.owner_ref,'account',r.account_ref,'generation',r.generation,'purpose',$8::text)
+ AND a.platform='openai' AND a.type='oauth' AND a.status='disabled' AND NOT a.schedulable
+ AND a.proxy_id IS NULL AND a.parent_account_id IS NULL AND NOT EXISTS(SELECT 1 FROM account_groups g WHERE g.account_id=a.id)`,
+			id, in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, intent.EnrollmentOperation, intent.EnrollmentMAC, in.Scope.Purpose).
+			Scan(&route.AccountID, &route.CreatedAt, &route.Generation, &erased)
+		if err != nil || intent.EnrollmentMAC == "" || (intent.State == "completed" && (intent.Outcome.AccountID != id || intent.Outcome.Operation != intent.EnrollmentOperation || intent.Outcome.Generation != route.Generation || intent.Outcome.State != "staged")) {
+			return deny()
+		}
+		route.Profile, route.BaseURL, route.Model = service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthBaseURL, service.GatewayCodexOAuthModel
+		out.Native, out.CredentialsErased = &route, erased
+	}
+	// Lock all attempts before reauthorizing. Never rewrite completed/unknown.
+	rows, err := tx.QueryContext(bounded, `SELECT state,consumer=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND native_created_at=$6
+ FROM gateway_oauth_refresh_attempts WHERE account_id=$1 ORDER BY operation_ref FOR UPDATE`, id, in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, func() any {
+		if out.Native != nil {
+			return out.Native.CreatedAt
+		}
+		return nil
+	}())
+	if err != nil {
+		return deny()
+	}
+	ambiguous := false
+	for rows.Next() {
+		var state string
+		var exact bool
+		if rows.Scan(&state, &exact) != nil || !exact {
+			_ = rows.Close()
+			return deny()
+		}
+		if state == "entered" || state == "unknown" {
+			ambiguous = true
+		}
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil || closeErr != nil {
+		return deny()
+	}
+	if in.Action == "erase" {
+		// Kernel transactions are released before this callback. Its latest exact
+		// token/owner/birth/lease proof must still hold after every native lock wait.
+		fresh, authErr := authorize(bounded, in)
+		if authErr != nil || fresh.Owner != in.Scope.Owner || !time.Now().Before(fresh.LeaseExpiresAt) || bounded.Err() != nil {
+			return deny()
+		}
+		deadline, _ := bounded.Deadline()
+		if fresh.LeaseExpiresAt.Before(deadline) {
+			deadline = fresh.LeaseExpiresAt
+		}
+		effectiveDeadline = deadline
+		mutationCtx, stop := context.WithDeadline(bounded, deadline)
+		defer stop()
+		if fresh.Native != nil && (out.Native == nil || !service.SameGatewayNativeDescriptor(*fresh.Native, *out.Native)) {
+			return deny()
+		}
+		// An explicitly unbound grant seals intent only. A discovered physical birth
+		// is returned for mapping and requires the next fresh mapped erase authority.
+		if fresh.Native != nil && !out.CredentialsErased {
+			result, updateErr := tx.ExecContext(mutationCtx, `UPDATE gateway_oauth_refresh_attempts SET state='unknown' WHERE account_id=$1 AND state='entered' AND $2>clock_timestamp()`, id, deadline)
+			if updateErr != nil {
+				return deny()
+			}
+			n, countErr := result.RowsAffected()
+			if countErr != nil {
+				return deny()
+			}
+			// Prepared is retained as positive no-entry evidence. Once the exact
+			// birth is erased migration244 denies entry, reclaim and publication.
+			// Entered becomes unknown and its provider effect remains unresolved.
+			if n > 0 {
+				ambiguous = true
+			}
+			result, updateErr = tx.ExecContext(mutationCtx, `UPDATE accounts SET credentials='{}'::jsonb,deleted_at=COALESCE(deleted_at,clock_timestamp()),updated_at=clock_timestamp() WHERE id=$1 AND $2>clock_timestamp()`, id, deadline)
+			if updateErr != nil {
+				return deny()
+			}
+			n, countErr = result.RowsAffected()
+			if countErr != nil || n != 1 {
+				return deny()
+			}
+			out.CredentialsErased = true
+		}
+		if intent.State == "prepared" {
+			// Immutable deadline: prepared cannot be cancelled before its accepted TTL.
+			result, updateErr := tx.ExecContext(mutationCtx, `UPDATE gateway_oauth_connect_intents SET state='expired',material_envelope=''`+where+` AND state='prepared' AND deadline<=clock_timestamp() AND $7>clock_timestamp()`, append(args, deadline)...)
+			if updateErr != nil {
+				return deny()
+			}
+			n, countErr := result.RowsAffected()
+			if countErr != nil {
+				return deny()
+			}
+			if n == 1 {
+				intent.State, intent.Envelope = "expired", ""
+			}
+		} else if (intent.State == "entered" || intent.State == "unknown") && !intent.RecoveryDenied {
+			// Seal only once; immutable sealed rows must not receive a replay UPDATE.
+			result, updateErr := tx.ExecContext(mutationCtx, `UPDATE gateway_oauth_connect_intents SET state='unknown',recovery_denied=true,material_envelope=''`+where+` AND state IN ('entered','unknown') AND NOT recovery_denied AND $7>clock_timestamp()`, append(args, deadline)...)
+			if updateErr != nil {
+				return deny()
+			}
+			n, countErr := result.RowsAffected()
+			if countErr != nil || n != 1 {
+				return deny()
+			}
+			intent.State, intent.Envelope, intent.RecoveryDenied = "unknown", "", true
+		}
+		if mutationCtx.Err() != nil {
+			return deny()
+		}
+	}
+	if out.Native != nil {
+		if intent.State != "completed" || ambiguous {
+			out.Closure = "unknown"
+		} else if out.CredentialsErased {
+			out.Closure = "closed"
+		}
+	} else if intent.State == "expired" && intent.Envelope == "" {
+		// An expired exact prepared row is positive no-entry evidence under the
+		// writer lock. Absence alone is never an effect/closure receipt.
+		var noEntry bool
+		if tx.QueryRowContext(bounded, `SELECT entered_at IS NULL AND NOT EXISTS(SELECT 1 FROM gateway_oauth_identity_reservations r WHERE r.consumer=$1 AND r.operation_ref=$7) FROM gateway_oauth_connect_intents`+where,
+			append(args, intent.EnrollmentOperation)...).Scan(&noEntry) != nil || !noEntry {
+			return deny()
+		}
+		out.CredentialsErased, out.Closure = true, "closed"
+	} else if intent.State == "entered" || intent.State == "unknown" {
+		out.CredentialsErased, out.Closure = intent.Envelope == "", "unknown"
+	}
+	if bounded.Err() != nil || !time.Now().Before(effectiveDeadline) || tx.Commit() != nil || !time.Now().Before(effectiveDeadline) {
+		return deny()
+	}
+	return out, nil
+}

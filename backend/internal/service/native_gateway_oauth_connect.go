@@ -70,12 +70,13 @@ type GatewayNativeOAuthConnectResult struct {
 }
 
 type GatewayNativeOAuthConnect struct {
-	aead       cipher.AEAD
-	client     *http.Client
-	repository GatewayNativeOAuthConnectRepository
-	enrollment *GatewayNativeOAuthEnrollment
-	readback   GatewayNativeOAuthConnectReadback
-	now        func() time.Time
+	aead           cipher.AEAD
+	client         *http.Client
+	repository     GatewayNativeOAuthConnectRepository
+	enrollment     *GatewayNativeOAuthEnrollment
+	readback       GatewayNativeOAuthConnectReadback
+	now            func() time.Time
+	authorizeEntry GatewayNativeOAuthEntryAuthorizer
 }
 
 // The key stays outside DB/backup. transport is trusted composition ONLY (TLS
@@ -322,6 +323,9 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 	if err != nil || material.State != state {
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
 	}
+	if ownerCtx.Err() != nil || (s.authorizeEntry != nil && s.authorizeEntry(ownerCtx, in.Scope, in.Operation) != nil) {
+		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
+	}
 	won, err := s.repository.EnterConnect(ownerCtx, in)
 	if err != nil {
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
@@ -334,6 +338,9 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 	// leaves the durable entry spent. No retry path, fallback, rearm or delete.
 	bounded, cancel := context.WithTimeout(ownerCtx, 20*time.Second)
 	defer cancel()
+	if bounded.Err() != nil {
+		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
+	}
 	bundle, err := s.exchange(bounded, code, material.Verifier)
 	material = connectMaterial{}
 	quarantine := err != nil
@@ -439,4 +446,52 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 		return deny()
 	}
 	return bundle, nil
+}
+
+// Entry authorization belongs to the service consumer; bootstrap supplies the
+// fixed live policy callback. It is independent of persisted capability scope.
+type GatewayNativeOAuthEntryAuthorizer func(context.Context, GatewayNativeCredentialScope, string) error
+
+func (s *GatewayNativeOAuthConnect) SetEntryAuthorizer(authorize GatewayNativeOAuthEntryAuthorizer) error {
+	if s == nil || authorize == nil {
+		return ErrGatewayNativeIdentity
+	}
+	s.authorizeEntry = authorize
+	return nil
+}
+
+type GatewayNativeOAuthCleanupRequest struct {
+	Scope                                       GatewayNativeCredentialScope
+	Operation, Action, CleanupRef, CleanupToken string
+}
+type GatewayNativeOAuthCleanupAuthority struct {
+	Owner          string
+	LeaseExpiresAt time.Time
+	Native         *GatewayNativeRoute
+}
+type GatewayNativeOAuthCleanupAuthorizer func(context.Context, GatewayNativeOAuthCleanupRequest) (GatewayNativeOAuthCleanupAuthority, error)
+type GatewayNativeOAuthCleanupResult struct {
+	Operation         string              `json:"operation"`
+	Account           string              `json:"account_ref"`
+	CredentialsErased bool                `json:"credentials_erased"`
+	Closure           string              `json:"closure"`
+	Native            *GatewayNativeRoute `json:"native,omitempty"`
+}
+type GatewayNativeOAuthCleanupRepository interface {
+	CleanupGatewayNativeOAuth(context.Context, GatewayNativeOAuthCleanupRequest, GatewayNativeOAuthCleanupAuthorizer) (GatewayNativeOAuthCleanupResult, error)
+}
+
+func GatewayNativeOAuthCleanupRequestValid(in GatewayNativeOAuthCleanupRequest) bool {
+	return GatewayNativeOAuthScopeValid(in.Scope) && GatewayNativeCredentialRefValid(in.Operation) &&
+		GatewayNativeCredentialRefValid(in.CleanupRef) && GatewayNativeCredentialRefValid(in.CleanupToken) && (in.Action == "read" || in.Action == "erase")
+}
+func (s *GatewayNativeOAuthConnect) Cleanup(ctx context.Context, in GatewayNativeOAuthCleanupRequest, authorize GatewayNativeOAuthCleanupAuthorizer) (GatewayNativeOAuthCleanupResult, error) {
+	if s == nil {
+		return GatewayNativeOAuthCleanupResult{}, ErrGatewayNativeIdentity
+	}
+	r, ok := s.readback.(GatewayNativeOAuthCleanupRepository)
+	if !ok || !GatewayNativeOAuthScopeAuthorized(ctx, in.Scope) || !GatewayNativeOAuthCleanupRequestValid(in) || authorize == nil {
+		return GatewayNativeOAuthCleanupResult{}, ErrGatewayNativeIdentity
+	}
+	return r.CleanupGatewayNativeOAuth(ctx, in, authorize)
 }

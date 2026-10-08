@@ -259,6 +259,38 @@ func TestGatewayNativeOAuthRefreshSignedHTTPContainment(t *testing.T) {
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 	require.True(t, verifyClockAdvance.Load())
 	verifyClockAdvance.Store(false)
+	// Failure: live policy may be revoked during preparation, after the HTTP
+	// middleware authorized Maintain. Entry must make zero token HTTP calls.
+	t.Run("live owner revoked at refresh entry", func(t *testing.T) {
+		scope := GatewayNativeCredentialScope{Consumer: "consumer", Owner: "owner", Account: "account", Generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Purpose: GatewayOAuthBundlePurpose}
+		ctx, err := WithGatewayNativeConsumer(context.Background(), scope.Consumer)
+		require.NoError(t, err)
+		ctx, err = WithGatewayNativeOAuthOwner(ctx, scope.Owner)
+		require.NoError(t, err)
+		old := GatewayNativeOAuthBundle{AccessToken: gatewayOAuthGuardFixtureOpaque(), RefreshToken: refresh, IDToken: goodID, SensitiveMetadata: json.RawMessage(`{"private":"old-custody"}`)}
+		envelope, err := custody.SealOAuthBundle(scope, old)
+		require.NoError(t, err)
+		in := GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 1, CreatedAt: time.Now().Truncate(time.Microsecond), ExpectedVersion: 1, Operation: "rotation", Intent: "intent", ConnectOperation: "original-connect"}
+		observer := &refreshContextObserver{prepared: GatewayNativeOAuthRefreshPrepared{Outcome: GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "prepared"}, Fence: 1, Deadline: time.Now().Add(time.Second), Claimed: true, Envelope: envelope}}
+		service, err := NewGatewayNativeOAuthRefresh(observer, custody, verifier, transport)
+		require.NoError(t, err)
+		checks := 0
+		require.NoError(t, service.SetEntryAuthorizer(func(_ context.Context, got GatewayNativeCredentialScope, operation string) error {
+			checks++
+			require.Equal(t, scope, got)
+			require.Equal(t, "original-connect", operation)
+			return ErrGatewayNativeIdentity
+		}))
+		before := tokenCalls.Load()
+		out, err := service.Refresh(ctx, in)
+		require.Error(t, err)
+		require.Equal(t, "unknown", out.State)
+		require.Equal(t, 1, checks)
+		require.Equal(t, before, tokenCalls.Load())
+		require.False(t, observer.completionCalled)
+		require.Equal(t, "prepared", observer.prepared.Outcome.State)
+	})
+
 	// These scenarios observe service/repository context contracts using actual
 	// signed HTTP and custody. Durable SQL publication is proved only by real PG.
 	for _, tc := range []struct {
@@ -358,7 +390,9 @@ func (o *refreshContextObserver) CompleteGatewayNativeOAuthRefresh(ctx context.C
 func (o *refreshContextObserver) UnknownGatewayNativeOAuthRefresh(ctx context.Context, _ GatewayNativeOAuthRefreshIntent, _ int64) error {
 	_, bounded := ctx.Deadline()
 	o.cleanupLive = ctx.Err() == nil && bounded
-	o.prepared.Outcome.State = "unknown"
+	if o.prepared.Outcome.State == "entered" {
+		o.prepared.Outcome.State = "unknown"
+	}
 	return nil
 }
 

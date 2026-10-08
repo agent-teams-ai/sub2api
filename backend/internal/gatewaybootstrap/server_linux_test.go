@@ -539,6 +539,17 @@ func (*oauthMountRows) QualifyGatewayNativeOAuthDispatch(context.Context, servic
 	return ErrDenied
 }
 
+func (*oauthMountRows) CleanupGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthCleanupRequest, authorize service.GatewayNativeOAuthCleanupAuthorizer) (service.GatewayNativeOAuthCleanupResult, error) {
+	if !service.GatewayNativeOAuthScopeAuthorized(ctx, in.Scope) {
+		return service.GatewayNativeOAuthCleanupResult{}, ErrDenied
+	}
+	grant, err := authorize(ctx, in)
+	if err != nil {
+		return service.GatewayNativeOAuthCleanupResult{}, err
+	}
+	return service.GatewayNativeOAuthCleanupResult{Operation: in.Operation, Account: in.Scope.Account, Closure: "pending", Native: grant.Native}, nil
+}
+
 type oauthMountAdmin struct{ service.AdminService }
 
 // Controlled rows behind the real candidate create/read handlers and admin
@@ -955,13 +966,32 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 	}
 	first := nativeOAuthOwnerTuple{"operation-a", "owner-a", "account-a", "33333333-3333-4333-8333-333333333333"}
 	second := nativeOAuthOwnerTuple{"operation-b", "owner-b", "account-b", "44444444-4444-4444-8444-444444444444"}
-	var lookups, tokenEntries atomic.Int32
+	var lookups, tokenEntries, cleanupLookups atomic.Int32
 	var grantLive atomic.Bool
 	grantLive.Store(true)
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/private/native/v1/enrollment" {
 			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		}
+
+		if r.URL.Path == "/private/native/v1/oauth-cleanup-authority" {
+			cleanupLookups.Add(1)
+			var selectors struct {
+				ConsumerID   string `json:"consumerId"`
+				OperationID  string `json:"operationId"`
+				AccountRef   string `json:"accountRef"`
+				Generation   string `json:"generation"`
+				CleanupRef   string `json:"cleanupRef"`
+				CleanupToken string `json:"cleanupToken"`
+				Action       string `json:"action"`
+			}
+			if r.Header.Get("Authorization") != "Bearer "+c.Authority.Credential || json.NewDecoder(r.Body).Decode(&selectors) != nil || selectors.ConsumerID != "fixture-consumer" || selectors.OperationID != first.Operation || selectors.AccountRef != first.AccountRef || selectors.Generation != first.Generation || selectors.CleanupRef != "cleanup-ref" || selectors.CleanupToken != "current-token" || selectors.Action != "read" {
+				w.WriteHeader(403)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ownerRef": first.OwnerRef, "leaseExpiresAt": time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano), "native": service.GatewayNativeRoute{AccountID: 42, Generation: first.Generation, CreatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Profile: service.GatewayCodexOAuthResponsesProfile, BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel}})
 			return
 		}
 		lookups.Add(1)
@@ -1018,7 +1048,7 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = transport.Stop(context.Background()) }()
-	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect: connect, dispatch: dispatch, owners: a}))
+	server := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth, &privateOAuth{connect: connect, dispatch: dispatch, owners: a, cleanup: a.AuthorizeNativeOAuthCleanup}))
 	defer server.Close()
 	post := func(path string, body any, authenticated bool) (int, []byte) {
 		raw, _ := json.Marshal(body)
@@ -1078,6 +1108,34 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 	if code, _ := post("/descriptor", second, true); code != 403 || tokenEntries.Load() != 0 {
 		t.Fatal("retired grant or selector denial entered token exchange")
 	}
+	// Failure: cleanup was never mounted on the sanitized router, management
+	// bearer reached it, or revoked connect grants prevented exact leased cleanup.
+	cleanupBody := map[string]string{"operation": first.Operation, "owner_ref": first.OwnerRef, "account_ref": first.AccountRef, "generation": first.Generation, "action": "read", "cleanup_ref": "cleanup-ref", "cleanup_token": "current-token"}
+	for _, tc := range []struct {
+		credential string
+		want       int
+	}{{"fixture-management-credential", 403}, {"fixture-execution-credential", 403}, {"fixture-cleanup-credential", 200}} {
+		raw, _ := json.Marshal(cleanupBody)
+		request, _ := http.NewRequest(http.MethodPost, server.URL+"/private/native/v1/oauth/connect/cleanup", bytes.NewReader(raw))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+tc.credential)
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != tc.want {
+			t.Fatal("cleanup mount purpose role", response.StatusCode, tc.want)
+		}
+		if tc.want == 200 && (!bytes.Contains(data, []byte(`"closure":"pending"`)) || !bytes.Contains(data, []byte(`"account_id":42`))) {
+			t.Fatal("cleanup reply lost finite result or exact native timestamp/ID", string(data))
+		}
+	}
+	if cleanupLookups.Load() != 2 || tokenEntries.Load() != 0 {
+		t.Fatal("cleanup did not use its own live purpose callback, or entered provider", cleanupLookups.Load(), tokenEntries.Load())
+	}
+
 }
 
 // Regression: an opt-in route was absent behind the MiMo-only router, callback
