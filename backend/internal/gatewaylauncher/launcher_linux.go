@@ -43,6 +43,10 @@ type Config struct {
 	// Optional server-only configuration, inherited as FD 6. The caller owns
 	// this file; Start captures a duplicate without closing or reopening it.
 	BootstrapFile *os.File
+	// Optional trusted engine stderr descriptor; nil preserves discard behavior.
+	// The caller owns this file. A file avoids os/exec output-copy goroutines,
+	// so child exit remains the sole authority for Wait and retirement.
+	EngineStderr *os.File
 }
 
 // Bound the one fixed-purpose bootstrap descriptor before any authority wait.
@@ -283,6 +287,9 @@ func Start(config Config) (*Launcher, error) {
 		return nil, ErrStart
 	}
 	cmd := exec.Command(c.EnginePath, c.Args...)
+	if c.EngineStderr != nil {
+		cmd.Stderr = c.EngineStderr
+	}
 	cmd.Env = append(c.Env,
 		"GATEWAY_LAUNCHER_LOCK_FD=3",
 		"GATEWAY_LAUNCHER_READY_FD=4",

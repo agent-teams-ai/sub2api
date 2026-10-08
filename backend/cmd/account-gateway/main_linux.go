@@ -249,7 +249,7 @@ func run(args []string) int {
 	l, startErr := gatewaylauncher.Start(gatewaylauncher.Config{
 		Authority: authority, EnginePath: engine, Args: []string{"--engine"},
 		Env: []string{"GIN_MODE=release"}, EngineUID: uint32(*uid), EngineGID: uint32(*gid),
-		BootstrapFile: file,
+		BootstrapFile: file, EngineStderr: os.Stderr,
 	})
 	_ = file.Close() // Start captured its own duplicate; no pathname reopen.
 	if l == nil {
