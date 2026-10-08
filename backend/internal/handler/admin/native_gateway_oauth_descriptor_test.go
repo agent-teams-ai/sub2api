@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,7 +143,24 @@ func (r *joinedDescriptorHTTPStore) QualifyGatewayNativeOAuthDispatch(ctx contex
 // HTTP output for the actual TS adapter in an explicitly owned test directory.
 func TestGatewayOAuthDescriptorHTTPJoinedSuccessWire(t *testing.T) {
 	f := newConnectHTTPFixture(t)
-	state := f.begin(t)
+	// Use product-shaped immutable UUID refs so the actual TS scope decoder can
+	// accept the fixture before the descriptor HTTP request is made.
+	f.scope.Consumer = "11111111-1111-4111-8111-111111111112"
+	f.scope.Owner = "22222222-2222-4222-8222-222222222222"
+	f.scope.Account = "33333333-3333-4333-8333-333333333333"
+	const operation = "44444444-4444-4444-8444-444444444444"
+	ownerCtx, err := service.WithGatewayNativeConsumer(context.Background(), f.scope.Consumer)
+	require.NoError(t, err)
+	ownerCtx, err = service.WithGatewayNativeOAuthOwner(ownerCtx, f.scope.Owner)
+	require.NoError(t, err)
+	begin, err := f.connect.BeginConnect(ownerCtx, f.scope, operation)
+	require.NoError(t, err)
+	authorizeURL, err := url.Parse(begin.AuthorizeURL)
+	require.NoError(t, err)
+	state := authorizeURL.Query().Get("state")
+	f.challenge = authorizeURL.Query().Get("code_challenge")
+	input, err := json.Marshal(gatewayConnectInput{Operation: operation, Owner: f.scope.Owner, Account: f.scope.Account, Generation: f.scope.Generation})
+	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, f.request(t, "/auth/callback?state="+state+"&code=fixture-code", "", false).Code)
 	require.Equal(t, "completed", f.store.row.State)
 	birth := time.Date(2026, 10, 8, 12, 34, 56, 123456000, time.UTC)
@@ -150,7 +168,7 @@ func TestGatewayOAuthDescriptorHTTPJoinedSuccessWire(t *testing.T) {
 	issuer, subject := f.enrolled.reservation.Identity.Principal()
 	account := &service.Account{ID: 42, CreatedAt: birth, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Status: service.StatusDisabled, Schedulable: false,
 		Credentials: map[string]any{"oauth_bundle": f.enrolled.reservation.Envelope}, Extra: map[string]any{service.GatewayGenerationExtraKey: f.scope.Generation, service.GatewayProfileExtraKey: service.GatewayOAuthStagingProfile, service.GatewayCredentialScopeExtraKey: f.scope.Metadata()}}
-	repository := &joinedDescriptorHTTPStore{account: account, physical: service.GatewayNativeOAuthPhysical{Scope: f.scope, Operation: "operation", Route: route, Issuer: issuer, Subject: subject}}
+	repository := &joinedDescriptorHTTPStore{account: account, physical: service.GatewayNativeOAuthPhysical{Scope: f.scope, Operation: operation, Route: route, Issuer: issuer, Subject: subject}}
 	dispatch, err := service.NewGatewayNativeOAuthDispatch(repository, f.custody, service.NewGatewayNativeOAuthVerifier(f.transport), f.transport)
 	require.NoError(t, err)
 	authorize := func(c *gin.Context) {
@@ -167,13 +185,13 @@ func TestGatewayOAuthDescriptorHTTPJoinedSuccessWire(t *testing.T) {
 	require.NoError(t, RegisterGatewayNativeOAuthDescriptorRoute(f.router.Group(""), dispatch, authorize))
 	outputs := map[string][]byte{}
 	for _, name := range []string{"first.json", "cached.json"} {
-		response := f.request(t, "/private/native/v1/oauth/connect/descriptor", f.input(), true)
+		response := f.request(t, "/private/native/v1/oauth/connect/descriptor", string(input), true)
 		require.Equal(t, http.StatusOK, response.Code)
 		var out map[string]any
 		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &out))
 		require.Equal(t, "staged", out["state"])
 		require.Equal(t, "controlled-source-v1", out["qualification"])
-		require.Equal(t, "operation", out["operation"])
+		require.Equal(t, operation, out["operation"])
 		require.Equal(t, f.scope.Account, out["account_ref"])
 		require.NotNil(t, out["native"])
 		outputs[name] = append([]byte(nil), response.Body.Bytes()...)
@@ -189,7 +207,7 @@ func TestGatewayOAuthDescriptorHTTPJoinedSuccessWire(t *testing.T) {
 		info, err := os.Stat(dir)
 		require.NoError(t, err)
 		require.True(t, info.IsDir())
-		outputs["scope.json"], err = json.Marshal(map[string]string{"consumerId": f.scope.Consumer, "operationId": "operation", "ownerRef": f.scope.Owner, "accountRef": f.scope.Account, "generation": f.scope.Generation})
+		outputs["scope.json"], err = json.Marshal(map[string]string{"consumerId": f.scope.Consumer, "operationId": operation, "ownerRef": f.scope.Owner, "accountRef": f.scope.Account, "generation": f.scope.Generation})
 		require.NoError(t, err)
 		// Expected identity comes from the accepted fixture birth, independently of
 		// the production response parser or its selected state/qualification tuple.
