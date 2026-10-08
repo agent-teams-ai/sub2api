@@ -27,6 +27,8 @@ import (
 const fixtureUID uint32 = 65534
 const fixtureGID uint32 = 65534
 
+const syntheticEngineDiagnosticLine = "{\"event\":\"gateway_native_response_failure\",\"phase\":\"http_status\",\"http_status\":401}\n"
+
 type fixture struct {
 	root   string
 	config Config
@@ -379,6 +381,14 @@ func TestSyntheticProcess(t *testing.T) {
 	if err != nil || n != 1 || g[0] != 'G' {
 		os.Exit(70)
 	}
+	if mode == "diagnostic" {
+		if _, err = io.WriteString(os.Stderr, syntheticEngineDiagnosticLine); err != nil {
+			os.Exit(70)
+		}
+		if _, err = io.WriteString(os.Stdout, "synthetic-engine-stdout-sentinel\n"); err != nil {
+			os.Exit(70)
+		}
+	}
 	if mode == "bootstrap" {
 		// Parent closes its original and replaces the pathname after Start,
 		// before this real child reads the captured description.
@@ -418,6 +428,50 @@ func TestSyntheticProcess(t *testing.T) {
 			os.Exit(0)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Red without EngineStderr wiring: the real child's finite diagnostic goes to
+// /dev/null. Exercise actual FD 2 delivery without mixing engine stdout into it.
+func TestEngineStderrDescriptorForRealChild(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			f := newFixture(t)
+			stderr, err := os.CreateTemp(f.root, "engine-stderr-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = stderr.Close() }()
+			c := fixtureConfig(f.root, "diagnostic")
+			if enabled {
+				c.EngineStderr = stderr
+			}
+			l := startFixture(t, c) // readiness retains its separate FD handshake.
+			binding := l.Binding()
+			probeLock(t, c, true)
+			stopEngine(t, f.root)
+			ctx, cancel := deadline(t)
+			defer cancel()
+			receipt, err := l.Wait(ctx)
+			if err != nil || receipt.Binding != binding || receipt.Scope != LocalTeardownScope || receipt.Method != "observed-child-exit" {
+				t.Fatalf("exact child retirement failed: %v", err)
+			}
+			if _, err = stderr.Stat(); err != nil {
+				t.Fatal("launcher closed caller-owned stderr", err)
+			}
+			data, err := os.ReadFile(stderr.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if enabled {
+				want = syntheticEngineDiagnosticLine
+			}
+			if string(data) != want {
+				t.Fatalf("engine stderr delivery differs: got %q want %q", data, want)
+			}
+			probeLock(t, c, false)
+		})
 	}
 }
 
