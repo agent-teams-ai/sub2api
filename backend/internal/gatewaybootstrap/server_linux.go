@@ -346,7 +346,9 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			c.Next()
 		}
 		if oauth.cleanup != nil && admin.RegisterGatewayNativeOAuthCleanupRoute(router.Group(""), oauth.connect, authorizeCleanup, oauth.cleanup) != nil {
-			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable) })
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
+			})
 		}
 		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil || admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil || (oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
