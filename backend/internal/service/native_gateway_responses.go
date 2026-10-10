@@ -84,6 +84,58 @@ const (
 	gatewayNativeFailureFlush       gatewayNativeResponseFailurePhase = "downstream_flush"
 )
 
+// Only fixed categories escape this bounded, request-deadline-controlled read.
+func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
+	body, err := io.ReadAll(io.LimitReader(reader, 8193))
+	if err != nil {
+		return "body_read_failed"
+	}
+	if len(body) > 8192 {
+		return "body_limit"
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return "invalid_error_json"
+	}
+	e := envelope.Error
+	switch e.Param {
+	case "service_tier":
+		return "parameter_service_tier"
+	case "max_output_tokens":
+		return "parameter_max_output_tokens"
+	case "parallel_tool_calls":
+		return "parameter_parallel_tool_calls"
+	case "context_management":
+		return "parameter_context_management"
+	}
+	message := strings.ToLower(e.Message)
+	if strings.Contains(message, "custom tools require mimo freeform responses lite mode") {
+		return "responses_lite_required"
+	}
+	if strings.Contains(message, "code_mode") && (strings.Contains(message, "required") || strings.Contains(message, "invalid")) {
+		return "code_mode_rejected"
+	}
+	switch e.Code {
+	case "code_mode_only":
+		return "code_mode_rejected"
+	case "invalid_api_key":
+		return "authentication_rejected"
+	case "model_not_found", "invalid_model":
+		return "model_rejected"
+	case "unsupported_parameter":
+		return "unsupported_parameter"
+	case "invalid_request_error":
+		return "invalid_request"
+	}
+	return "unknown"
+}
+
 func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
 	target, err := s.gatewayNativeTargetURL(a)
 	if err != nil {
@@ -113,15 +165,17 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// It works without initializing the general logger and leaves readiness on
 	// stdout intact. Never include context fields, headers, bodies or error text.
 	status := 0
+	providerErrorCategory := ""
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			phase = gatewayNativeFailureDeadline
 		}
 		event := struct {
-			Event      string                            `json:"event"`
-			Phase      gatewayNativeResponseFailurePhase `json:"phase"`
-			HTTPStatus int                               `json:"http_status,omitempty"`
-		}{Event: "gateway_native_response_failure", Phase: phase}
+			Event                 string                            `json:"event"`
+			Phase                 gatewayNativeResponseFailurePhase `json:"phase"`
+			HTTPStatus            int                               `json:"http_status,omitempty"`
+			ProviderErrorCategory string                            `json:"provider_error_category,omitempty"`
+		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory}
 		if status >= 100 && status <= 599 {
 			event.HTTPStatus = status
 		}
@@ -147,7 +201,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		return nil, fail(gatewayNativeFailureResponse)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Never read, export or log a vendor error body or return failover metadata.
+		// HTTP400 diagnostics never export vendor content or alter settlement.
+		if resp.StatusCode == http.StatusBadRequest {
+			providerErrorCategory = gatewayNativeHTTPErrorCategory(resp.Body)
+		}
 		return nil, fail(gatewayNativeFailureHTTP)
 	}
 	var reader io.Reader = resp.Body

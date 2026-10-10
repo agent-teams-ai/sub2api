@@ -23,8 +23,8 @@ import (
 
 type nativeDiagnosticBody struct {
 	io.Reader
-	reads, closes int
-	readErr       error
+	reads, closes, bytesRead int
+	readErr                  error
 }
 
 func (b *nativeDiagnosticBody) Read(p []byte) (int, error) {
@@ -32,7 +32,9 @@ func (b *nativeDiagnosticBody) Read(p []byte) (int, error) {
 	if b.readErr != nil {
 		return 0, b.readErr
 	}
-	return b.Reader.Read(p)
+	n, err := b.Reader.Read(p)
+	b.bytesRead += n
+	return n, err
 }
 
 func (b *nativeDiagnosticBody) Close() error {
@@ -56,7 +58,7 @@ func (h *nativeDiagnosticHTTP) Do(request *http.Request, _ string, _ int64, _ in
 
 // Red on the previous code: an entered HTTP rejection has no safe phase/status
 // diagnostic. The same boundary must still return the exact unknown singleton,
-// never read a rejection body, retry, or disclose any supplied private content.
+// bound HTTP400 reads, never retry or disclose supplied private content.
 func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	// One fresh process reproduces the private bootstrap's uninitialized logger
 	// and isolates stderr replacement from all other tests (including parallel
@@ -71,12 +73,17 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	require.False(t, logger.L().Core().Enabled(zap.WarnLevel), "private composition starts without the generic logger")
 	const sentinel = "PRIVATE_NATIVE_DIAGNOSTIC_SENTINEL"
 	cases := []struct {
-		name, contentType, wire, phase string
-		status                         int
-		stream, success, unread        bool
-		transportErr, readErr          error
+		name, contentType, wire, phase, category string
+		status                                   int
+		stream, success, unread                  bool
+		transportErr, readErr                    error
 	}{
-		{name: "http400", status: 400, phase: "http_status", unread: true, wire: sentinel},
+		{name: "http400", status: 400, phase: "http_status", category: "invalid_error_json", wire: sentinel},
+		{name: "http400 unknown private", status: 400, phase: "http_status", category: "unknown", wire: `{"error":{"code":"` + sentinel + `","message":"` + sentinel + `","param":"` + sentinel + `"}}`},
+		{name: "http400 parameter", status: 400, phase: "http_status", category: "parameter_service_tier", wire: `{"error":{"code":"invalid_request_error","message":"` + sentinel + `","param":"service_tier"}}`},
+		{name: "http400 code mode", status: 400, phase: "http_status", category: "code_mode_rejected", wire: `{"error":{"code":"code_mode_only","message":"` + sentinel + `"}}`},
+		{name: "http400 lite", status: 400, phase: "http_status", category: "responses_lite_required", wire: `{"error":{"message":"custom tools require MiMo freeform Responses lite mode. ` + sentinel + `"}}`},
+		{name: "http400 bound", status: 400, phase: "http_status", category: "body_limit", wire: strings.Repeat(sentinel, 1024)},
 		{name: "http401", status: 401, phase: "http_status", unread: true, wire: sentinel},
 		{name: "http429", status: 429, phase: "http_status", unread: true, wire: sentinel},
 		{name: "out of range status", status: 999, phase: "http_status", unread: true, wire: sentinel},
@@ -117,6 +124,9 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			result, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
 			require.True(t, entered)
 			require.Equal(t, 1, transport.requests)
+			if tc.status == 400 {
+				require.LessOrEqual(t, body.bytesRead, 8193, "HTTP400 body read is bounded")
+			}
 			if tc.unread {
 				require.Zero(t, body.reads, "a rejected response must not be consumed")
 			}
@@ -144,8 +154,13 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			} else {
 				require.NotContains(t, event, "http_status")
 			}
+			if tc.category != "" {
+				require.Equal(t, tc.category, event["provider_error_category"])
+			} else {
+				require.NotContains(t, event, "provider_error_category")
+			}
 			for field := range event {
-				require.Contains(t, []string{"event", "phase", "http_status"}, field)
+				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category"}, field)
 			}
 			for _, private := range []string{sentinel, "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
