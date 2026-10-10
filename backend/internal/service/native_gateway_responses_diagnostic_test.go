@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -25,10 +26,16 @@ type nativeDiagnosticBody struct {
 	io.Reader
 	reads, closes, bytesRead int
 	readErr                  error
+	waitForCancel            bool
+	ctx                      context.Context
 }
 
 func (b *nativeDiagnosticBody) Read(p []byte) (int, error) {
 	b.reads++
+	if b.waitForCancel {
+		<-b.ctx.Done()
+		return 0, b.ctx.Err()
+	}
 	if b.readErr != nil {
 		return 0, b.readErr
 	}
@@ -53,6 +60,11 @@ type nativeDiagnosticHTTP struct {
 func (h *nativeDiagnosticHTTP) Do(request *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 	h.requests++
 	h.lastRequest = request
+	if h.response != nil {
+		if body, ok := h.response.Body.(*nativeDiagnosticBody); ok {
+			body.ctx = request.Context()
+		}
+	}
 	return h.response, h.err
 }
 
@@ -74,6 +86,8 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	const sentinel = "PRIVATE_NATIVE_DIAGNOSTIC_SENTINEL"
 	cases := []struct {
 		name, contentType, wire, phase, category, encoding, shape, parameter string
+		readReason                                                           string
+		idle, deadline                                                       time.Duration
 		status                                                               int
 		stream, success, unread                                              bool
 		transportErr, readErr                                                error
@@ -147,7 +161,13 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "transport", phase: "transport", transportErr: errors.New(sentinel)},
 		{name: "missing response", phase: "invalid_response"},
 		{name: "body read", status: 200, phase: "body_read", readErr: errors.New(sentinel)},
-		{name: "SSE read", status: 200, stream: true, phase: "sse_read", contentType: "text/event-stream", readErr: errors.New(sentinel)},
+		// Red if scanner overflow keeps the generic read phase, or read failures
+		// omit the closed reason. The shared unknown singleton is not idle proof.
+		{name: "SSE read", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: errors.New(sentinel)},
+		{name: "SSE nonidle unknown singleton", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: ErrGatewayNativeEffectUnknown},
+		{name: "SSE oversized line", status: 200, stream: true, phase: "sse_frame_limit", contentType: "text/event-stream", wire: ":" + strings.Repeat("x", (1<<20)+1) + "\n\n"},
+		{name: "SSE idle expired", status: 200, stream: true, phase: "sse_read", readReason: "idle_expired", contentType: "text/event-stream", idle: 20 * time.Millisecond, deadline: time.Second},
+		{name: "SSE deadline omits read reason", status: 200, stream: true, phase: "deadline", contentType: "text/event-stream", idle: time.Second, deadline: 100 * time.Millisecond},
 		{name: "invalid final", status: 200, phase: "invalid_final", wire: `{"status":"incomplete","private":"` + sentinel + `"}`},
 		{name: "invalid content type", status: 200, stream: true, phase: "invalid_content_type", contentType: sentinel, unread: true, wire: sentinel},
 		{name: "invalid SSE event", status: 200, stream: true, phase: "sse_invalid_event", contentType: "text/event-stream", wire: "data: " + sentinel + "\n\n"},
@@ -165,7 +185,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 				os.Stderr = originalStderr
 				_ = stderr.Close()
 			})
-			body := &nativeDiagnosticBody{Reader: strings.NewReader(tc.wire), readErr: tc.readErr}
+			body := &nativeDiagnosticBody{Reader: strings.NewReader(tc.wire), readErr: tc.readErr, waitForCancel: tc.idle != 0}
 			transport := &nativeDiagnosticHTTP{err: tc.transportErr}
 			if tc.status != 0 {
 				transport.response = &http.Response{StatusCode: tc.status, Body: body, Header: http.Header{"Content-Type": {tc.contentType}, "X-Private": {sentinel}, "Content-Encoding": {tc.encoding}}}
@@ -178,7 +198,18 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			c, _ := gin.CreateTestContext(rec)
 			payload := []byte(`{"model":"mimo-test","input":"` + sentinel + `","stream":` + strconv.FormatBool(tc.stream) + `}`)
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(string(payload)))
-			result, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
+			ctx := nativeFixtureContext(t, context.Background())
+			if tc.idle != 0 {
+				bounded, cancel := context.WithTimeout(ctx, tc.deadline)
+				t.Cleanup(cancel)
+				life, err := NewGatewayNativeLifetime(bounded, cancel, func() {}, gatewayNativeResponseLimit)
+				require.NoError(t, err)
+				scope := nativeFixtureScope(a)
+				life.BindAccount(scope.Consumer, scope.Account, scope.Generation)
+				require.True(t, life.Admit(time.Now().Add(time.Second)))
+				ctx = WithGatewayNativeProviderReadIdle(WithGatewayNativeLifetime(bounded, life), tc.idle)
+			}
+			result, entered, err := svc.ForwardGatewayRoute(ctx, c, route, payload)
 			require.True(t, entered)
 			require.Equal(t, 1, transport.requests)
 			if tc.status == 400 {
@@ -228,8 +259,13 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			if tc.status != 400 {
 				require.NotContains(t, event, "provider_error_shape")
 			}
+			if tc.readReason != "" {
+				require.Equal(t, tc.readReason, event["read_error_reason"])
+			} else {
+				require.NotContains(t, event, "read_error_reason")
+			}
 			for field := range event {
-				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter"}, field)
+				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason"}, field)
 			}
 			for _, private := range []string{sentinel, "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)

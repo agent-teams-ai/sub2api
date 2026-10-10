@@ -377,6 +377,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	status := 0
 	providerErrorCategory := ""
 	providerErrorShape, providerErrorParameter := "", ""
+	readErrorReason := ""
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			phase = gatewayNativeFailureDeadline
@@ -388,7 +389,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			ProviderErrorCategory  string                            `json:"provider_error_category,omitempty"`
 			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
 			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
+			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
 		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
+		if phase == gatewayNativeFailureSSERead {
+			event.ReadErrorReason = readErrorReason
+		}
 		if status >= 100 && status <= 599 {
 			event.HTTPStatus = status
 		}
@@ -545,7 +550,18 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		event.Reset()
 		data = nil
 	}
-	if scanner.Err() != nil {
+	if err := scanner.Err(); err != nil {
+		if err == bufio.ErrTooLong {
+			return nil, fail(gatewayNativeFailureFrameLimit)
+		}
+		readErrorReason = "other"
+		if idleReader, ok := reader.(*gatewayNativeIdleReader); ok {
+			idleReader.mu.Lock()
+			if idleReader.expired {
+				readErrorReason = "idle_expired"
+			}
+			idleReader.mu.Unlock()
+		}
 		return nil, fail(gatewayNativeFailureSSERead)
 	}
 	return nil, fail(gatewayNativeFailureIncomplete)
