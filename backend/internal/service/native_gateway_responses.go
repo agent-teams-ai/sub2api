@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -84,47 +85,42 @@ const (
 	gatewayNativeFailureFlush       gatewayNativeResponseFailurePhase = "downstream_flush"
 )
 
-// Only fixed categories escape this bounded, request-deadline-controlled read.
-func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) string {
+type gatewayNativeHTTPErrorDiagnostic struct {
+	category, shape, parameter string
+}
+
+// Only fixed categories and closed projections escape this bounded read.
+func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) gatewayNativeHTTPErrorDiagnostic {
 	body, err := io.ReadAll(io.LimitReader(reader, 8193))
 	if err != nil {
-		return "body_read_failed"
+		return gatewayNativeHTTPErrorDiagnostic{category: "body_read_failed"}
 	}
 	if len(body) > 8192 {
-		return "body_limit"
+		return gatewayNativeHTTPErrorDiagnostic{category: "body_limit"}
 	}
 	if json.Valid(body) {
-		return gatewayNativeJSONErrorCategory(body)
+		return gatewayNativeJSONErrorCategory(body, "")
 	}
 	// Successful transport decoding removes Content-Encoding. Export only this
 	// fixed residual-encoding category, never the header or provider bytes.
 	if encoding = strings.TrimSpace(encoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return "unhandled_error_encoding"
+		return gatewayNativeHTTPErrorDiagnostic{category: "unhandled_error_encoding"}
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return "empty_error_body"
+		return gatewayNativeHTTPErrorDiagnostic{category: "empty_error_body"}
 	}
 	if http.DetectContentType(body) == "text/html; charset=utf-8" {
-		return "html_error_body"
+		return gatewayNativeHTTPErrorDiagnostic{category: "html_error_body"}
 	}
 	payload, event, ok := gatewayNativeHTTPErrorSSE(body)
 	if !ok {
-		return "invalid_error_json"
+		return gatewayNativeHTTPErrorDiagnostic{category: "invalid_error_json"}
 	}
-	category := gatewayNativeJSONErrorCategory(payload)
-	// Responses error events can carry the error fields directly. This is only
-	// diagnostic interpretation of an explicit error event, never forwarding.
-	var kind string
-	if fields, canonical := gatewayNativeCanonicalObject(payload, "type"); canonical {
-		_ = json.Unmarshal(fields["type"], &kind)
+	diagnostic := gatewayNativeJSONErrorCategory(payload, event)
+	if diagnostic.category == "unknown" {
+		diagnostic.category = "sse_error_body"
 	}
-	if category == "unknown" && (event == "error" || kind == "error") {
-		category = gatewayNativeJSONErrorCategory(append(append([]byte(`{"error":`), payload...), '}'))
-	}
-	if category == "unknown" {
-		return "sse_error_body"
-	}
-	return category
+	return diagnostic
 }
 
 // Conservative single-frame diagnostic subset: complete LF/CRLF framing,
@@ -179,26 +175,106 @@ func gatewayNativeHTTPErrorSSE(body []byte) ([]byte, string, bool) {
 	return payload, event, len(data) > 0 && json.Valid(payload)
 }
 
-func gatewayNativeJSONErrorCategory(body []byte) string {
-	var envelope struct {
-		Error struct {
-			Code    json.RawMessage `json:"code"`
-			Message json.RawMessage `json:"message"`
-			Param   json.RawMessage `json:"param"`
-		} `json:"error"`
+// Inspect protocol paths only. Never search arbitrary nested tool/user data.
+func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTPErrorDiagnostic {
+	d := gatewayNativeHTTPErrorDiagnostic{category: "unknown"}
+	root, ok := gatewayNativeCanonicalObject(body, "error", "response", "type")
+	if !ok {
+		d.shape = "non_object"
+		if bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+			d.shape = "ambiguous"
+		}
+		return d
 	}
-	if json.Unmarshal(body, &envelope) != nil {
-		return "unknown"
+	var kind string
+	_ = json.Unmarshal(root["type"], &kind)
+	selected := root["error"]
+	d.shape = "root_error_object"
+	if !bytes.HasPrefix(bytes.TrimSpace(selected), []byte("{")) {
+		selected = nil
+		if raw := root["response"]; bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+			response, canonical := gatewayNativeCanonicalObject(raw, "error", "status")
+			if !canonical {
+				d.shape = "ambiguous"
+				return d
+			}
+			var status string
+			_ = json.Unmarshal(response["status"], &status)
+			if kind == "response.failed" || kind == "response.incomplete" || event == "response.failed" || event == "response.incomplete" || status == "failed" || status == "incomplete" {
+				selected = response["error"]
+				d.shape = "response_error_object"
+			}
+		}
+		if !bytes.HasPrefix(bytes.TrimSpace(selected), []byte("{")) {
+			if kind != "error" && event != "error" {
+				d.shape = "unrecognized_object"
+				return d
+			}
+			selected, d.shape = body, "flat_error_object"
+		}
 	}
-	// Provider field types vary. Only strings can match the fixed vocabulary;
-	// other valid JSON values must neither mask sibling fields nor be coerced.
+	fields, canonical := gatewayNativeCanonicalObject(selected, "code", "type", "message", "param")
+	if !canonical {
+		d.shape = "ambiguous"
+		return d
+	}
 	var code, message, param string
-	_ = json.Unmarshal(envelope.Error.Code, &code)
-	_ = json.Unmarshal(envelope.Error.Message, &message)
-	_ = json.Unmarshal(envelope.Error.Param, &param)
+	kind = ""
+	_ = json.Unmarshal(fields["code"], &code)
+	_ = json.Unmarshal(fields["type"], &kind)
+	_ = json.Unmarshal(fields["message"], &message)
+	_ = json.Unmarshal(fields["param"], &param)
+	d.category = gatewayNativeErrorFieldsCategory(code, kind, message, param)
+	d.parameter = "other"
+	if raw := fields["param"]; len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		d.parameter = "missing"
+		if gatewayNativeValidationError(code) || gatewayNativeValidationError(kind) {
+			if match := gatewayNativeErrorParameterMessage.FindStringSubmatch(message); len(match) == 2 {
+				d.parameter = gatewayNativePublicErrorParameter(strings.TrimSuffix(strings.TrimSuffix(match[1], "."), ","))
+			}
+		}
+	} else if json.Unmarshal(raw, &param) == nil {
+		d.parameter = gatewayNativePublicErrorParameter(param)
+	}
+	return d
+}
+
+var gatewayNativeErrorParameterPath = regexp.MustCompile(`^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+|\[\d+\])*$`)
+var gatewayNativeErrorParameterMessage = regexp.MustCompile(`(?i)^(?:(?:unknown|unsupported|missing(?: required)?) parameter|invalid (?:parameter|type for|value for))(?:\s*[:=]\s*|\s+)["']?([^"' \t\r\n:]+)(?:["']|[\t\r\n ]|:|$)`)
+
+func gatewayNativePublicErrorParameter(path string) string {
+	if !gatewayNativeErrorParameterPath.MatchString(path) {
+		return "other"
+	}
+	field := strings.FieldsFunc(path, func(c rune) bool { return c == '.' || c == '[' })[0]
+	switch field {
+	case "service_tier", "max_output_tokens", "parallel_tool_calls", "context_management",
+		"tools", "input", "reasoning", "model", "store", "instructions", "stream", "text",
+		"tool_choice", "truncation", "previous_response_id", "prompt_cache_key", "prompt_cache_retention",
+		"include", "metadata", "background", "temperature", "top_p":
+		return field
+	}
+	return "other"
+}
+
+func gatewayNativeValidationError(value string) bool {
+	switch value {
+	case "unsupported_parameter", "unknown_parameter", "invalid_request_error", "invalid_parameter", "invalid_type", "invalid_value", "missing_required_parameter", "missing_parameter":
+		return true
+	}
+	return false
+}
+
+func gatewayNativeErrorFieldsCategory(code, kind, message, param string) string {
 	switch code {
 	case "code_mode_only":
 		return "code_mode_rejected"
+	case "invalid_api_key":
+		return "authentication_rejected"
+	case "model_not_found", "invalid_model":
+		return "model_rejected"
+	}
+	switch kind {
 	case "invalid_api_key":
 		return "authentication_rejected"
 	case "model_not_found", "invalid_model":
@@ -222,7 +298,13 @@ func gatewayNativeJSONErrorCategory(body []byte) string {
 		return "code_mode_rejected"
 	}
 	switch code {
-	case "unsupported_parameter":
+	case "unsupported_parameter", "unknown_parameter":
+		return "unsupported_parameter"
+	case "invalid_request_error":
+		return "invalid_request"
+	}
+	switch kind {
+	case "unsupported_parameter", "unknown_parameter":
 		return "unsupported_parameter"
 	case "invalid_request_error":
 		return "invalid_request"
@@ -260,16 +342,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// stdout intact. Never include context fields, headers, bodies or error text.
 	status := 0
 	providerErrorCategory := ""
+	providerErrorShape, providerErrorParameter := "", ""
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			phase = gatewayNativeFailureDeadline
 		}
 		event := struct {
-			Event                 string                            `json:"event"`
-			Phase                 gatewayNativeResponseFailurePhase `json:"phase"`
-			HTTPStatus            int                               `json:"http_status,omitempty"`
-			ProviderErrorCategory string                            `json:"provider_error_category,omitempty"`
-		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory}
+			Event                  string                            `json:"event"`
+			Phase                  gatewayNativeResponseFailurePhase `json:"phase"`
+			HTTPStatus             int                               `json:"http_status,omitempty"`
+			ProviderErrorCategory  string                            `json:"provider_error_category,omitempty"`
+			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
+			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
+		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
 		if status >= 100 && status <= 599 {
 			event.HTTPStatus = status
 		}
@@ -297,7 +382,8 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
 		if resp.StatusCode == http.StatusBadRequest {
-			providerErrorCategory = gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
+			diagnostic := gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
 		}
 		return nil, fail(gatewayNativeFailureHTTP)
 	}
