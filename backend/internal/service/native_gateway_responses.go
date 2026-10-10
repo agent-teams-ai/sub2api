@@ -93,18 +93,26 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 	if len(body) > 8192 {
 		return "body_limit"
 	}
+	if !json.Valid(body) {
+		return "invalid_error_json"
+	}
 	var envelope struct {
 		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Param   string `json:"param"`
+			Code    json.RawMessage `json:"code"`
+			Message json.RawMessage `json:"message"`
+			Param   json.RawMessage `json:"param"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return "invalid_error_json"
+		return "unknown"
 	}
-	e := envelope.Error
-	switch e.Code {
+	// Provider field types vary. Only strings can match the fixed vocabulary;
+	// other valid JSON values must neither mask sibling fields nor be coerced.
+	var code, message, param string
+	_ = json.Unmarshal(envelope.Error.Code, &code)
+	_ = json.Unmarshal(envelope.Error.Message, &message)
+	_ = json.Unmarshal(envelope.Error.Param, &param)
+	switch code {
 	case "code_mode_only":
 		return "code_mode_rejected"
 	case "invalid_api_key":
@@ -112,7 +120,7 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 	case "model_not_found", "invalid_model":
 		return "model_rejected"
 	}
-	switch e.Param {
+	switch param {
 	case "service_tier":
 		return "parameter_service_tier"
 	case "max_output_tokens":
@@ -122,14 +130,14 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 	case "context_management":
 		return "parameter_context_management"
 	}
-	message := strings.ToLower(e.Message)
+	message = strings.ToLower(message)
 	if strings.Contains(message, "custom tools require mimo freeform responses lite mode") {
 		return "responses_lite_required"
 	}
 	if strings.Contains(message, "code_mode is required") || strings.Contains(message, "code_mode must be enabled") || strings.Contains(message, "invalid code_mode") {
 		return "code_mode_rejected"
 	}
-	switch e.Code {
+	switch code {
 	case "unsupported_parameter":
 		return "unsupported_parameter"
 	case "invalid_request_error":
