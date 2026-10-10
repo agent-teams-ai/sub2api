@@ -3,10 +3,14 @@ package service
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -16,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -444,6 +449,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if !stream {
 		output, err := io.ReadAll(io.LimitReader(reader, gatewayNativeResponseLimit+1))
 		if err != nil {
+			if errors.Is(err, errGatewayNativeOutputLimit) {
+				return nil, fail(gatewayNativeFailureLimit)
+			}
 			return nil, fail(gatewayNativeFailureRead)
 		}
 		if len(output) > gatewayNativeResponseLimit {
@@ -551,20 +559,62 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		data = nil
 	}
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, errGatewayNativeOutputLimit) {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
 		if err == bufio.ErrTooLong {
 			return nil, fail(gatewayNativeFailureFrameLimit)
 		}
-		readErrorReason = "other"
-		if idleReader, ok := reader.(*gatewayNativeIdleReader); ok {
-			idleReader.mu.Lock()
-			if idleReader.expired {
-				readErrorReason = "idle_expired"
-			}
-			idleReader.mu.Unlock()
-		}
+		readErrorReason = gatewayNativeSSEReadErrorReason(err, reader)
 		return nil, fail(gatewayNativeFailureSSERead)
 	}
 	return nil, fail(gatewayNativeFailureIncomplete)
+}
+
+// Inspect typed identities only; error text and provider data never enter this
+// closed projection. The body idle timer owns its classification precedence.
+func gatewayNativeSSEReadErrorReason(err error, reader io.Reader) string {
+	if idleReader, ok := reader.(*gatewayNativeIdleReader); ok {
+		idleReader.mu.Lock()
+		expired := idleReader.expired
+		idleReader.mu.Unlock()
+		if expired {
+			return "idle_expired"
+		}
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, http.ErrBodyReadAfterClose):
+		return "body_after_close"
+	case errors.Is(err, net.ErrClosed):
+		return "connection_closed"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "transport_timeout"
+	}
+	var corrupt flate.CorruptInputError
+	if errors.As(err, &corrupt) || errors.Is(err, gzip.ErrChecksum) || errors.Is(err, gzip.ErrHeader) {
+		return "compression_error"
+	}
+	// Only the supported zstd decoder's exported error identities qualify.
+	for _, decoderError := range []error{
+		zstd.ErrReservedBlockType, zstd.ErrCompressedSizeTooBig, zstd.ErrBlockTooSmall,
+		zstd.ErrUnexpectedBlockSize, zstd.ErrMagicMismatch, zstd.ErrWindowSizeExceeded,
+		zstd.ErrWindowSizeTooSmall, zstd.ErrDecoderSizeExceeded, zstd.ErrUnknownDictionary,
+		zstd.ErrFrameSizeExceeded, zstd.ErrFrameSizeMismatch, zstd.ErrCRCMismatch,
+		zstd.ErrDecoderClosed, zstd.ErrDecoderNilInput,
+	} {
+		if errors.Is(err, decoderError) {
+			return "compression_error"
+		}
+	}
+	return "other"
 }
 
 // The forwarding goroutine is the sole reader. One timer per pending Read,

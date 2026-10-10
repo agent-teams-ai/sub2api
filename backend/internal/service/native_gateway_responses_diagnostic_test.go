@@ -3,10 +3,14 @@
 package service
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -84,10 +89,13 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	}
 	require.False(t, logger.L().Core().Enabled(zap.WarnLevel), "private composition starts without the generic logger")
 	const sentinel = "PRIVATE_NATIVE_DIAGNOSTIC_SENTINEL"
+	const cappedSSE = ": sandbox comment\n\n" + nativeReviewCompleted
+	const cappedJSON = `{"status":"completed","output":[]}`
 	cases := []struct {
 		name, contentType, wire, phase, category, encoding, shape, parameter string
 		readReason                                                           string
 		idle, deadline                                                       time.Duration
+		outputCap                                                            int64
 		status                                                               int
 		stream, success, unread                                              bool
 		transportErr, readErr                                                error
@@ -165,6 +173,23 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		// omit the closed reason. The shared unknown singleton is not idle proof.
 		{name: "SSE read", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: errors.New(sentinel)},
 		{name: "SSE nonidle unknown singleton", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: ErrGatewayNativeEffectUnknown},
+		{name: "SSE wrapped context canceled", status: 200, stream: true, phase: "sse_read", readReason: "context_canceled", contentType: "text/event-stream", readErr: fmt.Errorf("%s: %w", sentinel, context.Canceled)},
+		{name: "SSE upstream context deadline", status: 200, stream: true, phase: "sse_read", readReason: "context_deadline", contentType: "text/event-stream", readErr: context.DeadlineExceeded},
+		{name: "SSE unexpected EOF", status: 200, stream: true, phase: "sse_read", readReason: "unexpected_eof", contentType: "text/event-stream", readErr: io.ErrUnexpectedEOF},
+		{name: "SSE body after close", status: 200, stream: true, phase: "sse_read", readReason: "body_after_close", contentType: "text/event-stream", readErr: http.ErrBodyReadAfterClose},
+		{name: "SSE wrapped connection closed", status: 200, stream: true, phase: "sse_read", readReason: "connection_closed", contentType: "text/event-stream", readErr: fmt.Errorf("%s: %w", sentinel, net.ErrClosed)},
+		{name: "SSE typed timeout", status: 200, stream: true, phase: "sse_read", readReason: "transport_timeout", contentType: "text/event-stream", readErr: &net.DNSError{Name: sentinel, IsTimeout: true}},
+		{name: "SSE typed network nontimeout", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: &net.DNSError{Name: sentinel}},
+		{name: "SSE gzip checksum", status: 200, stream: true, phase: "sse_read", readReason: "compression_error", contentType: "text/event-stream", readErr: gzip.ErrChecksum},
+		{name: "SSE gzip header", status: 200, stream: true, phase: "sse_read", readReason: "compression_error", contentType: "text/event-stream", readErr: gzip.ErrHeader},
+		{name: "SSE wrapped deflate corruption", status: 200, stream: true, phase: "sse_read", readReason: "compression_error", contentType: "text/event-stream", readErr: fmt.Errorf("%s: %w", sentinel, flate.CorruptInputError(7))},
+		{name: "SSE wrapped zstd checksum", status: 200, stream: true, phase: "sse_read", readReason: "compression_error", contentType: "text/event-stream", readErr: fmt.Errorf("%s: %w", sentinel, zstd.ErrCRCMismatch)},
+		{name: "SSE zstd encoder counterexample", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: zstd.ErrEncoderClosed},
+		{name: "SSE text counterexample", status: 200, stream: true, phase: "sse_read", readReason: "other", contentType: "text/event-stream", readErr: errors.New("unexpected EOF gzip: invalid header " + sentinel)},
+		{name: "SSE exact cap includes comments", status: 200, stream: true, success: true, contentType: "text/event-stream", wire: cappedSSE, outputCap: int64(len(cappedSSE))},
+		{name: "SSE cap plus one", status: 200, stream: true, phase: "body_limit", contentType: "text/event-stream", wire: cappedSSE, outputCap: int64(len(cappedSSE) - 1)},
+		{name: "JSON exact cap", status: 200, success: true, wire: cappedJSON, outputCap: int64(len(cappedJSON))},
+		{name: "JSON cap plus one", status: 200, phase: "body_limit", wire: cappedJSON, outputCap: int64(len(cappedJSON) - 1)},
 		{name: "SSE oversized line", status: 200, stream: true, phase: "sse_frame_limit", contentType: "text/event-stream", wire: ":" + strings.Repeat("x", (1<<20)+1) + "\n\n"},
 		{name: "SSE idle expired", status: 200, stream: true, phase: "sse_read", readReason: "idle_expired", contentType: "text/event-stream", idle: 20 * time.Millisecond, deadline: time.Second},
 		{name: "SSE deadline omits read reason", status: 200, stream: true, phase: "deadline", contentType: "text/event-stream", idle: time.Second, deadline: 100 * time.Millisecond},
@@ -199,15 +224,26 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			payload := []byte(`{"model":"mimo-test","input":"` + sentinel + `","stream":` + strconv.FormatBool(tc.stream) + `}`)
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(string(payload)))
 			ctx := nativeFixtureContext(t, context.Background())
-			if tc.idle != 0 {
-				bounded, cancel := context.WithTimeout(ctx, tc.deadline)
+			if tc.idle != 0 || tc.outputCap != 0 {
+				deadline, outputCap := tc.deadline, tc.outputCap
+				if deadline == 0 {
+					deadline = time.Second
+				}
+				if outputCap == 0 {
+					outputCap = gatewayNativeResponseLimit
+				}
+				bounded, cancel := context.WithTimeout(ctx, deadline)
 				t.Cleanup(cancel)
-				life, err := NewGatewayNativeLifetime(bounded, cancel, func() {}, gatewayNativeResponseLimit)
+				life, err := NewGatewayNativeLifetime(bounded, cancel, func() {}, outputCap)
 				require.NoError(t, err)
 				scope := nativeFixtureScope(a)
 				life.BindAccount(scope.Consumer, scope.Account, scope.Generation)
 				require.True(t, life.Admit(time.Now().Add(time.Second)))
 				ctx = WithGatewayNativeProviderReadIdle(WithGatewayNativeLifetime(bounded, life), tc.idle)
+				if tc.outputCap != 0 {
+					svc.httpUpstream, err = NewGatewayNativeLifetimeUpstream(transport)
+					require.NoError(t, err)
+				}
 			}
 			result, entered, err := svc.ForwardGatewayRoute(ctx, c, route, payload)
 			require.True(t, entered)
@@ -220,6 +256,10 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			}
 			if transport.response != nil {
 				require.Positive(t, body.closes, "physical response body must still close")
+			}
+			if tc.outputCap != 0 {
+				require.Equal(t, 1, body.closes, "cap boundary keeps physical closure exactly once")
+				require.LessOrEqual(t, int64(body.bytesRead), tc.outputCap+1, "owned body keeps its one-byte cap probe")
 			}
 			logs, readErr := os.ReadFile(stderr.Name())
 			require.NoError(t, readErr)
@@ -267,7 +307,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			for field := range event {
 				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason"}, field)
 			}
-			for _, private := range []string{sentinel, "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
+			for _, private := range []string{sentinel, "gateway native output limit", "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
 			}
 		})

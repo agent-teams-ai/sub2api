@@ -282,7 +282,7 @@ func TestNEWTESTNativeLifetimeOvercapAndSealedEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.ReadAll(resp.Body); err != ErrGatewayNativeEffectUnknown {
+	if _, err := io.ReadAll(resp.Body); err != errGatewayNativeOutputLimit {
 		t.Fatal("output cap was not enforced", err)
 	}
 	_ = resp.Body.Close()
