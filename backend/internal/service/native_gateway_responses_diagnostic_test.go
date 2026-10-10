@@ -73,10 +73,10 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	require.False(t, logger.L().Core().Enabled(zap.WarnLevel), "private composition starts without the generic logger")
 	const sentinel = "PRIVATE_NATIVE_DIAGNOSTIC_SENTINEL"
 	cases := []struct {
-		name, contentType, wire, phase, category string
-		status                                   int
-		stream, success, unread                  bool
-		transportErr, readErr                    error
+		name, contentType, wire, phase, category, encoding string
+		status                                             int
+		stream, success, unread                            bool
+		transportErr, readErr                              error
 	}{
 		{name: "http400", status: 400, phase: "http_status", category: "invalid_error_json", wire: sentinel},
 		{name: "http400 unknown private", status: 400, phase: "http_status", category: "unknown", wire: `{"error":{"code":"` + sentinel + `","message":"` + sentinel + `","param":"` + sentinel + `"}}`},
@@ -96,7 +96,24 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "http400 root array", status: 400, phase: "http_status", category: "unknown", wire: `[{"error":{"code":"invalid_api_key"}}]`},
 		{name: "http400 null error", status: 400, phase: "http_status", category: "unknown", wire: `{"error":null}`},
 		{name: "http400 malformed JSON", status: 400, phase: "http_status", category: "invalid_error_json", wire: `{"error":{"code":400},`},
-		{name: "http400 empty body", status: 400, phase: "http_status", category: "invalid_error_json"},
+		{name: "http400 empty body", status: 400, phase: "http_status", category: "empty_error_body"},
+		{name: "http400 whitespace", status: 400, phase: "http_status", category: "empty_error_body", wire: " \t\r\n"},
+		{name: "http400 HTML", status: 400, phase: "http_status", category: "html_error_body", wire: "<!DOCTYPE html><html><body>" + sentinel + "</body></html>"},
+		{name: "http400 residual encoding", status: 400, phase: "http_status", category: "unhandled_error_encoding", encoding: sentinel, wire: sentinel},
+		{name: "http400 encoded valid JSON", status: 400, phase: "http_status", category: "authentication_rejected", encoding: "gzip", wire: `{"error":{"code":"invalid_api_key"}}`},
+		{name: "http400 SSE known envelope", status: 400, phase: "http_status", category: "code_mode_rejected", wire: "event: error\ndata: {\"error\":{\"message\":\"code_mode is required. " + sentinel + "\"}}\n\n"},
+		{name: "http400 SSE direct multiline CRLF", status: 400, phase: "http_status", category: "parameter_service_tier", wire: ": private " + sentinel + "\r\nevent: error\r\nid: " + sentinel + "\r\nretry: 10\r\ndata: {\"code\":400,\r\ndata: \"param\":\"service_tier\"}\r\n\r\n"},
+		{name: "http400 SSE typed error", status: 400, phase: "http_status", category: "authentication_rejected", wire: "data: {\"type\":\"error\",\"code\":\"invalid_api_key\"}\n\n"},
+		{name: "http400 SSE unknown", status: 400, phase: "http_status", category: "sse_error_body", wire: "event: " + sentinel + "\ndata: {\"error\":{\"message\":\"" + sentinel + "\"}}\n\n"},
+		{name: "http400 SSE incomplete", status: 400, phase: "http_status", category: "invalid_error_json", wire: "event: error\ndata: {\"error\":{\"code\":\"invalid_api_key\"}}\n"},
+		{name: "http400 SSE multiple frames", status: 400, phase: "http_status", category: "invalid_error_json", wire: "data: {}\n\ndata: {\"error\":{\"code\":\"invalid_api_key\"}}\n\n"},
+		{name: "http400 SSE malformed data", status: 400, phase: "http_status", category: "invalid_error_json", wire: "event: error\ndata: {\"error\":\n\n"},
+		{name: "http400 pseudo SSE", status: 400, phase: "http_status", category: "invalid_error_json", wire: sentinel + "\ndata: {\"error\":{\"code\":\"invalid_api_key\"}}\n\n"},
+		{name: "http400 SSE duplicate event", status: 400, phase: "http_status", category: "invalid_error_json", wire: "event: error\nevent: private\ndata: {\"code\":\"invalid_api_key\"}\n\n"},
+		{name: "http400 SSE invalid retry", status: 400, phase: "http_status", category: "invalid_error_json", wire: "retry: -1\ndata: {\"error\":{\"code\":\"invalid_api_key\"}}\n\n"},
+		{name: "http400 SSE invalid UTF8", status: 400, phase: "http_status", category: "invalid_error_json", wire: ": \xff\ndata: {}\n\n"},
+		{name: "http400 read failure precedence", status: 400, phase: "http_status", category: "body_read_failed", encoding: "gzip", readErr: errors.New(sentinel)},
+		{name: "http400 encoded bound", status: 400, phase: "http_status", category: "body_limit", encoding: "gzip", wire: strings.Repeat(sentinel, 1024)},
 		{name: "http400 bound", status: 400, phase: "http_status", category: "body_limit", wire: strings.Repeat(sentinel, 1024)},
 		{name: "http401", status: 401, phase: "http_status", unread: true, wire: sentinel},
 		{name: "http429", status: 429, phase: "http_status", unread: true, wire: sentinel},
@@ -125,7 +142,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			body := &nativeDiagnosticBody{Reader: strings.NewReader(tc.wire), readErr: tc.readErr}
 			transport := &nativeDiagnosticHTTP{err: tc.transportErr}
 			if tc.status != 0 {
-				transport.response = &http.Response{StatusCode: tc.status, Body: body, Header: http.Header{"Content-Type": {tc.contentType}, "X-Private": {sentinel}}}
+				transport.response = &http.Response{StatusCode: tc.status, Body: body, Header: http.Header{"Content-Type": {tc.contentType}, "X-Private": {sentinel}, "Content-Encoding": {tc.encoding}}}
 			}
 			a := nativeReviewStreamAccount(t, "http://127.0.0.1", GatewayMiMoResponsesProfile)
 			route, err := GatewayNativeDescriptor(a)

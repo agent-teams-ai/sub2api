@@ -85,7 +85,7 @@ const (
 )
 
 // Only fixed categories escape this bounded, request-deadline-controlled read.
-func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
+func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) string {
 	body, err := io.ReadAll(io.LimitReader(reader, 8193))
 	if err != nil {
 		return "body_read_failed"
@@ -93,9 +93,93 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 	if len(body) > 8192 {
 		return "body_limit"
 	}
-	if !json.Valid(body) {
+	if json.Valid(body) {
+		return gatewayNativeJSONErrorCategory(body)
+	}
+	// Successful transport decoding removes Content-Encoding. Export only this
+	// fixed residual-encoding category, never the header or provider bytes.
+	if encoding = strings.TrimSpace(encoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return "unhandled_error_encoding"
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "empty_error_body"
+	}
+	if http.DetectContentType(body) == "text/html; charset=utf-8" {
+		return "html_error_body"
+	}
+	payload, event, ok := gatewayNativeHTTPErrorSSE(body)
+	if !ok {
 		return "invalid_error_json"
 	}
+	category := gatewayNativeJSONErrorCategory(payload)
+	// Responses error events can carry the error fields directly. This is only
+	// diagnostic interpretation of an explicit error event, never forwarding.
+	var kind string
+	if fields, canonical := gatewayNativeCanonicalObject(payload, "type"); canonical {
+		_ = json.Unmarshal(fields["type"], &kind)
+	}
+	if category == "unknown" && (event == "error" || kind == "error") {
+		category = gatewayNativeJSONErrorCategory(append(append([]byte(`{"error":`), payload...), '}'))
+	}
+	if category == "unknown" {
+		return "sse_error_body"
+	}
+	return category
+}
+
+// Conservative single-frame diagnostic subset: complete LF/CRLF framing,
+// UTF-8, standard fields and valid JSON data. Never scan arbitrary text for JSON.
+func gatewayNativeHTTPErrorSSE(body []byte) ([]byte, string, bool) {
+	if !utf8.Valid(body) {
+		return nil, "", false
+	}
+	body = bytes.TrimPrefix(body, []byte{0xef, 0xbb, 0xbf})
+	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	if bytes.ContainsRune(body, '\r') || !bytes.HasSuffix(body, []byte("\n\n")) {
+		return nil, "", false
+	}
+	var data [][]byte
+	event := ""
+	eventSeen := false
+	for _, line := range bytes.Split(body[:len(body)-2], []byte("\n")) {
+		if len(line) == 0 { // A second frame is not a single diagnostic envelope.
+			return nil, "", false
+		}
+		if line[0] == ':' {
+			continue
+		}
+		field, value, _ := bytes.Cut(line, []byte(":"))
+		value = bytes.TrimPrefix(value, []byte(" "))
+		switch string(field) {
+		case "data":
+			data = append(data, value)
+		case "event":
+			if eventSeen {
+				return nil, "", false
+			}
+			event, eventSeen = string(value), true
+		case "id":
+			if bytes.ContainsRune(value, 0) {
+				return nil, "", false
+			}
+		case "retry":
+			if len(value) == 0 {
+				return nil, "", false
+			}
+			for _, c := range value {
+				if c < '0' || c > '9' {
+					return nil, "", false
+				}
+			}
+		default:
+			return nil, "", false
+		}
+	}
+	payload := bytes.Join(data, []byte("\n"))
+	return payload, event, len(data) > 0 && json.Valid(payload)
+}
+
+func gatewayNativeJSONErrorCategory(body []byte) string {
 	var envelope struct {
 		Error struct {
 			Code    json.RawMessage `json:"code"`
@@ -213,7 +297,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
 		if resp.StatusCode == http.StatusBadRequest {
-			providerErrorCategory = gatewayNativeHTTPErrorCategory(resp.Body)
+			providerErrorCategory = gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
 		}
 		return nil, fail(gatewayNativeFailureHTTP)
 	}
