@@ -17,10 +17,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // Only the explicit private native Responses profile uses this byte-preserving
-// path. Stock passthrough performs custom-tool conversion and error retries;
+// path, except the validated default tier is omitted on MiMo provider wire.
+// Stock passthrough performs custom-tool conversion and error retries;
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
@@ -331,9 +333,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
+	upstreamBody := body
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
+		// Internal admission still requires default. MiMo does not document this
+		// provider field: delete only its top-level span after validation, keeping
+		// every unrelated tool/user byte. Other profiles retain the original body.
+		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
+		if err != nil {
+			return nil, ErrGatewayNativeIdentity
+		}
+	}
 	upstreamCtx, stopUpstream := context.WithCancel(ctx)
 	defer stopUpstream()
-	request, err := http.NewRequestWithContext(WithHTTPUpstreamProfile(upstreamCtx, HTTPUpstreamProfileOpenAI), http.MethodPost, target, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(WithHTTPUpstreamProfile(upstreamCtx, HTTPUpstreamProfileOpenAI), http.MethodPost, target, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
