@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -186,6 +187,10 @@ func (l *GatewayNativeLifetime) attach(resp *http.Response) {
 	}
 }
 
+// Private cap identity survives the reader wrappers; public forwarding still
+// returns ErrGatewayNativeEffectUnknown and exports only the fixed phase.
+var errGatewayNativeOutputLimit = errors.New("gateway native output limit")
+
 // Physical Close is performed exactly once. Both service defers and cancel
 // observe the same cached result. At most one closer exists per bounded entry;
 // blocked Close retains evidence and capacity instead of inventing closure.
@@ -208,7 +213,7 @@ func (b *gatewayNativeOwnedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.remaining -= int64(n)
 	if b.remaining < 0 {
-		return 0, ErrGatewayNativeEffectUnknown
+		return 0, errGatewayNativeOutputLimit
 	}
 	return n, err
 }

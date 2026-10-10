@@ -26,6 +26,7 @@ func TestGatewayNativeResponses_PhysicalAccountAndTools(t *testing.T) {
 	var fail atomic.Bool
 	var partial atomic.Bool
 	first := []byte(`{"model":"mimo-test","input":"sandbox","store":false,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
+	firstWire := []byte(`{"model":"mimo-test","input":"sandbox","store":false,"tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
 	second := []byte(`{"model":"mimo-test","input":[{"type":"custom_tool_call_output","call_id":"call_1","output":"sandbox result"}],"store":false}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dispatches.Add(1)
@@ -34,7 +35,7 @@ func TestGatewayNativeResponses_PhysicalAccountAndTools(t *testing.T) {
 		assert.Empty(t, r.Header.Get("X-Codex-Turn-State"))
 		payload, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
-		assert.True(t, bytes.Equal(payload, first) || bytes.Equal(payload, second) || strings.Contains(string(payload), `"stream":true`), "native custom-tool payload must survive unchanged")
+		assert.True(t, bytes.Equal(payload, firstWire) || bytes.Equal(payload, second) || strings.Contains(string(payload), `"stream":true`), "native custom-tool payload must survive unchanged")
 		if fail.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, `{"error":{"message":"private-vendor-body"}}`)
@@ -177,4 +178,78 @@ func TestGatewayNativeIdleZeroByteReadsCannotRenewTolerance(t *testing.T) {
 	require.Greater(t, body.reads.Load(), int32(1))
 	require.Less(t, time.Since(start), time.Second)
 	require.Error(t, ctx.Err())
+}
+
+// Admission's internal tier policy remains default. Only the trusted MiMo wire
+// omits that field; the real peer must receive all unrelated bytes unchanged.
+func TestGatewayNativeMiMoWireDefaultTier(t *testing.T) {
+	const opaque = `"input":[{"type":"additional_tools","role":"developer","tools":[],"service_tier":"nested","n":9007199254740993,"v":1.2300,"s":"\u0061"}],"store":false,"stream":false`
+	cases := []struct {
+		name, payload, expected string
+		denied                  bool
+	}{
+		{"first", `{ "service_tier" : "default", "model":"mimo-test",` + opaque + ` }`, `{ "model":"mimo-test",` + opaque + ` }`, false},
+		{"middle escaped", `{"model":"mimo-test", "service\u005ftier":"default",` + opaque + `}`, `{"model":"mimo-test",` + opaque + `}`, false},
+		{"last", `{"model":"mimo-test",` + opaque + `, "service_tier":"default" }`, `{"model":"mimo-test",` + opaque + ` }`, false},
+		{"nondefault", `{"model":"mimo-test","service_tier":"priority",` + opaque + `}`, "", true},
+		{"duplicate", `{"model":"mimo-test","service_tier":"default","service\u005ftier":"default",` + opaque + `}`, "", true},
+		{"alias", `{"model":"mimo-test","Service_Tier":"default",` + opaque + `}`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			wire := make(chan []byte, 1)
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+				if err != nil {
+					t.Error(err)
+				}
+				wire <- body
+				assert.Equal(t, "true", r.Header.Get("x-openai-internal-codex-responses-lite"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"completed","output":[]}`)
+			}))
+			defer peer.Close()
+			account := nativeReviewStreamAccount(t, peer.URL, GatewayMiMoResponsesProfile)
+			route, err := GatewayNativeDescriptor(account)
+			require.NoError(t, err)
+			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: &gatewayIdentityRealHTTP{client: peer.Client()}, cfg: rawChatCompletionsTestConfig()}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(tc.payload))
+			original := []byte(tc.payload)
+			payload := append([]byte(nil), original...)
+			_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
+			require.Equal(t, original, payload, "internal normalized payload must not mutate")
+			if tc.denied {
+				require.Same(t, ErrGatewayNativeIdentity, err)
+				require.False(t, entered)
+				require.Zero(t, calls.Load())
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, entered)
+			require.EqualValues(t, 1, calls.Load())
+			require.Equal(t, []byte(tc.expected), <-wire, "provider wire must differ only by the approved tier span")
+		})
+	}
+}
+
+func TestGatewayNativeOpenRouterWireDefaultTierUnchanged(t *testing.T) {
+	payload := []byte(`{"model":"` + GatewayOpenRouterModel + `","service_tier":"default", "input":[{"n":9007199254740993,"v":1.2300}],"stream":false}`)
+	transport := &nativeDiagnosticHTTP{response: &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"completed","output":[]}`)), Header: http.Header{}}}
+	account := nativeReviewStreamAccount(t, GatewayOpenRouterBaseURL, GatewayOpenRouterResponsesProfile)
+	account.Extra[GatewayModelExtraKey] = GatewayOpenRouterModel
+	route, err := GatewayNativeDescriptor(account)
+	require.NoError(t, err)
+	svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(payload))
+	_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
+	require.NoError(t, err)
+	require.True(t, entered)
+	require.Equal(t, 1, transport.requests)
+	actual, err := io.ReadAll(transport.lastRequest.Body)
+	require.NoError(t, err)
+	require.Equal(t, payload, actual)
 }
