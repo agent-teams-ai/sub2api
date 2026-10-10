@@ -139,6 +139,9 @@ func (r *connectHTTPEnrollmentStore) ReadGatewayNativeOAuth(ctx context.Context,
 
 type connectHTTPFixture struct {
 	router         *gin.Engine
+	custody        *service.GatewayNativeCredentialCustody
+	transport      *http.Transport
+	checks         atomic.Int32
 	store          *connectHTTPStore
 	enrolled       *connectHTTPEnrollmentStore
 	connect        *service.GatewayNativeOAuthConnect
@@ -182,6 +185,12 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { f.destination.Add(1); w.WriteHeader(200) }))
 	t.Cleanup(destination.Close)
 	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/backend-api/accounts/check/v4-2023-04-27" {
+			f.checks.Add(1)
+			require.Equal(t, "chatgpt.com", r.Host)
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{"fixture": map[string]any{"account": map[string]any{"account_id": "11111111-1111-4111-8111-111111111111", "is_default": true}, "entitlement": map[string]any{"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339Nano)}}}})
+			return
+		}
 		require.Equal(t, "auth.openai.com", r.Host)
 		if r.URL.Path == "/.well-known/jwks.json" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
@@ -229,7 +238,7 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address == "auth.openai.com:443" {
+		if address == "auth.openai.com:443" || address == "chatgpt.com:443" {
 			address = source.Listener.Addr().String()
 		} else if address != destination.Listener.Addr().String() {
 			return nil, fmt.Errorf("unexpected fixture destination")
@@ -242,6 +251,8 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 	enrollment, err := service.NewGatewayNativeOAuthEnrollment(service.NewGatewayNativeOAuthVerifier(transport), custody, f.enrolled, connectHTTPRandom(t, 32))
 	require.NoError(t, err)
 	f.enrollment = enrollment
+	f.custody = custody
+	f.transport = transport
 	f.connect, err = service.NewGatewayNativeOAuthConnect(connectHTTPRandom(t, 32), transport, f.store, enrollment, f.enrolled)
 	require.NoError(t, err)
 	gin.SetMode(gin.TestMode)
