@@ -99,8 +99,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
 	}
 	request.Header.Set("Content-Type", "application/json")
-	// No caller affinity, turn-state, auth or routing headers. No invented
-	// vendor protocol switch: the official model catalog drives CLI tool shapes.
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
+		request.Header.Set("x-openai-internal-codex-responses-lite", "true")
+	}
+	// Only trusted profile protocol headers; no caller affinity, turn-state,
+	// auth or routing headers.
 	request.Header.Set("Accept", "application/json")
 	if gjson.GetBytes(body, "stream").Bool() {
 		request.Header.Set("Accept", "text/event-stream")

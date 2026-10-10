@@ -42,13 +42,15 @@ func (b *nativeDiagnosticBody) Close() error {
 
 type nativeDiagnosticHTTP struct {
 	HTTPUpstream
-	response *http.Response
-	err      error
-	requests int
+	response    *http.Response
+	err         error
+	requests    int
+	lastRequest *http.Request
 }
 
-func (h *nativeDiagnosticHTTP) Do(*http.Request, string, int64, int) (*http.Response, error) {
+func (h *nativeDiagnosticHTTP) Do(request *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 	h.requests++
+	h.lastRequest = request
 	return h.response, h.err
 }
 
@@ -148,6 +150,48 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			for _, private := range []string{sentinel, "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
 			}
+		})
+	}
+}
+
+// Codex 0.147 sends this static protocol header when its MiMo catalog selects
+// Responses Lite. The trusted profile must restore it after caller headers are
+// discarded; other profiles must never inherit it from the caller.
+func TestGatewayNativeResponsesLiteHeaderIsProfileScoped(t *testing.T) {
+	cases := []struct{ name, profile, expected string }{
+		{"MiMo", GatewayMiMoResponsesProfile, "true"},
+		{"OpenRouter", GatewayOpenRouterResponsesProfile, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(`{"model":"mimo-test","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","tools":[]}]}],"stream":false}`)
+			responseBody := &nativeDiagnosticBody{Reader: strings.NewReader(`{"status":"completed","output":[]}`)}
+			transport := &nativeDiagnosticHTTP{response: &http.Response{StatusCode: 200, Body: responseBody, Header: http.Header{}}}
+			account := nativeReviewStreamAccount(t, "http://127.0.0.1", tc.profile)
+			if tc.profile == GatewayOpenRouterResponsesProfile {
+				account.Credentials["base_url"] = GatewayOpenRouterBaseURL
+				account.Extra[GatewayModelExtraKey] = GatewayOpenRouterModel
+				payload = []byte(strings.Replace(string(payload), "mimo-test", GatewayOpenRouterModel, 1))
+			}
+			route, err := GatewayNativeDescriptor(account)
+			require.NoError(t, err)
+			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(string(payload)))
+			c.Request.Header.Set("x-openai-internal-codex-responses-lite", "caller-controlled")
+			c.Request.Header.Set("X-Private-Routing", "must-not-forward")
+			result, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
+			require.True(t, entered)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, 1, transport.requests)
+			require.Equal(t, tc.expected, transport.lastRequest.Header.Get("x-openai-internal-codex-responses-lite"))
+			require.Empty(t, transport.lastRequest.Header.Get("X-Private-Routing"))
+			require.Equal(t, "Bearer sandbox-fixture", transport.lastRequest.Header.Get("Authorization"))
+			actual, err := io.ReadAll(transport.lastRequest.Body)
+			require.NoError(t, err)
+			require.Equal(t, payload, actual, "MCP/tool/input bytes stay unchanged")
 		})
 	}
 }
