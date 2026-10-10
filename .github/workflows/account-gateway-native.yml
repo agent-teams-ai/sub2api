@@ -129,7 +129,11 @@ jobs:
             go test -tags unit -race -c -o "$fixture_dir/$suite.test" "./internal/gateway$suite"
             selection='.'
             if [ "$suite" = launcher ]; then selection='^TestBootstrap'; fi
-            docker run --rm --network none --memory 768m --cpus 2 --pids-limit 256 \
+            memory_limit=768m
+            # The 32-request max-copy transport fixture includes clients and -race.
+            # This CI fixture budget does not change the native product memory gate.
+            if [ "$suite" = transport ]; then memory_limit=4g; fi
+            docker run --rm --network none --memory "$memory_limit" --cpus 2 --pids-limit 256 \
               --cap-add SYS_ADMIN --cap-add CHECKPOINT_RESTORE --security-opt seccomp=unconfined \
               -v "$fixture_dir/$suite.test:/fixture.test:ro" "$image" \
               /fixture.test -test.v -test.timeout=3m "-test.run=$selection" | tee "$fixture_dir/$suite.log"
