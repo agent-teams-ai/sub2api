@@ -235,6 +235,20 @@ func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTP
 		}
 	} else if json.Unmarshal(raw, &param) == nil {
 		d.parameter = gatewayNativePublicErrorParameter(param)
+		// MiMo's public validation errors can put a fixed explanation in param.
+		// Interpret only publicly reported sentences under the exact wire guard;
+		// never mine arbitrary provider text or fall back to a sibling message.
+		if d.parameter == "other" && message == "Param Incorrect" && (code == "400" || bytes.Equal(bytes.TrimSpace(fields["code"]), []byte("400"))) {
+			switch param {
+			case "`text` is not set":
+				d.parameter = "text"
+			case "The reasoning_content in the thinking mode must be passed back to the API.":
+				d.parameter = "reasoning"
+			}
+			if d.parameter != "other" && d.category == "unknown" {
+				d.category = "invalid_request"
+			}
+		}
 	}
 	return d
 }
