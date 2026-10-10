@@ -252,6 +252,14 @@ func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTP
 			}
 		}
 	}
+	// Public MiMo Responses errors identify unsupported structured output with
+	// this exact code/sentence and no parameter name. Project only the fixed
+	// public field; an explicit unknown or nonstring param blocks inference.
+	if d.category == "unknown" && code == "responses_feature_not_supported" &&
+		message == "text.format type 'json_schema' is not supported, only 'text' and 'json_object' are allowed." &&
+		(len(fields["param"]) == 0 || bytes.Equal(bytes.TrimSpace(fields["param"]), []byte(`""`))) {
+		d.category, d.parameter = "invalid_request", "text"
+	}
 	return d
 }
 
