@@ -104,6 +104,14 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 		return "invalid_error_json"
 	}
 	e := envelope.Error
+	switch e.Code {
+	case "code_mode_only":
+		return "code_mode_rejected"
+	case "invalid_api_key":
+		return "authentication_rejected"
+	case "model_not_found", "invalid_model":
+		return "model_rejected"
+	}
 	switch e.Param {
 	case "service_tier":
 		return "parameter_service_tier"
@@ -118,16 +126,10 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader) string {
 	if strings.Contains(message, "custom tools require mimo freeform responses lite mode") {
 		return "responses_lite_required"
 	}
-	if strings.Contains(message, "code_mode") && (strings.Contains(message, "required") || strings.Contains(message, "invalid")) {
+	if strings.Contains(message, "code_mode is required") || strings.Contains(message, "code_mode must be enabled") || strings.Contains(message, "invalid code_mode") {
 		return "code_mode_rejected"
 	}
 	switch e.Code {
-	case "code_mode_only":
-		return "code_mode_rejected"
-	case "invalid_api_key":
-		return "authentication_rejected"
-	case "model_not_found", "invalid_model":
-		return "model_rejected"
 	case "unsupported_parameter":
 		return "unsupported_parameter"
 	case "invalid_request_error":
