@@ -11,10 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -26,6 +28,38 @@ import (
 
 const GatewayOAuthConnectRedirect = "http://localhost:1455/auth/callback"
 const GatewayOAuthConnectTTL = 10 * time.Minute
+
+// Private, finite diagnostics. Provider text and credential material never enter it.
+type gatewayOAuthFailure struct {
+	phase  string
+	status int
+	cause  error
+}
+
+func (e *gatewayOAuthFailure) Error() string { return "gateway native oauth failure" }
+func (e *gatewayOAuthFailure) Unwrap() error { return e.cause }
+func gatewayOAuthFail(phase string, cause error) error {
+	if errors.Is(cause, ErrGatewayOAuthConflict) {
+		phase = "stage_conflict"
+	}
+	return &gatewayOAuthFailure{phase: phase, cause: cause}
+}
+func gatewayOAuthReportFailure(err error) {
+	var detail *gatewayOAuthFailure
+	if !errors.As(err, &detail) {
+		return
+	}
+	event := struct {
+		Event      string `json:"event"`
+		Phase      string `json:"phase"`
+		HTTPStatus int    `json:"http_status,omitempty"`
+	}{Event: "gateway_native_oauth_connect_failure", Phase: detail.phase}
+	if detail.phase == "exchange_http_status" && detail.status >= 100 && detail.status <= 599 {
+		event.HTTPStatus = detail.status
+	}
+	line, _ := json.Marshal(event)
+	_, _ = fmt.Fprintln(os.Stderr, string(line))
+}
 
 // Server-private persisted intent. Never marshal this as a response or log it.
 // No authorization code or token response is persisted here.
@@ -342,12 +376,18 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
 	}
 	bundle, err := s.exchange(bounded, code, material.Verifier)
+	if err != nil {
+		gatewayOAuthReportFailure(err)
+	}
 	material = connectMaterial{}
 	quarantine := err != nil
 	if err == nil {
 		enrollment := *s.enrollment
 		enrollment.repository = connectEnrollmentRepository{enrollment.repository, s.repository, &in}
 		out, stageErr := enrollment.Stage(bounded, in.Scope, in.EnrollmentOperation, bundle)
+		if stageErr != nil {
+			gatewayOAuthReportFailure(stageErr)
+		}
 		quarantine = errors.Is(stageErr, ErrGatewayOAuthConflict) || in.EnrollmentMAC == ""
 		if stageErr == nil {
 			saved, finishErr := s.repository.FinishConnect(bounded, in, "completed", out)
@@ -374,63 +414,74 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 	// One deadline covers dialing, TLS, headers AND reading/closing the body.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	deny := func() (GatewayNativeOAuthBundle, error) { return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity }
+	deny := func(phase string) (GatewayNativeOAuthBundle, error) {
+		return GatewayNativeOAuthBundle{}, gatewayOAuthFail(phase, ErrGatewayNativeIdentity)
+	}
 	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {openai.ClientID}, "redirect_uri": {GatewayOAuthConnectRedirect}, "code": {code}, "code_verifier": {verifier}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, openai.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return deny()
+		return deny("exchange_transport")
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	started := s.now()
 	response, err := s.client.Do(request)
 	if err != nil {
-		return deny()
+		return deny("exchange_transport")
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 65537))
 	closeErr := response.Body.Close()
-	if readErr != nil || closeErr != nil || len(raw) > 65536 || response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != openai.TokenURL {
-		return deny()
+	if readErr != nil || closeErr != nil {
+		return deny("exchange_body_read")
+	}
+	if len(raw) > 65536 {
+		return deny("exchange_body_limit")
+	}
+	if response.StatusCode != http.StatusOK {
+		return GatewayNativeOAuthBundle{}, &gatewayOAuthFailure{phase: "exchange_http_status", status: response.StatusCode, cause: ErrGatewayNativeIdentity}
+	}
+	if response.Request == nil || response.Request.URL.String() != openai.TokenURL {
+		return deny("exchange_transport")
 	}
 	m, err := gatewayOAuthJSON(raw)
 	if err != nil || !gatewayOAuthCanonical(m, "access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope") {
-		return deny()
+		return deny("exchange_json_shape")
 	}
 	if _, exists := m["error"]; exists {
-		return deny()
+		return deny("exchange_token_fields")
 	}
 	access, aOK := gatewayOAuthString(m, "access_token")
 	refresh, rOK := gatewayOAuthString(m, "refresh_token")
 	id, iOK := gatewayOAuthString(m, "id_token")
 	kind, _ := gatewayOAuthString(m, "token_type")
 	if !aOK || !rOK || !iOK || !strings.EqualFold(kind, "Bearer") {
-		return deny()
+		return deny("exchange_token_fields")
 	}
 	if expiry, exists := m["expires_in"]; exists {
 		if n, ok := gatewayOAuthSeconds(expiry); !ok || n <= 0 {
-			return deny()
+			return deny("exchange_token_fields")
 		}
 	}
 	if rawScope, exists := m["scope"]; exists {
 		var scope string
 		if json.Unmarshal(rawScope, &scope) != nil {
-			return deny()
+			return deny("exchange_scopes")
 		}
 		got := strings.Fields(scope)
 		want := strings.Fields(openai.DefaultScopes)
 		seen := map[string]bool{}
 		for _, name := range got {
 			if seen[name] {
-				return deny()
+				return deny("exchange_scopes")
 			}
 			seen[name] = true
 		}
 		if len(got) != len(want) {
-			return deny()
+			return deny("exchange_scopes")
 		}
 		for _, name := range want {
 			if !seen[name] {
-				return deny()
+				return deny("exchange_scopes")
 			}
 		}
 	}
@@ -439,11 +490,11 @@ func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier
 	delete(m, "id_token")
 	metadata, err := json.Marshal(m)
 	if err != nil {
-		return deny()
+		return deny("exchange_bundle")
 	}
 	bundle := GatewayNativeOAuthBundle{AccessToken: access, RefreshToken: refresh, IDToken: id, SensitiveMetadata: metadata, requestStarted: started}
 	if _, err := bundle.bytes(); err != nil {
-		return deny()
+		return deny("exchange_bundle")
 	}
 	return bundle, nil
 }

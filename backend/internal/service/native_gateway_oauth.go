@@ -466,16 +466,16 @@ func NewGatewayNativeOAuthEnrollment(v *GatewayNativeOAuthVerifier, c *GatewayNa
 }
 func (e *GatewayNativeOAuthEnrollment) Stage(ctx context.Context, s GatewayNativeCredentialScope, operation string, b GatewayNativeOAuthBundle) (GatewayNativeOAuthOutcome, error) {
 	if e == nil || !GatewayNativeOAuthScopeAuthorized(ctx, s) || !GatewayNativeCredentialRefValid(operation) {
-		return GatewayNativeOAuthOutcome{}, ErrGatewayNativeIdentity
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_metadata", ErrGatewayNativeIdentity)
 	}
 	// Snapshot the whole intent before the first network/repository call.
 	raw, err := b.bytes()
 	if err != nil {
-		return GatewayNativeOAuthOutcome{}, err
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_metadata", err)
 	}
 	var snapshot GatewayNativeOAuthBundle
 	if json.Unmarshal(raw, &snapshot) != nil {
-		return GatewayNativeOAuthOutcome{}, ErrGatewayNativeIdentity
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_metadata", ErrGatewayNativeIdentity)
 	}
 	scopeRaw, _ := json.Marshal(s)
 	mac := hmac.New(sha256.New, e.intentKey)
@@ -490,39 +490,46 @@ func (e *GatewayNativeOAuthEnrollment) Stage(ctx context.Context, s GatewayNativ
 	// A previously accepted exact intent reads its original durable outcome even
 	// when the original ID token expires. This path creates no new authority.
 	if outcome, found, err := e.repository.ReplayGatewayNativeOAuth(ctx, s, operation, commitment); err != nil || found {
-		return outcome, err
+		if err != nil {
+			return outcome, gatewayOAuthFail("stage_repository", err)
+		}
+		return outcome, nil
 	}
 	metadata, err := gatewayOAuthJSON(snapshot.SensitiveMetadata)
 	if err != nil {
-		return GatewayNativeOAuthOutcome{}, err
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_metadata", err)
 	}
 	for name := range metadata {
 		if strings.EqualFold(name, gatewayOAuthTimingMember) {
-			return GatewayNativeOAuthOutcome{}, ErrGatewayNativeIdentity
+			return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_metadata", ErrGatewayNativeIdentity)
 		}
 	}
 	identity, err := e.verifier.Verify(ctx, snapshot.IDToken)
 	if err != nil {
-		return GatewayNativeOAuthOutcome{}, err
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_identity", err)
 	}
 	// Replay commitment above remains the original four-field input. Enrichment
 	// occurs only after fresh verification, without another JWKS read or clock.
 	if !b.requestStarted.IsZero() {
 		snapshot, err = gatewayOAuthTimedBundle(snapshot, b.requestStarted, identity, e.custody)
 		if err != nil {
-			return GatewayNativeOAuthOutcome{}, err
+			return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_custody", err)
 		}
 		raw, err = snapshot.bytes()
 		if err != nil {
-			return GatewayNativeOAuthOutcome{}, err
+			return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_custody", err)
 		}
 	}
 	envelope, err := e.custody.sealOAuthBytes(s, raw)
 	if err != nil {
-		return GatewayNativeOAuthOutcome{}, err
+		return GatewayNativeOAuthOutcome{}, gatewayOAuthFail("stage_custody", err)
 	}
 
-	return e.repository.StageGatewayNativeOAuth(ctx, GatewayNativeOAuthReservation{Identity: identity, Scope: s, Operation: operation, IntentMAC: commitment, Envelope: envelope})
+	out, err := e.repository.StageGatewayNativeOAuth(ctx, GatewayNativeOAuthReservation{Identity: identity, Scope: s, Operation: operation, IntentMAC: commitment, Envelope: envelope})
+	if err != nil {
+		return out, gatewayOAuthFail("stage_repository", err)
+	}
+	return out, nil
 }
 
 // Reserved timing lives inside SensitiveMetadata and therefore the existing AEAD.
