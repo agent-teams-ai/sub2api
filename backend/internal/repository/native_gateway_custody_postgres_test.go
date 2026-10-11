@@ -128,21 +128,24 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 
 	const oldFile = "244_gateway_oauth_fenced_refresh.sql"
 	const newFile = "247_gateway_native_openrouter_profile.sql"
+	const nanoFile = "248_gateway_native_openrouter_nano_model.sql"
 	oldSQL, err := migrations.FS.ReadFile(oldFile)
 	require.NoError(t, err)
 	newSQL, err := migrations.FS.ReadFile(newFile)
 	require.NoError(t, err)
+	nanoSQL, err := migrations.FS.ReadFile(nanoFile)
+	require.NoError(t, err)
 	guardStart := strings.Index(string(oldSQL), "CREATE OR REPLACE FUNCTION public.gateway_native_account_guard()")
 	require.GreaterOrEqual(t, guardStart, 0)
 	oldGuard := string(oldSQL)[guardStart:]
-	var newApplied bool
-	for _, file := range []string{oldFile, "246_gateway_oauth_profile_qualification.sql", newFile} {
+	var newApplied, nanoApplied bool
+	for _, file := range []string{oldFile, "246_gateway_oauth_profile_qualification.sql", newFile, nanoFile} {
 		content, readErr := migrations.FS.ReadFile(file)
 		require.NoError(t, readErr)
 		digest := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
 		var checksum string
 		err = tx.QueryRowContext(ctx, `SELECT checksum FROM public.schema_migrations WHERE filename=$1`, file).Scan(&checksum)
-		if file == newFile && errors.Is(err, sql.ErrNoRows) {
+		if (file == newFile || file == nanoFile) && errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		require.True(t, err == nil, "known profile migration history required")
@@ -150,10 +153,13 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 		if file == newFile {
 			newApplied = true
 		}
+		if file == nanoFile {
+			nanoApplied = true
+		}
 	}
 	var later int
 	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM public.schema_migrations
-		WHERE substring(filename from '^([0-9]{3})_')::integer>246 AND filename<>$1`, newFile).Scan(&later)
+		WHERE substring(filename from '^([0-9]{3})_')::integer>246 AND filename NOT IN ($1,$2)`, newFile, nanoFile).Scan(&later)
 	require.True(t, err == nil, "read later migration precondition")
 	require.Zero(t, later, "future schema requires separate qualification")
 	var originalFunction, originalBody, originalHistory string
@@ -163,6 +169,10 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	expectedGuard := oldGuard
 	if newApplied {
 		expectedGuard = string(newSQL)
+	}
+	if nanoApplied {
+		require.True(t, newApplied, "248 requires the preceding 247 history")
+		expectedGuard = string(nanoSQL)
 	}
 	parts := strings.Split(expectedGuard, "$$")
 	require.Len(t, parts, 3)
@@ -259,13 +269,27 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	require.Equal(t, service.GatewayOpenRouterBaseURL, route.BaseURL)
 	require.Equal(t, service.GatewayOpenRouterModel, route.Model)
 
+	nano := fixture(service.GatewayOpenRouterResponsesProfile, service.GatewayOpenRouterBaseURL, "openai/gpt-5.4-nano")
+	nanoCredentials, err := json.Marshal(nano.Credentials)
+	require.NoError(t, err)
+	nanoExtra, err := json.Marshal(nano.Extra)
+	require.NoError(t, err)
+	reject(insertSQL, nano.Name, string(nanoCredentials), string(nanoExtra))
+	_, err = tx.ExecContext(ctx, string(nanoSQL))
+	require.True(t, err == nil, "execute actual additive 248 SQL")
+	err = tx.QueryRowContext(ctx, insertSQL, nano.Name, string(nanoCredentials), string(nanoExtra)).Scan(&nano.ID, &nano.CreatedAt)
+	require.True(t, err == nil, "248 must accept the same protected nano row rejected by 247")
+	nanoRoute, err := service.GatewayNativeDescriptor(nano)
+	require.NoError(t, err)
+	require.Equal(t, "openai/gpt-5.4-nano", nanoRoute.Model)
+
 	mimo := fixture(service.GatewayMiMoResponsesProfile, "https://configured-mimo.invalid/v1", "configured-mimo-model")
 	mimoCredentials, err := json.Marshal(mimo.Credentials)
 	require.NoError(t, err)
 	mimoExtra, err := json.Marshal(mimo.Extra)
 	require.NoError(t, err)
 	err = tx.QueryRowContext(ctx, insertSQL, mimo.Name, string(mimoCredentials), string(mimoExtra)).Scan(&mimo.ID, &mimo.CreatedAt)
-	require.True(t, err == nil, "247 must preserve MiMo configured origin/model support")
+	require.True(t, err == nil, "248 must preserve MiMo configured origin/model support")
 	require.Positive(t, mimo.ID)
 	require.NotEqual(t, original.ID, mimo.ID)
 	require.False(t, mimo.CreatedAt.IsZero())
@@ -293,8 +317,8 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	require.True(t, err == nil, "read guard after rollback")
 	err = db.QueryRowContext(ctx, historySQL).Scan(&restoredHistory)
 	require.True(t, err == nil, "read history after rollback")
-	err = db.QueryRowContext(ctx, `SELECT count(*) FROM public.accounts WHERE extra->>'gateway_generation_v1' IN ($1,$2,$3)`,
-		original.Extra[service.GatewayGenerationExtraKey], mimo.Extra[service.GatewayGenerationExtraKey], wrong.Extra[service.GatewayGenerationExtraKey]).Scan(&fixtures)
+	err = db.QueryRowContext(ctx, `SELECT count(*) FROM public.accounts WHERE extra->>'gateway_generation_v1' IN ($1,$2,$3,$4)`,
+		original.Extra[service.GatewayGenerationExtraKey], mimo.Extra[service.GatewayGenerationExtraKey], wrong.Extra[service.GatewayGenerationExtraKey], nano.Extra[service.GatewayGenerationExtraKey]).Scan(&fixtures)
 	require.True(t, err == nil, "read fixture absence after rollback")
 	require.Zero(t, fixtures)
 	require.True(t, originalFunction == restoredFunction, "rollback must restore the original guard")

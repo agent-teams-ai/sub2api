@@ -387,6 +387,20 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		decoded.openRouterProfile().Profile != service.GatewayOpenRouterResponsesProfile || decoded.openRouterProfile().Tokens != 50 {
 		t.Fatal("second profile replaced the MiMo tuple or its own limits")
 	}
+	for _, model := range []string{"openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "unapproved-model"} {
+		candidate := c
+		second := *c.OpenRouter
+		second.Model = model
+		candidate.OpenRouter = &second
+		_, err := candidate.validate()
+		if model == "unapproved-model" {
+			if err == nil {
+				t.Fatal("unknown OpenRouter model accepted")
+			}
+		} else if err != nil || candidate.openRouterProfile().Model != model || candidate.qualifiedProfile() != c.Profile.qualified() {
+			t.Fatal("approved OpenRouter model or MiMo default was not preserved", model)
+		}
+	}
 	for i, bad := range []string{
 		strings.Replace(string(raw), `"openRouter":{`, `"openRouter":null,"openRouter":{`, 1),
 		strings.Replace(string(raw), `"openRouter":{`, `"OpenRouter":{`, 1),

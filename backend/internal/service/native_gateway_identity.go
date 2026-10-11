@@ -24,11 +24,16 @@ const GatewayLegacyBridgeProfile = "mimo-token-plan-responses-chat-bridge-v1"
 const GatewayOpenRouterResponsesProfile = "openrouter-openai-responses-apikey-v1"
 const GatewayOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 const GatewayOpenRouterModel = "openai/gpt-5.4-mini"
+const GatewayOpenRouterNanoModel = "openai/gpt-5.4-nano"
+
+func GatewayOpenRouterModelValid(model string) bool {
+	return model == GatewayOpenRouterModel || model == GatewayOpenRouterNanoModel
+}
 
 // Finite identities only; endpoints/models remain trusted composition fields.
 func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
 	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
-		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && model == GatewayOpenRouterModel
+		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model)
 }
 
 var ErrGatewayNativeIdentity = errors.New("gateway native identity rejected")
