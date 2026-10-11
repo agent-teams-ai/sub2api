@@ -601,6 +601,52 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	_, physical, release, err := dispatchRepo.LockGatewayNativeOAuthDispatch(principal, scope, connectOperation, staged.AccountID)
 	require.NoError(t, err)
 	release()
+	resolver, ok := repo.(service.GatewayNativeOAuthRefreshResolver)
+	require.True(t, ok)
+	// Recovery selects the original completed/MAC-bound inert birth before F4.
+	pending, err := resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, staged.AccountID, pending.AccountID)
+	require.Equal(t, physical.Route.CreatedAt, pending.CreatedAt)
+	require.EqualValues(t, 1, pending.Version)
+	require.Nil(t, pending.Attempt)
+	pendingRefresh, err := service.NewGatewayNativeOAuthRefresh(refreshRepo, custody, verifier, transport)
+	require.NoError(t, err)
+	pendingIdle, err := pendingRefresh.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "idle", pendingIdle.State)
+	require.Zero(t, calls.Load())
+	require.Zero(t, accountChecks.Load())
+	var qualifications int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_profile_qualifications WHERE account_id=$1`, staged.AccountID).Scan(&qualifications))
+	require.Zero(t, qualifications, "maintenance cannot mint qualification")
+	foreignPending, _ := oauthPGScope(t, "foreign-pending", scope.Owner, scope.Account)
+	_, err = resolver.ResolveGatewayNativeOAuthRefresh(foreignPending, scope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	// Test-only corruption on this disposable fixture proves malformed identity
+	// is denied even when there is no qualification. Triggers are re-enabled in
+	// the same committed statement group, and the original value is restored.
+	setFixtureIdentity := func(table, statement string, value any) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		_, err = tx.ExecContext(ctx, "ALTER TABLE "+table+" DISABLE TRIGGER USER")
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx, statement, value, staged.AccountID)
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx, "ALTER TABLE "+table+" ENABLE TRIGGER USER")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+	}
+	var enrollmentMAC string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT enrollment_mac FROM gateway_oauth_connect_intents WHERE outcome_account_id=$1`, staged.AccountID).Scan(&enrollmentMAC))
+	macUpdate := `UPDATE gateway_oauth_connect_intents SET enrollment_mac=$1 WHERE outcome_account_id=$2`
+	setFixtureIdentity("gateway_oauth_connect_intents", macUpdate, strings.Repeat("0", 64))
+	func() {
+		defer setFixtureIdentity("gateway_oauth_connect_intents", macUpdate, enrollmentMAC)
+		_, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+		require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	}()
 	// A bare physical DTO has no private proof and cannot qualify this row.
 	require.False(t, physical.QualificationValid(1))
 	require.ErrorIs(t, dispatchRepo.QualifyGatewayNativeOAuthDispatch(principal, physical, 1), service.ErrGatewayNativeIdentity)
@@ -620,6 +666,15 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Equal(t, service.GatewayCodexOAuthModel, descriptor.Native.Model)
 	require.EqualValues(t, 1, accountChecks.Load())
 	require.Zero(t, calls.Load())
+	// Joining by account ID alone must not misclassify a mismatched existing
+	// qualification as absent and grant the pending-enrollment branch.
+	qualifiedOwnerUpdate := `UPDATE gateway_oauth_profile_qualifications SET owner_ref=$1 WHERE account_id=$2`
+	setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, "foreign-qualified-owner")
+	func() {
+		defer setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, scope.Owner)
+		_, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
+		require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	}()
 	var birth time.Time
 	var original, extra []byte
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT created_at,credentials,extra FROM accounts WHERE id=$1`, staged.AccountID).Scan(&birth, &original, &extra))
@@ -637,8 +692,6 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Empty(t, idle.RefreshRef)
 	require.Zero(t, calls.Load())
 	require.EqualValues(t, 1, accountChecks.Load())
-	resolver, ok := repo.(service.GatewayNativeOAuthRefreshResolver)
-	require.True(t, ok)
 	// Same numeric ID with one microsecond birth difference is not authority.
 	wrong := in
 	wrong.CreatedAt = wrong.CreatedAt.Add(time.Microsecond)
