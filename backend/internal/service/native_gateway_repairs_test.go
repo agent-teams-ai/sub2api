@@ -128,7 +128,9 @@ func TestGatewayNativeRepairPolicyCaseAliases(t *testing.T) {
 		require.EqualValues(t, 1, got.entries)
 		require.Equal(t, "mimo-test", gjson.GetBytes(got.outbound, "model").String())
 		if profile == GatewayMiMoResponsesProfile {
-			require.Equal(t, request, string(got.outbound))
+			const expected = ` {"mo\u0064el":"mimo-test","s\u0074ore":false,"previous_response_\u0069d":"","input":"sandbox","tools":[{"type":"function","name":"MODEL","parameters":{"type":"object"}}],"metadata":{"MODEL":"nested"}} `
+			require.Equal(t, expected, string(got.outbound))
+			require.False(t, gjson.GetBytes(got.outbound, "service_tier").Exists())
 		}
 	}
 }

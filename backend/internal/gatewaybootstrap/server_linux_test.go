@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,7 +178,7 @@ func TestDedicatedHTTPRolesAndBypassDenial(t *testing.T) {
 				if err != nil || len(data) > 1024 || resp.StatusCode != check.want {
 					t.Fatalf("runtime status/body: status=%d bytes=%d err=%v", resp.StatusCode, len(data), err)
 				}
-				keys := []string{"heapAllocBytes", "heapInuseBytes", "sysBytes", "numGC", "numGoroutine"}
+				keys := []string{"heapAllocBytes", "heapInuseBytes", "sysBytes", "numGC", "numGoroutine", "heapLiveBytes", "automaticGCCycles", "forcedGCCycles"}
 				if check.want != http.StatusOK {
 					for _, key := range append(keys, "credential", "fixture-consumer", "fixture-model") {
 						if bytes.Contains(data, []byte(key)) {
@@ -190,8 +191,13 @@ func TestDedicatedHTTPRolesAndBypassDenial(t *testing.T) {
 					t.Fatal("runtime response media/cache contract")
 				}
 				var fields map[string]json.RawMessage
-				if err := json.Unmarshal(data, &fields); err != nil || len(fields) != len(keys) {
+				if err := json.Unmarshal(data, &fields); err != nil || len(fields) != len(keys)+2 {
 					t.Fatalf("runtime fixed JSON shape: %s err=%v", data, err)
+				}
+				var version string
+				var consistent bool
+				if json.Unmarshal(fields["metricVersion"], &version) != nil || version != "natural_gc_live_v2" || json.Unmarshal(fields["gcSnapshotConsistent"], &consistent) != nil {
+					t.Fatal("runtime live metric version/consistency contract")
 				}
 				values := make(map[string]uint64, len(keys))
 				for _, key := range keys {
@@ -204,6 +210,9 @@ func TestDedicatedHTTPRolesAndBypassDenial(t *testing.T) {
 						t.Fatalf("runtime %s must be a finite unsigned integer: %s", key, fields[key])
 					}
 					values[key] = value
+				}
+				if consistent && values["automaticGCCycles"]+values["forcedGCCycles"] != values["numGC"] {
+					t.Fatal("consistent live snapshot requires completed cycle accounting")
 				}
 				if values["heapAllocBytes"] == 0 || values["heapInuseBytes"] < values["heapAllocBytes"] ||
 					values["sysBytes"] < values["heapInuseBytes"] || values["numGoroutine"] == 0 {
@@ -1374,4 +1383,29 @@ func (s *oauthMountRows) ResolveGatewayNativeOAuthRefresh(ctx context.Context, s
 		return service.GatewayNativeOAuthRefreshResolution{}, ErrDenied
 	}
 	return s.refreshResolution, nil
+}
+
+// Counter transitions may invalidate live retention evidence without losing raw heap observation.
+func TestNativeNaturalGCConsistency(t *testing.T) {
+	before := runtime.MemStats{NumGC: 7, LastGC: 42, NumForcedGC: 1}
+	cases := []struct {
+		name                     string
+		after                    runtime.MemStats
+		total, automatic, forced uint64
+		want                     bool
+	}{
+		{"stable", before, 7, 6, 1, true},
+		{"cycle completed", runtime.MemStats{NumGC: 8, LastGC: 43, NumForcedGC: 1}, 7, 6, 1, false},
+		{"timestamp changed", runtime.MemStats{NumGC: 7, LastGC: 43, NumForcedGC: 1}, 7, 6, 1, false},
+		{"forced changed", runtime.MemStats{NumGC: 7, LastGC: 42, NumForcedGC: 2}, 7, 6, 1, false},
+		{"metric cycle differs", before, 8, 7, 1, false},
+		{"cycle sum differs", before, 7, 7, 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nativeNaturalGCConsistent(before, tc.after, tc.total, tc.automatic, tc.forced); got != tc.want {
+				t.Fatalf("live consistency=%v want%v", got, tc.want)
+			}
+		})
+	}
 }

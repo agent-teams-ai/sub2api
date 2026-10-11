@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,9 +147,10 @@ func ownerPOST(client *http.Client, origin, path, token string, input any) owner
 // Authorization boundary, TLS provider, registry and private HTTP paths run.
 type ownerFixtureRepo struct {
 	service.AccountRepository
-	row  *service.Account
-	rows map[int64]*service.Account
-	mu   sync.Mutex
+	row              *service.Account
+	rows             map[int64]*service.Account
+	mu               sync.Mutex
+	beforeNativeLock func() // controlled test repository gate, never production wiring
 }
 
 func (r *ownerFixtureRepo) GetByID(_ context.Context, id int64) (*service.Account, error) {
@@ -157,6 +162,9 @@ func (r *ownerFixtureRepo) GetByID(_ context.Context, id int64) (*service.Accoun
 	return r.row, nil
 }
 func (r *ownerFixtureRepo) LockGatewayNativeAccount(_ context.Context, id int64) (*service.Account, func(), error) {
+	if r.beforeNativeLock != nil {
+		r.beforeNativeLock()
+	}
 	r.mu.Lock()
 	if r.rows != nil {
 		return r.rows[id], r.mu.Unlock, nil
@@ -723,7 +731,7 @@ func TestOwnerClosureMissingPortsAndSealedLostAck(t *testing.T) {
 
 // Controlled storage plus real private HTTP, callback and TLS provider. No DB
 // claim/occupancy qualification is inferred from these boundary tests.
-func ownerIngressFixture(t *testing.T, provider http.Handler) (*Handler, *httptest.Server, *atomic.Int32, <-chan Proof) {
+func ownerIngressFixture(t *testing.T, provider http.Handler, configure ...func(*Config, *ownerFixtureRepo)) (*Handler, *httptest.Server, *atomic.Int32, <-chan Proof) {
 	t.Helper()
 	upstream := httptest.NewTLSServer(provider)
 	t.Cleanup(upstream.Close)
@@ -746,11 +754,12 @@ func ownerIngressFixture(t *testing.T, provider http.Handler) (*Handler, *httpte
 	if err != nil {
 		t.Fatal(err)
 	}
-	gateway := service.NewOpenAIGatewayService(&ownerFixtureRepo{row: row}, nil, nil, nil, nil, nil, nil,
+	repo := &ownerFixtureRepo{row: row}
+	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil,
 		&config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 		nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
 	admits := &atomic.Int32{}
-	proofs := make(chan Proof, 1)
+	proofs := make(chan Proof, fixtureExecutionAdmissionCap)
 	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		admits.Add(1)
 		var input admitRequest
@@ -792,6 +801,9 @@ func ownerIngressFixture(t *testing.T, provider http.Handler) (*Handler, *httpte
 			}
 			return nil
 		},
+	}
+	for _, configure := range configure {
+		configure(&cfg, repo)
 	}
 	h, err := New(context.Background(), cfg)
 	if err != nil {
@@ -1234,4 +1246,208 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Isolated maximum-copy component check. The process includes the real private
+// handler/native service AND controlled HTTP clients/TLS peer. It is not an ELF,
+// SQL, full memory fixture, or cgroup-enforced 2 GiB qualification. No forced GC.
+func TestGatewayNativeMiMoMaximumCopy32(t *testing.T) {
+	const capBytes = 4 << 20
+	const count = fixtureExecutionAdmissionCap
+	prefix := `{"service_tier":"default","model":"fixture-model","input":"`
+	suffix := `","opaque":{"service_tier":"nested","n":9007199254740993,"v":1.2300,"s":"\u0061"},"store":false,"stream":true}`
+	payload := []byte(prefix + strings.Repeat("x", capBytes-64-len(prefix)-len(suffix)) + suffix)
+	originalDigest := sha256.Sum256(payload)
+	// qualifyPayload adds only its approved token cap. The MiMo wire then deletes
+	// only the tier span. Compute this expectation independently of both helpers.
+	wire := append([]byte(nil), payload[len(`{"service_tier":"default",`):len(payload)-1]...)
+	wire = append([]byte{'{'}, wire...)
+	wire = append(wire, []byte(`,"max_output_tokens":100}`)...)
+	wireDigest, wireBytes := sha256.Sum256(wire), len(wire)
+	wire = nil
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	copyHeld := make(chan struct{}, count)
+	dispatchRelease := make(chan struct{})
+	var dispatchOnce sync.Once
+	releaseDispatch := func() { dispatchOnce.Do(func() { close(dispatchRelease) }) }
+	defer releaseDispatch()
+	arrivals := make(chan error, count)
+	var providerEntries atomic.Int32
+	h, server, admits, proofs := ownerIngressFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerEntries.Add(1)
+		hash := sha256.New()
+		n, err := io.CopyBuffer(hash, io.LimitReader(r.Body, capBytes+1), make([]byte, 32<<10))
+		if err == nil && (n != int64(wireBytes) || !bytes.Equal(hash.Sum(nil), wireDigest[:]) || r.URL.Path != "/v1/responses" || r.Header.Get("x-openai-internal-codex-responses-lite") != "true") {
+			err = errors.New("controlled provider wire differed from approved tier-only omission")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // release the existing fresh-row lock at Do headers
+		arrivals <- err
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
+	}), func(cfg *Config, repo *ownerFixtureRepo) {
+		// Each callback arrived after native created its tier-deleted HTTP body.
+		// Hold all 32 copies at this controlled repository boundary before real Do.
+		repo.beforeNativeLock = func() { copyHeld <- struct{}{}; <-dispatchRelease }
+		cfg.Profile.RequestBytes = capBytes
+		cfg.EnvelopeBytes = 5 << 20
+		cfg.MaxEntries = count
+		cfg.IOTimeout = 30 * time.Second
+		cfg.ProviderReadIdle = 30 * time.Second
+		cfg.CallbackTimeout = 30 * time.Second
+	})
+	// Capture raw observations from this combined test process. RSS is /proc/self,
+	// not parent shell/compiler memory; Go observations are not external RSS.
+	type observation struct {
+		Milliseconds int64  `json:"milliseconds"`
+		HeapAlloc    uint64 `json:"heapAlloc"`
+		HeapInuse    uint64 `json:"heapInuse"`
+		RSS          uint64 `json:"rss"`
+	}
+	var observations []observation
+	var observationMu sync.Mutex
+	epoch := time.Now()
+	sample := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		stat, err := os.ReadFile("/proc/self/statm")
+		if err != nil {
+			t.Error("RSS observation unavailable")
+			return
+		}
+		fields := strings.Fields(string(stat))
+		if len(fields) < 2 {
+			t.Error("invalid statm observation")
+			return
+		}
+		pages, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			t.Error("invalid RSS pages")
+			return
+		}
+		observationMu.Lock()
+		observations = append(observations, observation{time.Since(epoch).Milliseconds(), m.HeapAlloc, m.HeapInuse, pages * uint64(os.Getpagesize())})
+		observationMu.Unlock()
+	}
+	sample()
+	stop, sampled := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(sampled)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sample()
+			case <-stop:
+				return
+			}
+		}
+	}()
+	var copyHeldAt, heldAt, drainedAt int64
+	defer func() {
+		close(stop)
+		<-sampled
+		observationMu.Lock()
+		raw := append([]observation(nil), observations...)
+		observationMu.Unlock()
+		var peakRSS uint64
+		for _, o := range raw {
+			if o.RSS > peakRSS {
+				peakRSS = o.RSS
+			}
+		}
+		report := struct {
+			Scope                              string `json:"scope"`
+			Requests, InternalBytes, WireBytes int
+			CopyHeldAt, HeldAt, DrainedAt      int64
+			PeakRSS                            uint64
+			CgroupLimitEnforced                bool
+			Samples                            []observation
+		}{"combined_native_private_http_controlled_peer_test_process", count, len(payload), wireBytes, copyHeldAt, heldAt, drainedAt, peakRSS, false, raw}
+		encoded, err := json.Marshal(report)
+		require.NoError(t, err)
+		t.Log("MAXCOPY_RAW " + string(encoded))
+		require.LessOrEqual(t, peakRSS, uint64(2<<30), "combined process observed peak exceeds existing 2 GiB risk ceiling")
+	}()
+	results := make(chan ownerHTTPResult, count)
+	client := &http.Client{Timeout: 60 * time.Second}
+	for i := 0; i < count; i++ {
+		input := ownerRequest()
+		input.RequestRef = fmt.Sprintf("maxcopy-%02d", i)
+		input.Descriptor.BaseURL = h.cfg.Profile.BaseURL
+		input.Admission.Limits.RequestBytes = capBytes
+		input.Admission.Limits.Concurrency = count
+		input.Admission.Limits.Requests = count
+		input.Admission.ExpiresAt = time.Now().Add(90 * time.Second).UTC().Format(time.RFC3339Nano)
+		input.Payload = payload
+		go func() { results <- ownerPOST(client, server.URL, "", fixtureExecutionToken, input) }()
+	}
+	for i := 0; i < count; i++ {
+		select {
+		case <-copyHeld:
+		case <-time.After(30 * time.Second):
+			t.Fatal("32 native tier-deleted request copies not held")
+		}
+	}
+	copyHeldAt = time.Since(epoch).Milliseconds()
+	sample()
+	releaseDispatch()
+	for i := 0; i < count; i++ {
+		select {
+		case err := <-arrivals:
+			require.NoError(t, err)
+		case <-time.After(45 * time.Second):
+			t.Fatal("32 simultaneous maximum-copy native entries not observed")
+		}
+	}
+	require.EqualValues(t, count, admits.Load())
+	require.EqualValues(t, count, providerEntries.Load())
+	require.Len(t, h.executions, count, "actual HTTP execution admission must stay occupied")
+	// A 33rd valid auth request must be rejected before its body is read/callback.
+	excess := ownerHeldBody(t, server.URL, "", fixtureExecutionToken, http.StatusServiceUnavailable)
+	_ = excess.Close()
+	require.EqualValues(t, count, admits.Load())
+	heldAt = time.Since(epoch).Milliseconds()
+	sample()
+	unblock()
+	for i := 0; i < count; i++ {
+		select {
+		case result := <-results:
+			require.NoError(t, result.err)
+			require.Equal(t, http.StatusOK, result.code)
+			require.Contains(t, string(result.body), `"status":"completed"`)
+		case <-time.After(10 * time.Second):
+			t.Fatal("normal native forwarding did not drain")
+		}
+	}
+	for i := 0; i < count; i++ {
+		proof := <-proofs
+		read := ownerPOST(client, server.URL, "/read-owner", fixtureExecutionToken, ownerClosureRequest{Proof: proof})
+		require.NoError(t, read.err)
+		require.Equal(t, http.StatusAccepted, read.code)
+		require.True(t, closed(read.receipt.Lifetime))
+		require.True(t, read.receipt.Lifetime.Entered)
+		require.True(t, read.receipt.Lifetime.Completed)
+		ack := ownerPOST(client, server.URL, "/ack-owner", fixtureExecutionToken, ownerClosureRequest{Proof: proof})
+		require.NoError(t, ack.err)
+		require.Equal(t, http.StatusAccepted, ack.code)
+		require.True(t, ack.receipt.Acknowledged)
+		require.Equal(t, "closed", ack.receipt.Phase)
+	}
+	require.Empty(t, h.executions)
+	require.Equal(t, originalDigest, sha256.Sum256(payload), "internal default/opaque payload must remain unchanged")
+	drainedAt = time.Since(epoch).Milliseconds()
+	time.Sleep(time.Second) // bounded postdrain raw observation, no runtime.GC.
+	sample()
+	require.EqualValues(t, count, admits.Load())
+	require.EqualValues(t, count, providerEntries.Load())
 }
