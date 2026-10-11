@@ -223,7 +223,7 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 	if !p.valid() {
 		return nil, ErrDenied
 	}
-	if c.OpenRouter != nil && (!c.OpenRouter.valid() || c.OpenRouter.BaseURL != service.GatewayOpenRouterBaseURL || c.OpenRouter.Model != service.GatewayOpenRouterModel) {
+	if c.OpenRouter != nil && (!c.OpenRouter.valid() || c.OpenRouter.BaseURL != service.GatewayOpenRouterBaseURL || !service.GatewayOpenRouterModelValid(c.OpenRouter.Model)) {
 		return nil, ErrDenied
 	}
 	if c.OAuth != nil {
