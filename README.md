@@ -478,11 +478,11 @@ Build and run from source code for development or customization.
 #### Prerequisites
 
 - Go 1.21+
-- Node.js 24 (default) or 26.10 (qualified by frontend CI); Node.js 25 is excluded
+- Node.js 26.11.1 (default) or 24.21.0 (compatibility); Node.js 25 is excluded
 - PostgreSQL 15+
 - Redis 7+
 
-Node.js 24 is the current default; CI is configured for Node.js 24.21 and 26.10 with frozen installs, existing critical frontend tests, and a production build. These checks do not establish full application E2E compatibility. Install pnpm 9.15.9 directly with npm without Corepack; both Docker `frontend-builder` targets support a `NODE_IMAGE` override.
+Node.js 26.11.1 is the current default; CI is configured for Node.js 26.11.1 and 24.21.0 with frozen installs, existing critical frontend tests, and a production build. These checks do not establish full application E2E compatibility. Install pnpm 9.15.9 directly with npm without Corepack; both Docker `frontend-builder` targets support a `NODE_IMAGE` override.
 
 #### Build Steps
 

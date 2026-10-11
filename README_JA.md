@@ -479,7 +479,7 @@ cd sub2api/deploy
 #### 前提条件
 
 - Go 1.21+
-- Node.js 18+
+- Node.js 26.11.1 (default), 24.21.0 (compatibility)
 - PostgreSQL 15+
 - Redis 7+
 
