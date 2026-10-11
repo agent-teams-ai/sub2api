@@ -12,9 +12,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
-// Reservation and inert native birth are one atomic transaction. PostgreSQL's
-// unique principal constraint serializes cross-consumer/owner contenders. No
-// reconnect, promotion or inferred owner is implemented. F2 refresh uses a separate ledger.
+// Permanent principal ownership, operation reservation and inert native birth
+// commit together. Reconnect creates another birth only for the same exact
+// consumer/owner/logical account. F2 refresh retains its separate ledger.
 func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in service.GatewayNativeOAuthReservation) (out service.GatewayNativeOAuthOutcome, retErr error) {
 	deny := func() (service.GatewayNativeOAuthOutcome, error) {
 		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayNativeIdentity
@@ -44,6 +44,23 @@ func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in serv
 		}
 	}()
 	issuer, subject := in.Identity.Principal()
+	// The verified principal is permanent ownership, not a mutable birth. A
+	// consumer/account can claim only one principal, including after erasure.
+	_, err = tx.ExecContext(ctx, `INSERT INTO gateway_oauth_principal_claims
+ (issuer,subject,consumer,owner_ref,account_ref) VALUES ($1,$2,$3,$4,$5)
+ ON CONFLICT DO NOTHING`, issuer, subject, in.Scope.Consumer, in.Scope.Owner, in.Scope.Account)
+	if err != nil {
+		return deny()
+	}
+	var consumer, owner, account string
+	err = tx.QueryRowContext(ctx, `SELECT consumer,owner_ref,account_ref
+ FROM gateway_oauth_principal_claims WHERE issuer=$1 AND subject=$2 FOR UPDATE`, issuer, subject).Scan(&consumer, &owner, &account)
+	if err == sql.ErrNoRows || err == nil && (consumer != in.Scope.Consumer || owner != in.Scope.Owner || account != in.Scope.Account) {
+		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayOAuthConflict
+	}
+	if err != nil {
+		return deny()
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO gateway_oauth_identity_reservations
  (issuer,subject,consumer,owner_ref,account_ref,generation,operation_ref,intent_mac)
  VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, issuer, subject, in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Operation, in.IntentMAC)
@@ -392,7 +409,8 @@ func (r *accountRepository) UnknownGatewayNativeOAuthRefresh(ctx context.Context
 var _ service.GatewayNativeOAuthRefreshRepository = (*accountRepository)(nil)
 
 // Resolve after locking the exact physical account. The completed F3 commitment
-// and F4 qualification are read afresh after any dispatch/refresh lock wait.
+// and any existing F4 qualification are read afresh after lock waits. A completed
+// inert enrollment may rotate its bundle before its first qualification.
 func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution, error) {
 	var out service.GatewayNativeOAuthRefreshResolution
 	deny := func() (service.GatewayNativeOAuthRefreshResolution, error) {
@@ -432,13 +450,15 @@ func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context
  AND c.enrollment_operation=r.operation_ref AND c.enrollment_mac=r.intent_mac
  AND c.outcome_operation=r.operation_ref AND c.outcome_account_id=r.account_id
  AND c.outcome_generation=r.generation AND c.outcome_state='staged'
- JOIN gateway_oauth_profile_qualifications q ON q.account_id=a.id AND q.native_created_at=a.created_at
- AND q.consumer=c.consumer AND q.owner_ref=c.owner_ref AND q.account_ref=c.account_ref
- AND q.generation=c.generation AND q.operation_ref=c.operation_ref AND q.issuer=r.issuer AND q.subject=r.subject
+ LEFT JOIN gateway_oauth_profile_qualifications q ON q.account_id=a.id
  WHERE a.id=$1 AND c.consumer=$2 AND c.owner_ref=$3 AND c.account_ref=$4 AND c.generation=$5 AND c.operation_ref=$6
  AND c.state='completed' AND NOT c.recovery_denied AND c.purpose=$7
+ AND (q.account_id IS NULL OR (
+ q.native_created_at=a.created_at AND q.consumer=c.consumer AND q.owner_ref=c.owner_ref
+ AND q.account_ref=c.account_ref AND q.generation=c.generation AND q.operation_ref=c.operation_ref
+ AND q.issuer=r.issuer AND q.subject=r.subject
  AND q.profile=$8 AND q.base_url=$9 AND q.model=$10 AND q.qualification=$11
- AND q.qualified_at IS NOT NULL AND q.provider_account_id<>''
+ AND q.qualified_at IS NOT NULL AND q.provider_account_id<>''))
  AND a.deleted_at IS NULL AND a.status='disabled' AND NOT a.schedulable
  AND a.platform='openai' AND a.type='oauth' AND a.proxy_id IS NULL AND a.parent_account_id IS NULL
  AND (a.expires_at IS NULL OR a.expires_at>clock_timestamp())

@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: backend/go.sum
       - name: Native boundary and ordinary regressions
         working-directory: backend
@@ -67,15 +67,20 @@ jobs:
         working-directory: backend
         env:
           GATEWAY_NATIVE_OAUTH_CONNECT_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_oauth_connect_test_ci?sslmode=disable
+          GATEWAY_NATIVE_OAUTH_RECONNECT_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_oauth_reconnect_test_ci?sslmode=disable
         run: |
           set -o pipefail
           docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_oauth_connect_test_ci
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_oauth_reconnect_test_ci
           go test -tags unit ./internal/handler/admin -run '^TestGatewayOAuthDescriptorHTTPJoinedSuccessWire$' -count=1 -v | tee "$RUNNER_TEMP/native-oauth-joined-wire.log"
           test "$(grep -c '^--- PASS: TestGatewayOAuthDescriptorHTTPJoinedSuccessWire ' "$RUNNER_TEMP/native-oauth-joined-wire.log")" -eq 1
           ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-joined-wire.log"
           go test -tags unit ./internal/repository -run '^TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-oauth-connect-pg.log"
           test "$(grep -c '^--- PASS: TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart ' "$RUNNER_TEMP/native-oauth-connect-pg.log")" -eq 1
           ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-connect-pg.log"
+          go test -tags unit ./internal/repository -run '^TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-oauth-reconnect-pg.log"
+          test "$(grep -c '^--- PASS: TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill ' "$RUNNER_TEMP/native-oauth-reconnect-pg.log")" -eq 1
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-reconnect-pg.log"
 
       - name: Encrypted native custody and actual backup restore
         working-directory: backend
