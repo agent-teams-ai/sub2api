@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -398,11 +399,39 @@ func TestGatewayNativeOAuthConnectHTTPTokenFailureIsSpent(t *testing.T) {
 				f.response = string(raw)
 			}
 			path := "/auth/callback?state=" + state + "&code=fixture-code"
+			reader, writer, err := os.Pipe()
+			require.NoError(t, err)
+			stderr := os.Stderr
+			os.Stderr = writer
+			t.Cleanup(func() { os.Stderr = stderr; _ = writer.Close(); _ = reader.Close() })
 			w := f.request(t, path, "", false)
 			require.Equal(t, 200, w.Code)
 			require.Equal(t, "unknown", f.store.row.State)
 			require.Empty(t, f.store.row.Envelope)
 			f.request(t, path, "", false)
+			os.Stderr = stderr
+			require.NoError(t, writer.Close())
+			diagnostic, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			phase := "exchange_token_fields"
+			switch kind {
+			case "redirect":
+				phase = "exchange_transport"
+			case "body-cap":
+				phase = "exchange_body_limit"
+			case "duplicate", "case-alias":
+				phase = "exchange_json_shape"
+			case "wrong-scope":
+				phase = "exchange_scopes"
+			case "invalid-id":
+				phase = "stage_identity"
+			}
+			expected, err := json.Marshal(map[string]string{"event": "gateway_native_oauth_connect_failure", "phase": phase})
+			require.NoError(t, err)
+			require.JSONEq(t, string(expected), strings.TrimSpace(string(diagnostic)))
+			for _, secret := range append(f.secrets, state, "fixture-code", "fixture-upstream-secret") {
+				require.NotContains(t, string(diagnostic), secret)
+			}
 			require.Equal(t, int32(1), f.tokens.Load())
 			require.Zero(t, f.destination.Load())
 			require.Zero(t, f.enrolled.calls)
