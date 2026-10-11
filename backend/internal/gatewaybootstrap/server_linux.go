@@ -370,14 +370,23 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 		if oauth != nil && r.URL.Path == "/auth/callback" {
 			query := r.URL.RawQuery
 			values, err := url.ParseQuery(query)
+			scope, hasScope := values["scope"]
+			callbackFields := len(values) == 2 || (len(values) == 3 && hasScope && len(scope) == 1 && len(scope[0]) <= 1024)
 			valid := r.Method == http.MethodGet && r.URL.RawPath == "" && !r.URL.ForceQuery && len(query) <= 8192 && len(r.RequestURI) <= 8210 &&
-				r.RequestURI == "/auth/callback?"+query && err == nil && values.Encode() == query && len(values) == 2 && len(values["state"]) == 1 && len(values["code"]) == 1 &&
+				r.RequestURI == "/auth/callback?"+query && err == nil && values.Encode() == query && callbackFields && len(values["state"]) == 1 && len(values["code"]) == 1 &&
 				r.ContentLength == 0 && len(r.TransferEncoding) == 0 && r.Header.Get("Content-Encoding") == ""
 			if !valid {
 				r.URL.RawQuery = ""
 				r.RequestURI = "/auth/callback"
 				http.Error(w, "private native bootstrap denied", 400)
 				return
+			}
+			// OAuth response scope is bounded metadata, never identity or authority.
+			// Keep the inner one-use capability parser's exact code/state contract.
+			if hasScope {
+				values.Del("scope")
+				r.URL.RawQuery = values.Encode()
+				r.RequestURI = "/auth/callback?" + r.URL.RawQuery
 			}
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
