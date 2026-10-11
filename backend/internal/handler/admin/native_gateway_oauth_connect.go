@@ -23,7 +23,7 @@ type gatewayConnectInput struct {
 // access diagnostic middleware. authorize MUST bind both typed consumer AND
 // WithGatewayNativeOAuthOwner from live server authorization, never stock admin.
 // Callback bypasses authorize: its one-use state only acts on its persisted
-// owner intent. Mount/loopback operator forwarding or code handoff is pending;
+// owner intent. Protected owner completion binds the exact persisted intent;
 // this registration creates no listener, callback-port bridge, login or dispatch.
 func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *service.GatewayNativeOAuthConnect, authorize gin.HandlerFunc) error {
 	if group == nil || group.BasePath() != "/" || connect == nil || authorize == nil {
@@ -71,6 +71,27 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 		}
 		c.JSON(http.StatusOK, out)
 	})
+	control.POST("/connect/complete", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, GatewayNativeOAuthConnectCompletionBodyLimit+1))
+		req, valid := DecodeGatewayNativeOAuthConnectCompletion(raw)
+		if err != nil || !valid || c.Request.URL.RawQuery != "" {
+			fail(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+		out, err := connect.CompleteOwnerCallback(c.Request.Context(), scope, req.Operation, req.State, req.Code)
+		if err != nil {
+			fail(c)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	})
 	group.GET("/auth/callback", func(c *gin.Context) {
 		// Scrub before handler diagnostics; outer server MUST already exclude
 		// access logging (Gin Logger snapshots query before calling this handler).
@@ -94,6 +115,74 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte("<!doctype html><title>Connect received</title><p>Return to the account owner application to read the connect result.</p>"))
 	})
 	return nil
+}
+
+const GatewayNativeOAuthConnectCompletionBodyLimit = 32768
+
+// Sensitive transient ingress shared with the private server authorization
+// boundary. It is never an operation DTO or a persisted callback record.
+type GatewayNativeOAuthConnectCompletionInput struct {
+	Operation  string `json:"operation"`
+	Owner      string `json:"owner_ref"`
+	Account    string `json:"account_ref"`
+	Generation string `json:"generation"`
+	State      string `json:"state"`
+	Code       string `json:"code"`
+}
+
+func DecodeGatewayNativeOAuthConnectCompletion(raw []byte) (GatewayNativeOAuthConnectCompletionInput, bool) {
+	var req GatewayNativeOAuthConnectCompletionInput
+	if len(raw) > GatewayNativeOAuthConnectCompletionBodyLimit || !utf8.Valid(raw) {
+		return req, false
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := d.Token()
+	if err != nil || tok != json.Delim('{') {
+		return req, false
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		tok, err = d.Token()
+		name, ok := tok.(string)
+		if err != nil || !ok || seen[name] {
+			return GatewayNativeOAuthConnectCompletionInput{}, false
+		}
+		seen[name] = true
+		var value string
+		if d.Decode(&value) != nil {
+			return GatewayNativeOAuthConnectCompletionInput{}, false
+		}
+		switch name {
+		case "operation", "owner_ref", "account_ref", "generation":
+			if !service.GatewayNativeCredentialRefValid(value) {
+				return GatewayNativeOAuthConnectCompletionInput{}, false
+			}
+			switch name {
+			case "operation":
+				req.Operation = value
+			case "owner_ref":
+				req.Owner = value
+			case "account_ref":
+				req.Account = value
+			case "generation":
+				req.Generation = value
+			}
+		case "state":
+			req.State = value
+		case "code":
+			req.Code = value
+		default:
+			return GatewayNativeOAuthConnectCompletionInput{}, false
+		}
+	}
+	tok, err = d.Token()
+	if err != nil || tok != json.Delim('}') || len(seen) != 6 || !service.GatewayNativeOAuthConnectCallbackValid(req.State, req.Code) {
+		return GatewayNativeOAuthConnectCompletionInput{}, false
+	}
+	if _, err = d.Token(); err != io.EOF {
+		return GatewayNativeOAuthConnectCompletionInput{}, false
+	}
+	return req, true
 }
 
 func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {

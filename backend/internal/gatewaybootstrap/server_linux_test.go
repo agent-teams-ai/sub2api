@@ -1317,6 +1317,56 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if err != nil || authorizeURL.Query().Get("redirect_uri") != "http://localhost:1455/auth/callback" {
 		t.Fatal("fixed localhost callback changed")
 	}
+	completePath := path + "/complete"
+	completeBody := strings.TrimSuffix(input, "}") + `,"state":"` + authorizeURL.Query().Get("state") + `","code":"controlled-code-marker"}`
+	for _, role := range []string{"execution", "cleanup", "missing"} {
+		status, _ := post(completePath, completeBody, role)
+		if status != 403 {
+			t.Fatal("non-management completed OAuth", role, status)
+		}
+	}
+	owners.live = false
+	status, _ = post(completePath, completeBody, "management")
+	if status != 403 {
+		t.Fatal("retired owner completed OAuth", status)
+	}
+	owners.live = true
+	for _, body := range []string{
+		strings.Replace(completeBody, `"code":`, `"Code":`, 1),
+		strings.TrimSuffix(completeBody, "}") + `,"\u0063ode":"duplicate"}`,
+		strings.TrimSuffix(completeBody, "}") + `,"callbackURL":"secret"}`,
+		strings.Replace(completeBody, "controlled-code-marker", strings.Repeat("x", 4097), 1),
+		completeBody + strings.Repeat(" ", 32768-len(completeBody)+1),
+	} {
+		status, data := post(completePath, body, "management")
+		if status != 400 || bytes.Contains(data, []byte("controlled-code-marker")) {
+			t.Fatal("completion accepted ambiguous/unbounded body or reflected code", status)
+		}
+	}
+	for _, body := range []string{
+		strings.Replace(completeBody, "fixture-live-owner", "caller-owner", 1),
+		strings.Replace(completeBody, "original-mount-operation", "wrong-operation", 1),
+		strings.Replace(completeBody, scope.Generation, "44444444-4444-4444-8444-444444444444", 1),
+		strings.Replace(completeBody, authorizeURL.Query().Get("state"), strings.Repeat("0", 64), 1),
+	} {
+		status, _ := post(completePath, body, "management")
+		if status != 403 && status != 404 {
+			t.Fatal("completion selected a foreign owner/intent/state", status)
+		}
+	}
+	// Maximum code bytes can expand beyond the legacy 4096-byte ingress cap.
+	// A wrong state keeps this transport-only probe from entering the provider.
+	largeBody := strings.Replace(completeBody, `"controlled-code-marker"`, `"`+strings.Repeat(`\u0061`, 4096)+`"`, 1)
+	largeBody = strings.Replace(largeBody, authorizeURL.Query().Get("state"), strings.Repeat("0", 64), 1)
+	largeBody += strings.Repeat(" ", 32768-len(largeBody))
+	status, _ = post(completePath, largeBody, "management")
+	if status != 404 {
+		t.Fatal("completion retained legacy body cap", status)
+	}
+	status, _ = post(path, input+strings.Repeat(" ", 4097), "management")
+	if status != 400 || tokenEntries.Load() != 0 || journal.entries != 0 || journal.finds != 0 {
+		t.Fatal("invalid owner handoff reached capability lookup/exchange, or legacy cap changed")
+	}
 	query := url.Values{"code": {"controlled-code-marker"}, "state": {authorizeURL.Query().Get("state")}}.Encode()
 	scopeQuery := url.Values{"code": {"controlled-code-marker"}, "scope": {"openid profile email offline_access"}, "state": {authorizeURL.Query().Get("state")}}.Encode()
 	// No bearer; caller owner mapping is now retired. Capability reconstructs
@@ -1337,6 +1387,10 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		t.Fatal("callback rearmed or changed original operation")
 	}
 	owners.live = true
+	status, raw = post(completePath, completeBody, "management")
+	if status != 200 || !bytes.Contains(raw, []byte(`"state":"unknown"`)) || bytes.Contains(raw, []byte("controlled-code-marker")) || bytes.Contains(raw, []byte(authorizeURL.Query().Get("state"))) || tokenEntries.Load() != 1 || journal.entries != 1 {
+		t.Fatal("spent owner completion rearmed exchange or reflected callback data", status)
+	}
 	status, raw = post(path+"/read", input, "management")
 	if status != 200 || !bytes.Contains(raw, []byte(`"operation":"original-mount-operation"`)) || !bytes.Contains(raw, []byte(`"state":"unknown"`)) {
 		t.Fatal("original readback lost")

@@ -280,9 +280,22 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			bounded, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 			defer cancel()
-			data, err := io.ReadAll(io.LimitReader(c.Request.Body, 4097))
+			completion := c.Request.URL.Path == "/private/native/v1/oauth/connect/complete"
+			bodyLimit := 4096
+			if completion {
+				bodyLimit = admin.GatewayNativeOAuthConnectCompletionBodyLimit
+			}
+			data, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(bodyLimit+1)))
 			var tuple nativeOAuthOwnerTuple
-			if err != nil || len(data) > 4096 || decodeStrict(data, &tuple) != nil || !(nativeOAuthOwnerTuple{tuple.Operation, tuple.OwnerRef, tuple.AccountRef, tuple.Generation}).valid() {
+			valid := false
+			if completion {
+				req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
+				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
+				valid = ok
+			} else {
+				valid = decodeStrict(data, &tuple) == nil
+			}
+			if err != nil || len(data) > bodyLimit || !valid || !tuple.valid() {
 				c.AbortWithStatus(http.StatusBadRequest)
 				return
 			}
@@ -421,7 +434,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			cleanup.ServeHTTP(w, r.WithContext(bounded))
-		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return

@@ -336,6 +336,24 @@ func connectCodeValid(code string) bool {
 	return true
 }
 
+func GatewayNativeOAuthConnectCallbackValid(state, code string) bool {
+	decoded, err := hex.DecodeString(state)
+	return err == nil && len(decoded) == 32 && hex.EncodeToString(decoded) == state && connectCodeValid(code)
+}
+
+// Owner handoff must select the exact authorized immutable intent before its
+// random callback capability can enter the existing one-use transition.
+func (s *GatewayNativeOAuthConnect) CompleteOwnerCallback(ctx context.Context, scope GatewayNativeCredentialScope, operation, state, code string) (GatewayNativeOAuthConnectResult, error) {
+	if s == nil || !GatewayNativeOAuthScopeAuthorized(ctx, scope) || !GatewayNativeCredentialRefValid(operation) || !GatewayNativeOAuthConnectCallbackValid(state, code) {
+		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
+	}
+	in, err := s.repository.ReadConnectIntent(ctx, scope, operation)
+	if err != nil || !GatewayNativeOAuthConnectIntentValid(in) || in.Scope != scope || in.Operation != operation || in.StateHash != connectStateHash(state) {
+		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
+	}
+	return s.CompleteCallback(ctx, state, code)
+}
+
 func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state, code string) (GatewayNativeOAuthConnectResult, error) {
 	decoded, err := hex.DecodeString(state)
 	if s == nil || err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != state || !connectCodeValid(code) {

@@ -312,6 +312,50 @@ func (f *connectHTTPFixture) begin(t *testing.T) string {
 	return u.Query().Get("state")
 }
 
+// Failure: owner handoff could cross operation/scope, accept ambiguous or
+// unbounded secrets, reflect callback data, or exchange a spent callback again.
+func TestGatewayNativeOAuthConnectHTTPOwnerCompletion(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	state := f.begin(t)
+	path := "/private/native/v1/oauth/connect/complete"
+	body := strings.TrimSuffix(f.input(), "}") + `,"state":"` + state + `","code":"fixture-code"}`
+	require.Equal(t, 404, f.request(t, path, body, false).Code)
+	for _, bad := range []string{
+		strings.Replace(body, `"owner"`, `"foreign-owner"`, 1),
+		strings.Replace(body, `"operation":"operation"`, `"operation":"foreign"`, 1),
+		strings.Replace(body, f.scope.Generation, uuid.NewString(), 1),
+		strings.Replace(body, state, strings.Repeat("0", 64), 1),
+		strings.Replace(body, state, strings.Repeat("A", 64), 1),
+		strings.Replace(body, `"code":`, `"Code":`, 1),
+		strings.TrimSuffix(body, "}") + `,"\u0063ode":"other"}`,
+		strings.TrimSuffix(body, "}") + `,"callbackURL":"secret"}`,
+		strings.Replace(body, "fixture-code", " leading", 1),
+		strings.Replace(body, "fixture-code", `control\ncode`, 1),
+		strings.Replace(body, "fixture-code", strings.Repeat("x", 4097), 1),
+		strings.Replace(body, "fixture-code", string([]byte{0xff}), 1),
+		body + "{}",
+		body + strings.Repeat(" ", 32768-len(body)+1),
+	} {
+		w := f.request(t, path, bad, true)
+		require.Equal(t, 404, w.Code)
+		require.NotContains(t, w.Body.String(), state)
+		require.NotContains(t, w.Body.String(), "fixture-code")
+		require.Equal(t, "prepared", f.store.row.State)
+		require.Zero(t, f.tokens.Load())
+	}
+	w := f.request(t, path, body, true)
+	require.Equal(t, 200, w.Code)
+	require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+	require.Contains(t, w.Body.String(), `"outcome":"staged"`)
+	replay := f.request(t, path, strings.Replace(body, "fixture-code", "spent-code", 1), true)
+	require.Equal(t, 200, replay.Code)
+	require.Equal(t, int32(1), f.tokens.Load())
+	require.Equal(t, 1, f.enrolled.calls)
+	for _, secret := range append(f.secrets, state, "fixture-code", "spent-code") {
+		require.NotContains(t, w.Body.String()+replay.Body.String()+f.logs.String(), secret)
+	}
+}
+
 // Failure: malformed/duplicate callback queries or stock/wrong-owner authority
 // could spend another owner's intent or leak the token response into DTO/logs.
 func TestGatewayNativeOAuthConnectHTTPGinSignedStageAndContainment(t *testing.T) {
