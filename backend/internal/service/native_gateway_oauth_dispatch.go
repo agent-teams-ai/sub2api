@@ -526,6 +526,8 @@ func (s *OpenAIGatewayService) checkGatewayOAuthDispatch(request *http.Request, 
 	request.Header.Set("ChatGPT-Account-Id", p.ProviderAccount)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("originator", resolveCodexOutboundIdentity("").originator)
+	enforceCodexIdentityHeaders(request.Header)
 	request.GetBody = nil
 	return release, nil
 }
