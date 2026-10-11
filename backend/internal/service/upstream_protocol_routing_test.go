@@ -181,7 +181,7 @@ func (routingScopedReasoningCache) SetGatewayNativeReasoningContent(context.Cont
 }
 
 func TestGatewayNativeResponsesShapedChatRoutingReasoningScope(t *testing.T) {
-	body := []byte(`{"model":"deepseek-reasoner","input":[{"type":"reasoning","id":"shared-item","summary":[],"encrypted_content":"opaque"},{"type":"function_call","call_id":"call_1","name":"get_value","arguments":"{}"}]}`)
+	body := []byte(`{"model":"deepseek-reasoner","input":[{"type":"reasoning","id":"shared-item","summary":[],"encrypted_content":"opaque"},{"type":"function_call","call_id":"call_1","name":"get_value","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}]}`)
 	svc := &OpenAIGatewayService{cache: routingScopedReasoningCache{}}
 	for _, tc := range []struct{ scope, want string }{
 		{"tenant-a", "tenant-a private reasoning"},
