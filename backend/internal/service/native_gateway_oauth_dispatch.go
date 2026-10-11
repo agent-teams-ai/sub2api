@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/imroc/req/v3"
 )
 
 const GatewayCodexOAuthResponsesProfile = "openai-codex-oauth-responses-v1"
@@ -105,10 +107,11 @@ type GatewayNativeOAuthDescriptorResult struct {
 }
 
 type GatewayNativeOAuthDispatch struct {
-	repository GatewayNativeOAuthDispatchRepository
-	custody    *GatewayNativeCredentialCustody
-	verifier   *GatewayNativeOAuthVerifier
-	client     *http.Client
+	repository          GatewayNativeOAuthDispatchRepository
+	custody             *GatewayNativeCredentialCustody
+	verifier            *GatewayNativeOAuthVerifier
+	client              *http.Client
+	accountCheckHeaders http.Header
 }
 
 // Transport injection is trusted composition for loopback TLS fixtures only.
@@ -117,12 +120,26 @@ func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *Ga
 	if r == nil || !GatewayNativeCredentialCustodyReady(c) || v == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
+	var headers http.Header
 	if transport == nil {
-		transport = &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16 << 10, MaxConnsPerHost: 2, DisableKeepAlives: true}
+		// Match the maintained accounts/check Firefox transport without sharing its
+		// mutable privacy client, 30s timeout, proxy, retries or body/error logging.
+		browser := req.C().SetTimeout(5 * time.Second).ImpersonateFirefox()
+		bounded := browser.GetTransport()
+		bounded.Proxy = nil
+		bounded.TLSClientConfig.MinVersion = tls.VersionTLS12
+		bounded.DialContext = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+		bounded.TLSHandshakeTimeout = 5 * time.Second
+		bounded.ResponseHeaderTimeout = 5 * time.Second
+		bounded.MaxResponseHeaderBytes = 16 << 10
+		bounded.SetHTTP2MaxHeaderListSize(16 << 10)
+		bounded.DisableAutoDecode()
+		bounded.MaxConnsPerHost = 2
+		bounded.DisableKeepAlives = true
+		transport = bounded
+		headers = browser.Headers.Clone()
 	}
-	return &GatewayNativeOAuthDispatch{repository: r, custody: c, verifier: v, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
+	return &GatewayNativeOAuthDispatch{repository: r, custody: c, verifier: v, accountCheckHeaders: headers, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }}}, nil
 }
 
@@ -199,6 +216,11 @@ func (s *GatewayNativeOAuthDispatch) accountCheck(ctx context.Context, access st
 	if err != nil {
 		return "", ErrGatewayNativeIdentity
 	}
+	for name, values := range s.accountCheckHeaders {
+		req.Header[name] = append([]string(nil), values...)
+	}
+	req.Header.Set("Origin", "https://chatgpt.com")
+	req.Header.Set("Referer", "https://chatgpt.com/")
 	req.Header.Set("Authorization", "Bearer "+access)
 	req.Header.Set("Accept", "application/json")
 	response, err := s.client.Do(req)
@@ -228,7 +250,7 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 	if err != nil || len(accounts) == 0 || len(accounts) > 32 {
 		return deny()
 	}
-	seen := map[string]bool{}
+	seen := map[string]json.RawMessage{}
 	selected := ""
 	for _, record := range accounts {
 		entry, err := gatewayOAuthJSON(record)
@@ -241,10 +263,15 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 		}
 		id, ok := gatewayOAuthString(account, "account_id")
 		parsed, err := uuid.Parse(id)
-		if !ok || err != nil || parsed == uuid.Nil || parsed.String() != id || seen[id] {
+		if !ok || err != nil || parsed == uuid.Nil || parsed.String() != id {
 			return deny()
 		}
-		seen[id] = true
+		if prior, exists := seen[id]; exists {
+			if !bytes.Equal(prior, record) {
+				return deny()
+			}
+			continue
+		}
 		usable := true
 		for _, fields := range []map[string]json.RawMessage{entry, account} {
 			if !gatewayOAuthCanonical(fields, "deactivated", "is_deactivated", "disabled", "is_disabled", "deactivated_at", "disabled_at", "deleted_at", "status", "state") {
@@ -303,6 +330,8 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 				}
 			}
 		}
+		// Reuse only an identical alias of this fully validated record.
+		seen[id] = record
 		if usable {
 			if selected != "" {
 				return deny()
