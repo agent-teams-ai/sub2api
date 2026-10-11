@@ -3,6 +3,7 @@
 package service
 
 import (
+	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
@@ -89,6 +90,70 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	}
 	require.False(t, logger.L().Core().Enabled(zap.WarnLevel), "private composition starts without the generic logger")
 	const sentinel = "PRIVATE_NATIVE_DIAGNOSTIC_SENTINEL"
+	t.Run("codex request shape private scalars", func(t *testing.T) {
+		for _, tc := range []struct {
+			body                                     string
+			present, stringValue, nonblank, metadata bool
+		}{
+			{`{"instructions":"` + sentinel + `", "metadata":{"private":"` + sentinel + `"}, "input":[{"content":"` + sentinel + `"}]}`, true, true, true, true},
+			{`{"instructions":"  ", "input":[]}`, true, true, false, false},
+			{`{"instructions":null, "input":[]}`, true, false, false, false},
+			{`{"input":[]}`, false, false, false, false},
+		} {
+			raw, err := json.Marshal(gatewayNativeCodexRequestShape([]byte(tc.body)))
+			require.NoError(t, err)
+			require.NotContains(t, string(raw), sentinel)
+			var got struct {
+				Event       string          `json:"event"`
+				Canonical   bool            `json:"canonical_object"`
+				Present     bool            `json:"instructions_present"`
+				StringValue bool            `json:"instructions_string"`
+				Nonblank    bool            `json:"instructions_nonblank"`
+				Fields      map[string]bool `json:"unsupported_fields_present"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &got))
+			require.Equal(t, "gateway_native_codex_request_shape", got.Event)
+			require.True(t, got.Canonical)
+			require.Equal(t, tc.present, got.Present)
+			require.Equal(t, tc.stringValue, got.StringValue)
+			require.Equal(t, tc.nonblank, got.Nonblank)
+			require.Equal(t, tc.metadata, got.Fields["metadata"])
+			require.Len(t, got.Fields, 14)
+			require.False(t, got.Fields["max_output_tokens"])
+		}
+	})
+	t.Run("protected codex HTTP400 emits private shape", func(t *testing.T) {
+		f := newOAuthDispatchFixture(t)
+		route := f.qualify(t)
+		f.mode = "badrequest"
+		stderr, err := os.CreateTemp(t.TempDir(), "protected-shape-")
+		require.NoError(t, err)
+		previous := os.Stderr
+		os.Stderr = stderr
+		defer func() { os.Stderr = previous; _ = stderr.Close() }()
+		_, entered, err, life := f.call(t, route, oauthDispatchPayload())
+		require.True(t, entered)
+		require.Same(t, ErrGatewayNativeEffectUnknown, err)
+		require.EqualValues(t, 1, f.entries.Load())
+		require.True(t, life.Snapshot().BodyClosed)
+		raw, err := os.ReadFile(stderr.Name())
+		require.NoError(t, err)
+		lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+		require.Len(t, lines, 2)
+		var shape map[string]any
+		require.NoError(t, json.Unmarshal(lines[0], &shape))
+		require.Equal(t, "gateway_native_codex_request_shape", shape["event"])
+		require.Equal(t, false, shape["instructions_present"])
+		require.Equal(t, false, shape["instructions_string"])
+		require.Equal(t, false, shape["instructions_nonblank"])
+		require.Equal(t, false, shape["unsupported_fields_present"].(map[string]any)["max_output_tokens"])
+		require.NotContains(t, string(raw), f.bundle.AccessToken)
+		require.NotContains(t, string(raw), f.bundle.IDToken)
+		var failure map[string]any
+		require.NoError(t, json.Unmarshal(lines[1], &failure))
+		require.Equal(t, "invalid_request", failure["provider_error_category"])
+		require.Equal(t, "instructions", failure["provider_error_parameter"])
+	})
 	const cappedSSE = ": sandbox comment\n\n" + nativeReviewCompleted
 	const cappedJSON = `{"status":"completed","output":[]}`
 	cases := []struct {
@@ -116,6 +181,8 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "http400 scalar error", status: 400, phase: "http_status", category: "unknown", wire: `{"error":"code_mode is required. ` + sentinel + `"}`},
 		{name: "http400 array error", status: 400, phase: "http_status", category: "unknown", wire: `{"error":[{"message":"code_mode is required"}]}`},
 		{name: "http400 canonical detail", status: 400, phase: "http_status", category: "invalid_request", shape: "flat_error_object", parameter: "max_output_tokens", wire: `{"detail":"Unsupported parameter: max_output_tokens. ` + sentinel + `"}`},
+		{name: "http400 plan gated detail", status: 400, phase: "http_status", category: "model_rejected", shape: "flat_error_object", parameter: "model", wire: `{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}`},
+		{name: "http400 instructions detail", status: 400, phase: "http_status", category: "invalid_request", shape: "flat_error_object", parameter: "instructions", wire: `{"detail":"Instructions are required"}`},
 		{name: "http400 private detail", status: 400, phase: "http_status", category: "unknown", shape: "flat_error_object", parameter: "missing", wire: `{"detail":"` + sentinel + ` Unsupported parameter: max_output_tokens"}`},
 		{name: "http400 null detail", status: 400, phase: "http_status", category: "unknown", shape: "unrecognized_object", wire: `{"detail":null}`},
 		{name: "http400 object detail", status: 400, phase: "http_status", category: "unknown", shape: "unrecognized_object", wire: `{"detail":{"message":"Unsupported parameter: max_output_tokens"}}`},
