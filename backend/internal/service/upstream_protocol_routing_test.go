@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/gin-gonic/gin"
@@ -160,6 +161,38 @@ func TestResponsesToNativeAnthropicTrimsBillingModel(t *testing.T) {
 			require.True(t, strings.HasSuffix(upstream.lastReq.URL.Path, "/v1/messages"), upstream.lastReq.URL.String())
 			require.Equal(t, tc.model, gjson.GetBytes(upstream.lastBody, "model").String())
 			require.Equal(t, tc.model, result.BillingModel)
+		})
+	}
+}
+
+type routingScopedReasoningCache struct{ GatewayCache }
+
+func (routingScopedReasoningCache) GetReasoningContent(context.Context, string) (string, error) {
+	return "ordinary secret", nil
+}
+func (routingScopedReasoningCache) GetGatewayNativeReasoningContent(_ context.Context, scope, itemID string) (string, error) {
+	if scope == "tenant-a" && itemID == "shared-item" {
+		return "tenant-a private reasoning", nil
+	}
+	return "", ErrReasoningContentNotFound
+}
+func (routingScopedReasoningCache) SetGatewayNativeReasoningContent(context.Context, string, string, string, time.Duration) error {
+	return nil
+}
+
+func TestGatewayNativeResponsesShapedChatRoutingReasoningScope(t *testing.T) {
+	body := []byte(`{"model":"deepseek-reasoner","input":[{"type":"reasoning","id":"shared-item","summary":[],"encrypted_content":"opaque"},{"type":"function_call","call_id":"call_1","name":"get_value","arguments":"{}"}]}`)
+	svc := &OpenAIGatewayService{cache: routingScopedReasoningCache{}}
+	for _, tc := range []struct{ scope, want string }{
+		{"tenant-a", "tenant-a private reasoning"},
+		{"tenant-b", ""},
+		{"", "ordinary secret"},
+	} {
+		t.Run(tc.scope, func(t *testing.T) {
+			converted, err := svc.convertResponsesShapedChatBody(body, tc.scope)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, gjson.GetBytes(converted, "messages.0.reasoning_content").String())
+			require.Equal(t, "call_1", gjson.GetBytes(converted, "messages.0.tool_calls.0.id").String())
 		})
 	}
 }
