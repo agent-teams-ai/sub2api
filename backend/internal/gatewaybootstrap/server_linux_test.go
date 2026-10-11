@@ -1318,11 +1318,12 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		t.Fatal("fixed localhost callback changed")
 	}
 	query := url.Values{"code": {"controlled-code-marker"}, "state": {authorizeURL.Query().Get("state")}}.Encode()
+	scopeQuery := url.Values{"code": {"controlled-code-marker"}, "scope": {"openid profile email offline_access"}, "state": {authorizeURL.Query().Get("state")}}.Encode()
 	// No bearer; caller owner mapping is now retired. Capability reconstructs
 	// original persisted consumer/owner, and it never chooses a new operation.
 	owners.live = false
-	for range 2 {
-		response, err := server.Client().Get(server.URL + "/auth/callback?" + query)
+	for _, callbackQuery := range []string{scopeQuery, query} {
+		response, err := server.Client().Get(server.URL + "/auth/callback?" + callbackQuery)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1342,6 +1343,10 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	}
 	for _, bad := range []string{
 		"/auth/callback?" + query + "&state=duplicate",
+		"/auth/callback?" + url.Values{"code": {"controlled-code-marker"}, "scope": {"openid", "profile"}, "state": {authorizeURL.Query().Get("state")}}.Encode(),
+		"/auth/callback?" + url.Values{"code": {"controlled-code-marker"}, "scope": {strings.Repeat("x", 1025)}, "state": {authorizeURL.Query().Get("state")}}.Encode(),
+		"/auth/callback?" + query + "&%73cope=openid",
+		"/auth/callback?" + url.Values{"code": {"controlled-code-marker"}, "other": {"openid"}, "state": {authorizeURL.Query().Get("state")}}.Encode(),
 		"/auth/callback?code=controlled-code-marker&%73tate=" + authorizeURL.Query().Get("state"),
 		"/auth/%63allback?" + query,
 		"/auth/callback?" + strings.Repeat("x", 8193),
@@ -1356,6 +1361,18 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 		if response.StatusCode != 400 || bytes.Contains(data, []byte("controlled-code-marker")) {
 			t.Fatal("callback alias or query reflection accepted", response.StatusCode)
 		}
+	}
+	bodyRequest, err := http.NewRequest(http.MethodGet, server.URL+"/auth/callback?"+scopeQuery, strings.NewReader("smuggled-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyResponse, err := server.Client().Do(bodyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bodyResponse.Body.Close()
+	if bodyResponse.StatusCode != 400 {
+		t.Fatal("callback body smuggling accepted", bodyResponse.StatusCode)
 	}
 	mode.owners = nil
 	status, _ = post(path, input, "management")
