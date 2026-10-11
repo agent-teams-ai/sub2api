@@ -138,6 +138,10 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 			require.Equal(t, http.MethodPost, r.Method)
 			require.Equal(t, provider, r.Header.Get("ChatGPT-Account-Id"))
 			require.Equal(t, "text/event-stream", r.Header.Get("Accept"))
+			require.Equal(t, codexCLIUserAgent, r.Header.Get("User-Agent"))
+			require.Equal(t, "codex-tui", r.Header.Get("originator"))
+			require.Equal(t, codexCLIVersion, r.Header.Get("version"))
+			require.Empty(t, r.Header.Get("OpenAI-Beta"))
 			for _, header := range []string{"X-Codex-Turn-State", "Cookie", "X-Api-Key", "Origin", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Only"} {
 				require.Empty(t, r.Header.Get(header))
 			}
@@ -223,7 +227,7 @@ func (f *oauthDispatchFixture) call(t *testing.T, route GatewayNativeRoute, body
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(body))
-	for _, header := range []string{"Authorization", "ChatGPT-Account-Id", "X-Codex-Turn-State", "Cookie", "X-Api-Key", "Origin", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Only"} {
+	for _, header := range []string{"Authorization", "ChatGPT-Account-Id", "User-Agent", "originator", "version", "OpenAI-Beta", "X-Codex-Turn-State", "Cookie", "X-Api-Key", "Origin", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Only"} {
 		c.Request.Header.Set(header, uuid.NewString())
 	}
 	_, entered, err := f.svc.ForwardGatewayRoute(ctx, c, route, body)
