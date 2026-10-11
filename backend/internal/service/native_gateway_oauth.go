@@ -333,7 +333,10 @@ func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (key *
 			continue
 		}
 		for name := range k {
-			if name != "kid" && name != "kty" && name != "alg" && name != "use" && name != "key_ops" && name != "n" && name != "e" {
+			// RFC 7517 public metadata and unknown extensions do not replace
+			// the pinned RSA parameters below. Never accept private key material.
+			name = strings.ToLower(name)
+			if name == "d" || name == "p" || name == "q" || name == "dp" || name == "dq" || name == "qi" || name == "oth" || name == "k" {
 				return nil, ErrGatewayNativeIdentity
 			}
 		}

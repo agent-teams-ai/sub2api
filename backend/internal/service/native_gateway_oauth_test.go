@@ -70,7 +70,14 @@ func TestGatewayNativeOAuthSignedIdentityAndClaimRejections(t *testing.T) {
 		requests.Add(1)
 		require.Equal(t, "/.well-known/jwks.json", r.URL.Path)
 		require.Equal(t, "auth.openai.com", r.Host)
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{oauthFixtureJWK(key)}})
+		jwk := oauthFixtureJWK(key)
+		// Public certificate metadata and provider extensions are ignored;
+		// identity authority still requires the genuine RSA signature below.
+		jwk["x5c"] = []string{"synthetic-public-certificate"}
+		jwk["x5t"] = "synthetic-public-thumbprint"
+		jwk["x5t#S256"] = "synthetic-public-thumbprint-sha256"
+		jwk["provider_extension"] = map[string]any{"version": 1}
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk}})
 	}), now)
 	header := `{"alg":"RS256","kid":"fixture","typ":"JWT"}`
 	claims := oauthFixtureClaims("synthetic-subject", now)
@@ -229,7 +236,7 @@ func TestGatewayNativeOAuthJWKSRejectsUntrustedMaterial(t *testing.T) {
 	key := oauthFixtureKey(t)
 	now := time.Now().Truncate(time.Second)
 	token := oauthFixtureSign(t, key, `{"alg":"RS256","kid":"fixture"}`, oauthFixtureClaims("synthetic", now))
-	for _, name := range []string{"duplicate kid", "small modulus", "bad exponent", "encryption key", "private material", "bad key_ops", "duplicate field", "wrong alg", "oversized"} {
+	for _, name := range []string{"duplicate kid", "small modulus", "bad exponent", "encryption key", "private material", "private material alias", "bad key_ops", "duplicate field", "wrong alg", "oversized"} {
 		t.Run(name, func(t *testing.T) {
 			jwk := oauthFixtureJWK(key)
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +252,8 @@ func TestGatewayNativeOAuthJWKSRejectsUntrustedMaterial(t *testing.T) {
 					jwk["use"] = "enc"
 				case "private material":
 					jwk["d"] = "private"
+				case "private material alias":
+					jwk["D"] = "private"
 				case "bad key_ops":
 					jwk["key_ops"] = []string{"sign", "verify"}
 				case "wrong alg":
