@@ -246,7 +246,7 @@ func TestGatewayOAuthDescriptorControlledTLSSelection(t *testing.T) {
 			require.Equal(t, state, f.store.connectState)
 		})
 	}
-	for _, scenario := range []string{"ambiguous", "expired", "bad-expiry", "disabled", "disabled-alias", "invalid-utf8", "map-key-only", "duplicate-account", "case-alias", "escaped-duplicate", "redirect", "over-limit", "wrong-principal", "tampered-custody"} {
+	for _, scenario := range []string{"ambiguous", "expired", "bad-expiry", "disabled", "disabled-alias", "invalid-utf8", "map-key-only", "conflicting-duplicate-account", "case-alias", "escaped-duplicate", "redirect", "over-limit", "wrong-principal", "tampered-custody"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newOAuthDispatchFixture(t)
 			switch scenario {
@@ -264,9 +264,9 @@ func TestGatewayOAuthDescriptorControlledTLSSelection(t *testing.T) {
 				f.accountCheck = "{\"accounts\":{\"\xff\":{}}}"
 			case "map-key-only":
 				f.accountCheck = fmt.Sprintf(`{"accounts":{%q:{"account":{"is_default":true}}}}`, uuid.NewString())
-			case "duplicate-account":
+			case "conflicting-duplicate-account":
 				id := uuid.NewString()
-				f.accountCheck = fmt.Sprintf(`{"accounts":{"one":{"account":{"account_id":%q}},"two":{"account":{"account_id":%q}}}}`, id, id)
+				f.accountCheck = fmt.Sprintf(`{"accounts":{"one":{"account":{"account_id":%q}},"two":{"account":{"account_id":%q,"is_default":true}}}}`, id, id)
 			case "case-alias":
 				f.accountCheck = strings.ReplaceAll(f.accountCheck, "account_id", "ACCOUNT_ID")
 			case "escaped-duplicate":
@@ -503,4 +503,19 @@ func TestGatewayOAuthRetainedFenceAfterSignedJWKS(t *testing.T) {
 			require.False(t, life.Snapshot().Entered)
 		})
 	}
+}
+
+// Identical map aliases describe one canonical nested identity; map keys and
+// default/plan hints do not select an identity. This invokes normal Descriptor.
+func TestGatewayOAuthDescriptorIdenticalAccountAliases(t *testing.T) {
+	f := newOAuthDispatchFixture(t)
+	id := uuid.NewString()
+	record := fmt.Sprintf(`{"account":{"account_id":%q,"is_default":false}}`, id)
+	f.accountCheck = fmt.Sprintf(`{"accounts":{"default":%s,"unrelated-map-key":%s}}`, record, record)
+	route := f.qualify(t)
+	require.Equal(t, id, f.store.physical.ProviderAccount)
+	require.Equal(t, f.scope.Generation, route.Generation)
+	require.EqualValues(t, 1, f.checks.Load())
+	require.Equal(t, 1, f.store.qualifications)
+	require.Zero(t, f.entries.Load())
 }

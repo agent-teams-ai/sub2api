@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -249,7 +250,7 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 	if err != nil || len(accounts) == 0 || len(accounts) > 32 {
 		return deny()
 	}
-	seen := map[string]bool{}
+	seen := map[string]json.RawMessage{}
 	selected := ""
 	for _, record := range accounts {
 		entry, err := gatewayOAuthJSON(record)
@@ -262,10 +263,15 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 		}
 		id, ok := gatewayOAuthString(account, "account_id")
 		parsed, err := uuid.Parse(id)
-		if !ok || err != nil || parsed == uuid.Nil || parsed.String() != id || seen[id] {
+		if !ok || err != nil || parsed == uuid.Nil || parsed.String() != id {
 			return deny()
 		}
-		seen[id] = true
+		if prior, exists := seen[id]; exists {
+			if !bytes.Equal(prior, record) {
+				return deny()
+			}
+			continue
+		}
 		usable := true
 		for _, fields := range []map[string]json.RawMessage{entry, account} {
 			if !gatewayOAuthCanonical(fields, "deactivated", "is_deactivated", "disabled", "is_disabled", "deactivated_at", "disabled_at", "deleted_at", "status", "state") {
@@ -324,6 +330,8 @@ func gatewayOAuthSelectAccount(raw []byte, now time.Time) (string, error) {
 				}
 			}
 		}
+		// Reuse only an identical alias of this fully validated record.
+		seen[id] = record
 		if usable {
 			if selected != "" {
 				return deny()
