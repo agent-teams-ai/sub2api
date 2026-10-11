@@ -76,6 +76,51 @@ func connectPureFixture(t *testing.T) (*GatewayNativeOAuthConnect, *connectPureS
 	return s, r, ctx, scope
 }
 
+// Failure: a live owner could route a capability to a different scoped operation
+// before the existing entry authorizer has a chance to deny provider exchange.
+func TestGatewayNativeOAuthConnectOwnerCompletionExactIntent(t *testing.T) {
+	s, r, ctx, scope := connectPureFixture(t)
+	_, err := s.BeginConnect(ctx, scope, "operation")
+	require.NoError(t, err)
+	material, err := s.open(r.row)
+	require.NoError(t, err)
+	entries := 0
+	require.NoError(t, s.SetEntryAuthorizer(func(context.Context, GatewayNativeCredentialScope, string) error {
+		entries++
+		return ErrGatewayNativeIdentity
+	}))
+	for _, field := range []string{"consumer", "owner", "account", "generation", "operation", "state"} {
+		foreign, operation, state := scope, "operation", material.State
+		switch field {
+		case "consumer":
+			foreign.Consumer = "foreign"
+		case "owner":
+			foreign.Owner = "foreign"
+		case "account":
+			foreign.Account = "foreign"
+		case "generation":
+			foreign.Generation = uuid.NewString()
+		case "operation":
+			operation = "foreign"
+		case "state":
+			state = "0" + state[1:]
+			if state == material.State {
+				state = "1" + state[1:]
+			}
+		}
+		_, err = s.CompleteOwnerCallback(ctx, foreign, operation, state, "fixture-code")
+		require.ErrorIs(t, err, ErrGatewayNativeIdentity, field)
+		require.Zero(t, entries, field)
+	}
+	_, err = s.CompleteOwnerCallback(context.Background(), scope, "operation", material.State, "fixture-code")
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.Zero(t, entries)
+	_, err = s.CompleteOwnerCallback(ctx, scope, "operation", material.State, "fixture-code")
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	require.Equal(t, 1, entries)
+	require.Equal(t, "prepared", r.row.State)
+}
+
 // Failure: a lost prepare ACK could expose an unpersisted URL, mint another
 // capability/deadline, or let stock admin/foreign owner change a stable intent.
 func TestGatewayNativeOAuthConnectPrepareCustodyAndAuthority(t *testing.T) {
