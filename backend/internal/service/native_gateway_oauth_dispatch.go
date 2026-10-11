@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/imroc/req/v3"
+	"github.com/tidwall/sjson"
 )
 
 const GatewayCodexOAuthResponsesProfile = "openai-codex-oauth-responses-v1"
@@ -451,6 +452,12 @@ func (s *OpenAIGatewayService) forwardGatewayOAuthRoute(ctx context.Context, c *
 	if !ok || cap > binding.tokens {
 		return nil, false, ErrGatewayNativeIdentity
 	}
+	// The Codex backend does not accept this local admission allowance.
+	// Keep the validated original body/cap local; byte and lifetime limits still apply.
+	providerBody, err := sjson.DeleteBytes(body, "max_output_tokens")
+	if err != nil {
+		return nil, false, ErrGatewayNativeIdentity
+	}
 	a, p, release, err := binding.dispatch.repository.LockGatewayNativeOAuthDispatch(ctx, binding.scope, binding.operation, route.AccountID)
 	if err != nil || release == nil {
 		return nil, false, ErrGatewayNativeIdentity
@@ -466,7 +473,7 @@ func (s *OpenAIGatewayService) forwardGatewayOAuthRoute(ctx context.Context, c *
 	request := c.Request.Clone(ctx)
 	request.Header = make(http.Header)
 	c.Request = request
-	result, err := s.forwardGatewayNativeResponses(ctx, c, a, body)
+	result, err := s.forwardGatewayNativeResponses(ctx, c, a, providerBody)
 	if err != nil && err != ErrGatewayNativeIdentity && err != ErrGatewayNativeReplay {
 		if state.entered.Load() {
 			err = ErrGatewayNativeEffectUnknown

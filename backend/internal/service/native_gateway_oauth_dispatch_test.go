@@ -338,7 +338,8 @@ func TestGatewayOAuthNativeResponsesRefreshBeforeEntryAndCancellation(t *testing
 	require.True(t, entered)
 	require.EqualValues(t, 1, f.entries.Load())
 	require.Equal(t, "Bearer "+newAccess, f.lastAuthorization.Load())
-	require.Equal(t, string(body), f.lastPayload.Load())
+	require.Equal(t, strings.Replace(string(body), `"max_output_tokens":128,`, "", 1), f.lastPayload.Load())
+	require.Equal(t, oauthDispatchPayload(), body, "local admission payload remains unchanged")
 	require.Contains(t, rec.Body.String(), "custom_tool_call")
 	require.Contains(t, rec.Body.String(), "controlled final")
 	snapshot := life.Snapshot()
@@ -370,7 +371,7 @@ func TestGatewayOAuthNativeResponsesRefreshBeforeEntryAndCancellation(t *testing
 }
 
 func TestGatewayOAuthInvalidEntryHasNoProviderEffect(t *testing.T) {
-	for _, scenario := range []string{"unowned-transport", "wrong-birth", "wrong-created", "wrong-row", "wrong-profile", "wrong-owner", "wrong-principal", "wrong-operation-at-entry", "erased", "grouped", "proxy", "model-alias", "store", "previous", "cap-alias", "cap-type", "bytes", "unqualified", "unsigned", "expired-current"} {
+	for _, scenario := range []string{"unowned-transport", "wrong-birth", "wrong-created", "wrong-row", "wrong-profile", "wrong-owner", "wrong-principal", "wrong-operation-at-entry", "erased", "grouped", "proxy", "model-alias", "store", "previous", "cap-alias", "cap-type", "cap-missing", "cap-over-limit", "bytes", "unqualified", "unsigned", "expired-current"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newOAuthDispatchFixture(t)
 			route := f.qualify(t)
@@ -413,6 +414,10 @@ func TestGatewayOAuthInvalidEntryHasNoProviderEffect(t *testing.T) {
 				body = bytes.ReplaceAll(body, []byte(`"max_output_tokens":128`), []byte(`"max_output_tokens":128,"MAX_OUTPUT_TOKENS":1`))
 			case "cap-type":
 				body = bytes.ReplaceAll(body, []byte(`"max_output_tokens":128`), []byte(`"max_output_tokens":"128"`))
+			case "cap-missing":
+				body = bytes.ReplaceAll(body, []byte(`"max_output_tokens":128,`), nil)
+			case "cap-over-limit":
+				body = bytes.ReplaceAll(body, []byte(`"max_output_tokens":128`), []byte(`"max_output_tokens":129`))
 			case "bytes":
 				body = append(body, bytes.Repeat([]byte(" "), 4096)...)
 			case "unqualified":

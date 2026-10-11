@@ -185,7 +185,7 @@ func gatewayNativeHTTPErrorSSE(body []byte) ([]byte, string, bool) {
 // Inspect protocol paths only. Never search arbitrary nested tool/user data.
 func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTPErrorDiagnostic {
 	d := gatewayNativeHTTPErrorDiagnostic{category: "unknown"}
-	root, ok := gatewayNativeCanonicalObject(body, "error", "response", "type")
+	root, ok := gatewayNativeCanonicalObject(body, "error", "response", "type", "detail")
 	if !ok {
 		d.shape = "non_object"
 		if bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
@@ -215,6 +215,16 @@ func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTP
 		if !bytes.HasPrefix(bytes.TrimSpace(selected), []byte("{")) {
 			if kind != "error" && event != "error" {
 				d.shape = "unrecognized_object"
+				// ChatGPT internal errors may use a top-level detail string.
+				// Only an anchored public parameter phrase is classified; never export text.
+				var detail string
+				if root["error"] == nil && root["response"] == nil && bytes.HasPrefix(bytes.TrimSpace(root["detail"]), []byte(`"`)) && json.Unmarshal(root["detail"], &detail) == nil {
+					d.shape, d.parameter = "flat_error_object", "missing"
+					if match := gatewayNativeErrorParameterMessage.FindStringSubmatch(detail); len(match) == 2 {
+						d.category = "invalid_request"
+						d.parameter = gatewayNativePublicErrorParameter(strings.TrimSuffix(strings.TrimSuffix(match[1], "."), ","))
+					}
+				}
 				return d
 			}
 			selected, d.shape = body, "flat_error_object"
