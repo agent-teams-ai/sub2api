@@ -158,7 +158,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	const cappedJSON = `{"status":"completed","output":[]}`
 	cases := []struct {
 		name, contentType, wire, phase, category, encoding, shape, parameter string
-		readReason, mediaCategory, bodyShape                                 string
+		readReason, mediaCategory, bodyShape, bodyPrefix                     string
 		idle, deadline                                                       time.Duration
 		outputCap                                                            int64
 		status                                                               int
@@ -268,13 +268,16 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "SSE deadline omits read reason", status: 200, stream: true, phase: "deadline", contentType: "text/event-stream", idle: time.Second, deadline: 100 * time.Millisecond},
 		{name: "invalid final", status: 200, phase: "invalid_final", wire: `{"status":"incomplete","private":"` + sentinel + `"}`},
 		{name: "invalid content type", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "other", contentType: sentinel, unread: true, wire: sentinel},
-		{name: "invalid content type missing", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", wire: sentinel},
-		{name: "missing media empty", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "empty"},
-		{name: "missing media JSON", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "json", category: "model_rejected", shape: "root_error_object", parameter: "model", wire: `{"error":{"code":"invalid_model","param":"model","message":"` + sentinel + `"}}`},
-		{name: "missing media HTML", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "html", wire: "<!DOCTYPE html><html><body>" + sentinel + "</body></html>"},
-		{name: "missing media SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", wire: "event: response.created\r\ndata: {\"type\":\"response.created\",\"private\":\"" + sentinel + "\"}\r\n\r\n" + nativeReviewCompleted},
-		{name: "missing media malformed SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", wire: "event: error\ndata: " + sentinel + "\n\n"},
-		{name: "missing media bound", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", category: "body_limit", wire: "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" + strings.Repeat(sentinel, 1024)},
+		{name: "invalid content type missing", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", bodyPrefix: "text", wire: sentinel},
+		{name: "missing media empty", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "empty", bodyPrefix: "empty"},
+		{name: "missing media JSON", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "json", bodyPrefix: "json_prefix", category: "model_rejected", shape: "root_error_object", parameter: "model", wire: `{"error":{"code":"invalid_model","param":"model","message":"` + sentinel + `"}}`},
+		{name: "missing media HTML", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "html", bodyPrefix: "html_prefix", wire: "<!DOCTYPE html><html><body>" + sentinel + "</body></html>"},
+		{name: "missing media SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", bodyPrefix: "sse_prefix", wire: "event: response.created\r\ndata: {\"type\":\"response.created\",\"private\":\"" + sentinel + "\"}\r\n\r\n" + nativeReviewCompleted},
+		{name: "missing media malformed SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", bodyPrefix: "sse_prefix", wire: "event: error\ndata: " + sentinel + "\n\n"},
+		{name: "missing media bound", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", bodyPrefix: "sse_prefix", category: "body_limit", wire: "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" + strings.Repeat(sentinel, 1024)},
+		{name: "missing media truncated JSON prefix", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", bodyPrefix: "json_prefix", category: "body_limit", wire: `{"private":"` + strings.Repeat(sentinel, 1024)},
+		{name: "missing media large first SSE prefix", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", bodyPrefix: "sse_prefix", category: "body_limit", wire: "event: response.created\ndata: {\"private\":\"" + strings.Repeat(sentinel, 1024)},
+		{name: "missing media gzip prefix", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", bodyPrefix: "gzip_prefix", category: "body_limit", wire: "\x1f\x8b" + strings.Repeat(sentinel, 1024)},
 		{name: "missing media deadline", status: 200, stream: true, phase: "deadline", category: "body_read_failed", idle: time.Second, deadline: 100 * time.Millisecond},
 		{name: "invalid content type HTML", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "html", contentType: `text/html; private="` + sentinel + `"`, unread: true, wire: sentinel},
 		{name: "invalid content type SSE formatting", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "sse", contentType: " text/event-stream", unread: true, wire: sentinel},
@@ -400,13 +403,18 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			} else {
 				require.NotContains(t, event, "upstream_body_shape")
 			}
+			if tc.bodyPrefix != "" {
+				require.Equal(t, tc.bodyPrefix, event["upstream_body_prefix"])
+			} else {
+				require.NotContains(t, event, "upstream_body_prefix")
+			}
 			if tc.readReason != "" {
 				require.Equal(t, tc.readReason, event["read_error_reason"])
 			} else {
 				require.NotContains(t, event, "read_error_reason")
 			}
 			for field := range event {
-				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape"}, field)
+				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape", "upstream_body_prefix"}, field)
 			}
 			for _, private := range []string{sentinel, "gateway native output limit", "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
