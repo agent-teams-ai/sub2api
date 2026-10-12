@@ -45,9 +45,12 @@ jobs:
         working-directory: backend
         env:
           GATEWAY_NATIVE_TEST_REDIS_ADDR: 127.0.0.1:6379
+          GATEWAY_NATIVE_OAUTH_TEST_REDIS_ADDR: 127.0.0.1:6379
         run: |
           set -o pipefail
-          go test -tags unit ./internal/service ./internal/repository ./internal/handler/admin -run GatewayNative -skip '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v
+          go test -tags unit ./internal/service ./internal/repository ./internal/handler/admin -run GatewayNative -skip '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v | tee "$RUNNER_TEMP/native-boundary.log"
+          test "$(grep -c '^--- PASS: TestGatewayNativeOAuthRealRedisGuards ' "$RUNNER_TEMP/native-boundary.log")" -eq 1
+          ! grep -Eq '^--- SKIP: TestGatewayNativeOAuthRealRedisGuards([[:space:]]|$)' "$RUNNER_TEMP/native-boundary.log"
           go test -tags unit ./internal/repository -run '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis-repository.log
           test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningRealRedis /p' /tmp/native-redis-repository.log | wc -l)" -eq 1
           go test -tags unit ./internal/service ./internal/handler/admin ./internal/pkg/apicompat -run 'RawChat|Responses.*Chat|Chat.*Responses|CCStream|GatewayNativeReviewOrdinary|BatchDelete' -count=1
