@@ -126,6 +126,10 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) gatewayNa
 	if err != nil {
 		return gatewayNativeHTTPErrorDiagnostic{category: "body_read_failed"}
 	}
+	return gatewayNativeHTTPErrorCategoryBytes(body, encoding)
+}
+
+func gatewayNativeHTTPErrorCategoryBytes(body []byte, encoding string) gatewayNativeHTTPErrorDiagnostic {
 	if len(body) > 8192 {
 		return gatewayNativeHTTPErrorDiagnostic{category: "body_limit"}
 	}
@@ -152,6 +156,41 @@ func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) gatewayNa
 		diagnostic.category = "sse_error_body"
 	}
 	return diagnostic
+}
+
+// Missing media remains rejected. Observe only a bounded byte shape, never content.
+func gatewayNativeMissingMediaDiagnostic(reader io.Reader, encoding string) (string, gatewayNativeHTTPErrorDiagnostic) {
+	body, err := io.ReadAll(io.LimitReader(reader, 8193))
+	if err != nil {
+		return "", gatewayNativeHTTPErrorDiagnostic{category: "body_read_failed"}
+	}
+	shape := "other"
+	switch {
+	case len(bytes.TrimSpace(body)) == 0:
+		shape = "empty"
+	case json.Valid(body):
+		shape = "json"
+	case strings.TrimSpace(encoding) == "" || strings.EqualFold(strings.TrimSpace(encoding), "identity"):
+		if http.DetectContentType(body) == "text/html; charset=utf-8" {
+			shape = "html"
+		} else {
+			// Recognize only a complete first frame using the existing strict
+			// UTF-8/standard-field/JSON-data parser. Later frames stay opaque.
+			frame := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+			if end := bytes.Index(frame, []byte("\n\n")); end >= 0 {
+				if _, _, ok := gatewayNativeHTTPErrorSSE(frame[:end+2]); ok {
+					shape = "sse"
+				}
+			}
+		}
+	}
+	if len(body) > 8192 {
+		return shape, gatewayNativeHTTPErrorDiagnostic{category: "body_limit"}
+	}
+	if shape == "json" {
+		return shape, gatewayNativeHTTPErrorCategoryBytes(body, encoding)
+	}
+	return shape, gatewayNativeHTTPErrorDiagnostic{}
 }
 
 // Conservative single-frame diagnostic subset: complete LF/CRLF framing,
@@ -441,6 +480,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	providerErrorCategory := ""
 	providerErrorShape, providerErrorParameter := "", ""
 	upstreamMediaCategory := ""
+	upstreamBodyShape := ""
 	readErrorReason := ""
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -455,12 +495,16 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
 			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
 			UpstreamMediaCategory  string                            `json:"upstream_media_category,omitempty"`
+			UpstreamBodyShape      string                            `json:"upstream_body_shape,omitempty"`
 		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
 		if phase == gatewayNativeFailureSSERead {
 			event.ReadErrorReason = readErrorReason
 		}
 		if phase == gatewayNativeFailureContentType {
 			event.UpstreamMediaCategory = upstreamMediaCategory
+			if upstreamMediaCategory == "missing" {
+				event.UpstreamBodyShape = upstreamBodyShape
+			}
 		}
 		if status >= 100 && status <= 599 {
 			event.HTTPStatus = status
@@ -543,6 +587,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
 		if upstreamMediaCategory == "json" {
 			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+		} else if upstreamMediaCategory == "missing" {
+			var diagnostic gatewayNativeHTTPErrorDiagnostic
+			upstreamBodyShape, diagnostic = gatewayNativeMissingMediaDiagnostic(reader, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
 		}
 		return nil, fail(gatewayNativeFailureContentType)
