@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -94,6 +95,29 @@ const (
 
 type gatewayNativeHTTPErrorDiagnostic struct {
 	category, shape, parameter string
+}
+
+// Only this fixed declaration category escapes; never header values or parameters.
+func gatewayNativeUpstreamMediaCategory(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "missing"
+	}
+	media, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "other"
+	}
+	switch media {
+	case "application/json":
+		return "json"
+	case "text/html":
+		return "html"
+	case "text/event-stream":
+		return "sse"
+	}
+	if strings.HasPrefix(media, "application/") && strings.HasSuffix(media, "+json") {
+		return "json"
+	}
+	return "other"
 }
 
 // Only fixed categories and closed projections escape this bounded read.
@@ -416,6 +440,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	status := 0
 	providerErrorCategory := ""
 	providerErrorShape, providerErrorParameter := "", ""
+	upstreamMediaCategory := ""
 	readErrorReason := ""
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -429,9 +454,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
 			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
 			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
+			UpstreamMediaCategory  string                            `json:"upstream_media_category,omitempty"`
 		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
 		if phase == gatewayNativeFailureSSERead {
 			event.ReadErrorReason = readErrorReason
+		}
+		if phase == gatewayNativeFailureContentType {
+			event.UpstreamMediaCategory = upstreamMediaCategory
 		}
 		if status >= 100 && status <= 599 {
 			event.HTTPStatus = status
@@ -511,6 +540,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		return result, nil
 	}
 	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
+		if upstreamMediaCategory == "json" {
+			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+		}
 		return nil, fail(gatewayNativeFailureContentType)
 	}
 	c.Header("Content-Type", "text/event-stream")
