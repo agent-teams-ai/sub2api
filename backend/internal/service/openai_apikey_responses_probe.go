@@ -127,11 +127,14 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 		logger.LegacyPrintf("service.openai_probe", "probe_load_account_failed: account_id=%d err=%v", accountID, err)
 		return
 	}
+	if HasGatewayNativeIdentity(account) {
+		return
+	}
 	if account.Type != AccountTypeAPIKey {
 		return
 	}
-	if account.IsCNProvider() {
-		// 国产 OpenAI 兼容上游默认仅支持 /v1/chat/completions。直接落标 false
+	if account.RoutesProtocolByInbound() {
+		// 按入站协议分流的供应商（国产厂商等）默认仅支持 /v1/chat/completions。直接落标 false
 		// 走 Chat Completions 直转，跳过网络探测。
 		// 例外：deepseek / kimi 的固定 responses 和 adaptive 账号使用官方原生
 		// Responses 端点，落标 force_responses；其余协议显式重置为 auto，避免

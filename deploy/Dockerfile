@@ -7,7 +7,7 @@
 # =============================================================================
 
 ARG NODE_IMAGE=node:26.11.1-alpine
-ARG GOLANG_IMAGE=golang:1.27.0-alpine
+ARG GOLANG_IMAGE=golang:1.27.2-alpine
 ARG ALPINE_IMAGE=alpine:3.20
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.google.cn
@@ -28,6 +28,7 @@ ENV PATH="/opt/pnpm/node_modules/.bin:${PATH}"
 
 # Install dependencies first (better caching)
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/.npmrc ./
+COPY frontend/vendor/ ./vendor/
 RUN pnpm install --frozen-lockfile
 
 # Copy frontend source and build.

@@ -1019,6 +1019,10 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	if service.HasGatewayNativeIdentity(&service.Account{Extra: req.Extra}) {
+		response.BadRequest(c, "reserved native identity")
+		return
+	}
 	if err := service.ValidateOpenAILongContextBillingExtra(req.Platform, req.Extra); err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -1225,8 +1229,11 @@ func (h *AccountHandler) Update(c *gin.Context) {
 // 当前请求。探测错误仅记录日志，不向上下文传播：探测失败时标记保持缺失，
 // 网关会按"现状即证据"默认走 Responses。
 func (h *AccountHandler) scheduleOpenAIResponsesProbe(account *service.Account) {
+	if service.HasGatewayNativeIdentity(account) {
+		return
+	}
 	if account == nil || account.Type != service.AccountTypeAPIKey ||
-		(account.Platform != service.PlatformOpenAI && !service.IsCNProvider(account.Platform)) {
+		(account.Platform != service.PlatformOpenAI && !account.RoutesProtocolByInbound()) {
 		return
 	}
 	if h.accountTestService == nil {
@@ -1922,6 +1929,11 @@ func (h *AccountHandler) BatchClearError(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// Resolve and guard the whole list before launching any mutating worker.
+	if _, err := h.adminService.GetAccountsByIDs(ctx, req.AccountIDs); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
 	const maxConcurrency = 10
 	g, gctx := errgroup.WithContext(ctx)
@@ -2894,10 +2906,9 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 		return
 	}
 
-	// Handle Antigravity accounts: return Claude + Gemini models
+	// Explicit account mappings expose their request-side names to connectivity tests.
 	if account.Platform == service.PlatformAntigravity {
-		// 直接复用 antigravity.DefaultModels()，与 /v1/models 端点保持同步
-		response.Success(c, antigravity.DefaultModels())
+		response.Success(c, antigravityAccountTestModels(account.Credentials["model_mapping"]))
 		return
 	}
 
@@ -2996,6 +3007,48 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 	}
 
 	response.Success(c, models)
+}
+
+// antigravityAccountTestModels uses the stored mapping rather than GetModelMapping,
+// which supplies defaults and compatibility aliases that the administrator did not configure.
+func antigravityAccountTestModels(rawMapping any) []antigravity.ClaudeModel {
+	var mappedIDs []string
+	switch mapping := rawMapping.(type) {
+	case map[string]any:
+		for id := range mapping {
+			if strings.TrimSpace(id) != "" {
+				mappedIDs = append(mappedIDs, id)
+			}
+		}
+	case map[string]string:
+		for id := range mapping {
+			if strings.TrimSpace(id) != "" {
+				mappedIDs = append(mappedIDs, id)
+			}
+		}
+	}
+	if len(mappedIDs) == 0 {
+		return antigravity.DefaultModels()
+	}
+
+	sort.Strings(mappedIDs)
+	defaultByID := make(map[string]antigravity.ClaudeModel)
+	for _, model := range antigravity.DefaultModels() {
+		defaultByID[model.ID] = model
+	}
+	models := make([]antigravity.ClaudeModel, 0, len(mappedIDs))
+	for _, id := range mappedIDs {
+		if model, ok := defaultByID[id]; ok {
+			models = append(models, model)
+			continue
+		}
+		models = append(models, antigravity.ClaudeModel{
+			ID:          id,
+			Type:        "model",
+			DisplayName: id,
+		})
+	}
+	return models
 }
 
 // SyncUpstreamModels handles syncing live supported models from an account's upstream.

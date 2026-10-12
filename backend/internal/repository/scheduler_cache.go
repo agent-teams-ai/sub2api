@@ -797,6 +797,12 @@ func (c *schedulerCache) writeAccountIDs(ctx context.Context, accounts []service
 	}
 
 	for _, account := range accounts {
+		if service.HasGatewayNativeIdentity(&account) {
+			if err := c.DeleteAccount(ctx, account.ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		fullPayload, metaPayload, err := marshalSchedulerCacheAccount(account)
 		if err != nil {
 			slog.Warn("scheduler cache skips account with unencodable payload",

@@ -1,0 +1,895 @@
+package service
+
+import (
+	"bufio"
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+// Only the explicit private native Responses profile uses this byte-preserving
+// path, except the validated default tier is omitted on MiMo provider wire.
+// Stock passthrough performs custom-tool conversion and error retries;
+// neither is appropriate for MiMo's officially documented native Responses lite.
+// Ordinary callers, the historical bridge and their handlers stay unchanged.
+func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
+		return GatewayCodexOAuthBaseURL + "/responses", nil
+	}
+	if a.Extra[GatewayProfileExtraKey] == GatewayLegacyBridgeProfile {
+		return s.openAIChatCompletionsTargetURL(a)
+	}
+	base, err := s.validateUpstreamBaseURL(a.GetCredential("base_url"))
+	if err != nil {
+		return "", ErrGatewayNativeIdentity
+	}
+	return buildOpenAIResponsesURLForPlatform(PlatformOpenAI, base), nil
+}
+
+// These are hard bounds for the draft profile, NOT a capacity qualification.
+const gatewayNativeResponseLimit = 8 << 20
+const gatewayNativeSSEFrameLimit = 1 << 20
+
+// Draft fallback for direct private service callers. The dedicated handler
+// supplies its trusted IOTimeout-aligned policy; the approved context deadline
+// always wins. This is provider BODY inactivity, not listener idle or H2 PING.
+const gatewayNativeUpstreamReadIdle = 30 * time.Second
+
+type gatewayNativeProviderReadIdleKey struct{}
+
+// WithGatewayNativeProviderReadIdle is set by trusted private composition only,
+// never decoded from the request. Cancellation still observes the saved deadline.
+func WithGatewayNativeProviderReadIdle(ctx context.Context, idle time.Duration) context.Context {
+	return context.WithValue(ctx, gatewayNativeProviderReadIdleKey{}, idle)
+}
+
+// GatewayNativeResponseHeaderBytes marks the actual owned private transport.
+// Ordinary requests, including ordinary OpenAI profiles, keep their policy.
+func GatewayNativeResponseHeaderBytes(ctx context.Context) int64 {
+	if ctx == nil || gatewayNativeLifetime(ctx) == nil {
+		return 0
+	}
+	return 16 << 10
+}
+
+// Closed operational vocabulary: never derive diagnostics from provider content.
+type gatewayNativeResponseFailurePhase string
+
+const (
+	gatewayNativeFailureTransport   gatewayNativeResponseFailurePhase = "transport"
+	gatewayNativeFailureResponse    gatewayNativeResponseFailurePhase = "invalid_response"
+	gatewayNativeFailureHTTP        gatewayNativeResponseFailurePhase = "http_status"
+	gatewayNativeFailureRead        gatewayNativeResponseFailurePhase = "body_read"
+	gatewayNativeFailureLimit       gatewayNativeResponseFailurePhase = "body_limit"
+	gatewayNativeFailureFinal       gatewayNativeResponseFailurePhase = "invalid_final"
+	gatewayNativeFailureContentType gatewayNativeResponseFailurePhase = "invalid_content_type"
+	gatewayNativeFailureFrameLimit  gatewayNativeResponseFailurePhase = "sse_frame_limit"
+	gatewayNativeFailureFrame       gatewayNativeResponseFailurePhase = "sse_invalid_frame"
+	gatewayNativeFailureEvent       gatewayNativeResponseFailurePhase = "sse_invalid_event"
+	gatewayNativeFailureProvider    gatewayNativeResponseFailurePhase = "sse_provider_failure"
+	gatewayNativeFailureIncomplete  gatewayNativeResponseFailurePhase = "sse_incomplete"
+	gatewayNativeFailureSSERead     gatewayNativeResponseFailurePhase = "sse_read"
+	gatewayNativeFailureDeadline    gatewayNativeResponseFailurePhase = "deadline"
+	gatewayNativeFailureWrite       gatewayNativeResponseFailurePhase = "downstream_write"
+	gatewayNativeFailureFlush       gatewayNativeResponseFailurePhase = "downstream_flush"
+)
+
+type gatewayNativeHTTPErrorDiagnostic struct {
+	category, shape, parameter string
+}
+
+// Only this fixed declaration category escapes; never header values or parameters.
+func gatewayNativeUpstreamMediaCategory(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "missing"
+	}
+	media, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "other"
+	}
+	switch media {
+	case "application/json":
+		return "json"
+	case "text/html":
+		return "html"
+	case "text/event-stream":
+		return "sse"
+	}
+	if strings.HasPrefix(media, "application/") && strings.HasSuffix(media, "+json") {
+		return "json"
+	}
+	return "other"
+}
+
+// Only fixed categories and closed projections escape this bounded read.
+func gatewayNativeHTTPErrorCategory(reader io.Reader, encoding string) gatewayNativeHTTPErrorDiagnostic {
+	body, err := io.ReadAll(io.LimitReader(reader, 8193))
+	if err != nil {
+		return gatewayNativeHTTPErrorDiagnostic{category: "body_read_failed"}
+	}
+	return gatewayNativeHTTPErrorCategoryBytes(body, encoding)
+}
+
+func gatewayNativeHTTPErrorCategoryBytes(body []byte, encoding string) gatewayNativeHTTPErrorDiagnostic {
+	if len(body) > 8192 {
+		return gatewayNativeHTTPErrorDiagnostic{category: "body_limit"}
+	}
+	if json.Valid(body) {
+		return gatewayNativeJSONErrorCategory(body, "")
+	}
+	// Successful transport decoding removes Content-Encoding. Export only this
+	// fixed residual-encoding category, never the header or provider bytes.
+	if encoding = strings.TrimSpace(encoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return gatewayNativeHTTPErrorDiagnostic{category: "unhandled_error_encoding"}
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return gatewayNativeHTTPErrorDiagnostic{category: "empty_error_body"}
+	}
+	if http.DetectContentType(body) == "text/html; charset=utf-8" {
+		return gatewayNativeHTTPErrorDiagnostic{category: "html_error_body"}
+	}
+	payload, event, ok := gatewayNativeHTTPErrorSSE(body)
+	if !ok {
+		return gatewayNativeHTTPErrorDiagnostic{category: "invalid_error_json"}
+	}
+	diagnostic := gatewayNativeJSONErrorCategory(payload, event)
+	if diagnostic.category == "unknown" {
+		diagnostic.category = "sse_error_body"
+	}
+	return diagnostic
+}
+
+// Missing media remains rejected. Observe only a bounded byte shape, never content.
+func gatewayNativeMissingMediaDiagnostic(reader io.Reader, encoding string) (string, string, gatewayNativeHTTPErrorDiagnostic) {
+	body, err := io.ReadAll(io.LimitReader(reader, 8193))
+	if err != nil {
+		return "", "", gatewayNativeHTTPErrorDiagnostic{category: "body_read_failed"}
+	}
+	// Prefix facts also survive a truncated JSON object or large first SSE frame.
+	// These describe captured bytes only and never relax media acceptance.
+	probe := bytes.TrimSpace(bytes.TrimPrefix(body, []byte{0xef, 0xbb, 0xbf}))
+	prefix := "text"
+	switch {
+	case len(probe) == 0:
+		prefix = "empty"
+	case bytes.HasPrefix(probe, []byte{0x1f, 0x8b}):
+		prefix = "gzip_prefix"
+	case bytes.HasPrefix(probe, []byte{0x28, 0xb5, 0x2f, 0xfd}):
+		prefix = "zstd_prefix"
+	case probe[0] == '{' || probe[0] == '[':
+		prefix = "json_prefix"
+	case probe[0] == '<':
+		prefix = "html_prefix"
+	default:
+		for _, line := range bytes.Split(bytes.TrimPrefix(body, []byte{0xef, 0xbb, 0xbf}), []byte("\n")) {
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			if bytes.HasPrefix(line, []byte("data:")) || bytes.HasPrefix(line, []byte("event:")) || line[0] == ':' {
+				prefix = "sse_prefix"
+			}
+			break
+		}
+		if prefix == "text" && http.DetectContentType(body) == "application/octet-stream" {
+			prefix = "binary"
+		}
+	}
+	shape := "other"
+	switch {
+	case len(bytes.TrimSpace(body)) == 0:
+		shape = "empty"
+	case json.Valid(body):
+		shape = "json"
+	case strings.TrimSpace(encoding) == "" || strings.EqualFold(strings.TrimSpace(encoding), "identity"):
+		if http.DetectContentType(body) == "text/html; charset=utf-8" {
+			shape = "html"
+		} else {
+			// Recognize only a complete first frame using the existing strict
+			// UTF-8/standard-field/JSON-data parser. Later frames stay opaque.
+			frame := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+			if end := bytes.Index(frame, []byte("\n\n")); end >= 0 {
+				if _, _, ok := gatewayNativeHTTPErrorSSE(frame[:end+2]); ok {
+					shape = "sse"
+				}
+			}
+		}
+	}
+	if len(body) > 8192 {
+		return shape, prefix, gatewayNativeHTTPErrorDiagnostic{category: "body_limit"}
+	}
+	if shape == "json" {
+		return shape, prefix, gatewayNativeHTTPErrorCategoryBytes(body, encoding)
+	}
+	return shape, prefix, gatewayNativeHTTPErrorDiagnostic{}
+}
+
+// Conservative single-frame diagnostic subset: complete LF/CRLF framing,
+// UTF-8, standard fields and valid JSON data. Never scan arbitrary text for JSON.
+func gatewayNativeHTTPErrorSSE(body []byte) ([]byte, string, bool) {
+	if !utf8.Valid(body) {
+		return nil, "", false
+	}
+	body = bytes.TrimPrefix(body, []byte{0xef, 0xbb, 0xbf})
+	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	if bytes.ContainsRune(body, '\r') || !bytes.HasSuffix(body, []byte("\n\n")) {
+		return nil, "", false
+	}
+	var data [][]byte
+	event := ""
+	eventSeen := false
+	for _, line := range bytes.Split(body[:len(body)-2], []byte("\n")) {
+		if len(line) == 0 { // A second frame is not a single diagnostic envelope.
+			return nil, "", false
+		}
+		if line[0] == ':' {
+			continue
+		}
+		field, value, _ := bytes.Cut(line, []byte(":"))
+		value = bytes.TrimPrefix(value, []byte(" "))
+		switch string(field) {
+		case "data":
+			data = append(data, value)
+		case "event":
+			if eventSeen {
+				return nil, "", false
+			}
+			event, eventSeen = string(value), true
+		case "id":
+			if bytes.ContainsRune(value, 0) {
+				return nil, "", false
+			}
+		case "retry":
+			if len(value) == 0 {
+				return nil, "", false
+			}
+			for _, c := range value {
+				if c < '0' || c > '9' {
+					return nil, "", false
+				}
+			}
+		default:
+			return nil, "", false
+		}
+	}
+	payload := bytes.Join(data, []byte("\n"))
+	return payload, event, len(data) > 0 && json.Valid(payload)
+}
+
+// Private scalar-only shape evidence for a failed protected Codex request.
+func gatewayNativeCodexRequestShape(body []byte) any {
+	unsupported := []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "chat_template_kwargs", "user", "metadata", "prompt_cache_retention", "safety_identifier", "stream_options", "truncation", "stop_sequences"}
+	fields, canonical := gatewayNativeCanonicalObject(body, append([]string{"instructions"}, unsupported...)...)
+	var instructions string
+	stringValue := canonical && bytes.HasPrefix(bytes.TrimSpace(fields["instructions"]), []byte(`"`)) && json.Unmarshal(fields["instructions"], &instructions) == nil
+	present := make(map[string]bool, len(unsupported))
+	for _, field := range unsupported {
+		present[field] = canonical && fields[field] != nil
+	}
+	return struct {
+		Event                string          `json:"event"`
+		Canonical            bool            `json:"canonical_object"`
+		InstructionsPresent  bool            `json:"instructions_present"`
+		InstructionsString   bool            `json:"instructions_string"`
+		InstructionsNonblank bool            `json:"instructions_nonblank"`
+		Unsupported          map[string]bool `json:"unsupported_fields_present"`
+	}{"gateway_native_codex_request_shape", canonical, canonical && fields["instructions"] != nil, stringValue, stringValue && strings.TrimSpace(instructions) != "", present}
+}
+
+// Inspect protocol paths only. Never search arbitrary nested tool/user data.
+func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTPErrorDiagnostic {
+	d := gatewayNativeHTTPErrorDiagnostic{category: "unknown"}
+	root, ok := gatewayNativeCanonicalObject(body, "error", "response", "type", "detail")
+	if !ok {
+		d.shape = "non_object"
+		if bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+			d.shape = "ambiguous"
+		}
+		return d
+	}
+	var kind string
+	_ = json.Unmarshal(root["type"], &kind)
+	selected := root["error"]
+	d.shape = "root_error_object"
+	if !bytes.HasPrefix(bytes.TrimSpace(selected), []byte("{")) {
+		selected = nil
+		if raw := root["response"]; bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+			response, canonical := gatewayNativeCanonicalObject(raw, "error", "status")
+			if !canonical {
+				d.shape = "ambiguous"
+				return d
+			}
+			var status string
+			_ = json.Unmarshal(response["status"], &status)
+			if kind == "response.failed" || kind == "response.incomplete" || event == "response.failed" || event == "response.incomplete" || status == "failed" || status == "incomplete" {
+				selected = response["error"]
+				d.shape = "response_error_object"
+			}
+		}
+		if !bytes.HasPrefix(bytes.TrimSpace(selected), []byte("{")) {
+			if kind != "error" && event != "error" {
+				d.shape = "unrecognized_object"
+				// ChatGPT internal errors may use a top-level detail string.
+				// Only an anchored public parameter phrase is classified; never export text.
+				var detail string
+				if root["error"] == nil && root["response"] == nil && bytes.HasPrefix(bytes.TrimSpace(root["detail"]), []byte(`"`)) && json.Unmarshal(root["detail"], &detail) == nil {
+					d.shape, d.parameter = "flat_error_object", "missing"
+					if match := gatewayNativeErrorParameterMessage.FindStringSubmatch(detail); len(match) == 2 {
+						d.category = "invalid_request"
+						d.parameter = gatewayNativePublicErrorParameter(strings.TrimSuffix(strings.TrimSuffix(match[1], "."), ","))
+					} else if isOpenAICodexPlanGatedModelError(http.StatusBadRequest, []byte(detail)) {
+						d.category, d.parameter = "model_rejected", "model"
+					} else if isOpenAIInstructionsRequiredError(http.StatusBadRequest, detail, nil) {
+						d.category, d.parameter = "invalid_request", "instructions"
+					}
+				}
+				return d
+			}
+			selected, d.shape = body, "flat_error_object"
+		}
+	}
+	fields, canonical := gatewayNativeCanonicalObject(selected, "code", "type", "message", "param")
+	if !canonical {
+		d.shape = "ambiguous"
+		return d
+	}
+	var code, message, param string
+	kind = ""
+	_ = json.Unmarshal(fields["code"], &code)
+	_ = json.Unmarshal(fields["type"], &kind)
+	_ = json.Unmarshal(fields["message"], &message)
+	_ = json.Unmarshal(fields["param"], &param)
+	d.category = gatewayNativeErrorFieldsCategory(code, kind, message, param)
+	d.parameter = "other"
+	if raw := fields["param"]; len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		d.parameter = "missing"
+		if gatewayNativeValidationError(code) || gatewayNativeValidationError(kind) {
+			if match := gatewayNativeErrorParameterMessage.FindStringSubmatch(message); len(match) == 2 {
+				d.parameter = gatewayNativePublicErrorParameter(strings.TrimSuffix(strings.TrimSuffix(match[1], "."), ","))
+			}
+		}
+	} else if json.Unmarshal(raw, &param) == nil {
+		d.parameter = gatewayNativePublicErrorParameter(param)
+		// MiMo's public validation errors can put a fixed explanation in param.
+		// Interpret only publicly reported sentences under the exact wire guard;
+		// never mine arbitrary provider text or fall back to a sibling message.
+		if d.parameter == "other" && message == "Param Incorrect" && (code == "400" || bytes.Equal(bytes.TrimSpace(fields["code"]), []byte("400"))) {
+			switch param {
+			case "`text` is not set":
+				d.parameter = "text"
+			case "The reasoning_content in the thinking mode must be passed back to the API.":
+				d.parameter = "reasoning"
+			}
+			if d.parameter != "other" && d.category == "unknown" {
+				d.category = "invalid_request"
+			}
+		}
+	}
+	// Public MiMo Responses errors identify unsupported structured output with
+	// this exact code/sentence and no parameter name. Project only the fixed
+	// public field; an explicit unknown or nonstring param blocks inference.
+	if d.category == "unknown" && code == "responses_feature_not_supported" &&
+		message == "text.format type 'json_schema' is not supported, only 'text' and 'json_object' are allowed." &&
+		(len(fields["param"]) == 0 || bytes.Equal(bytes.TrimSpace(fields["param"]), []byte(`""`))) {
+		d.category, d.parameter = "invalid_request", "text"
+	}
+	return d
+}
+
+var gatewayNativeErrorParameterPath = regexp.MustCompile(`^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+|\[\d+\])*$`)
+var gatewayNativeErrorParameterMessage = regexp.MustCompile(`(?i)^(?:(?:unknown|unsupported|missing(?: required)?) parameter|invalid (?:parameter|type for|value for))(?:\s*[:=]\s*|\s+)["']?([^"' \t\r\n:]+)(?:["']|[\t\r\n ]|:|$)`)
+
+func gatewayNativePublicErrorParameter(path string) string {
+	if !gatewayNativeErrorParameterPath.MatchString(path) {
+		return "other"
+	}
+	field := strings.FieldsFunc(path, func(c rune) bool { return c == '.' || c == '[' })[0]
+	switch field {
+	case "service_tier", "max_output_tokens", "parallel_tool_calls", "context_management",
+		"tools", "input", "reasoning", "model", "store", "instructions", "stream", "text",
+		"tool_choice", "truncation", "previous_response_id", "prompt_cache_key", "prompt_cache_retention",
+		"include", "metadata", "background", "temperature", "top_p":
+		return field
+	}
+	return "other"
+}
+
+func gatewayNativeValidationError(value string) bool {
+	switch value {
+	case "unsupported_parameter", "unknown_parameter", "invalid_request_error", "invalid_parameter", "invalid_type", "invalid_value", "missing_required_parameter", "missing_parameter":
+		return true
+	}
+	return false
+}
+
+func gatewayNativeErrorFieldsCategory(code, kind, message, param string) string {
+	switch code {
+	case "code_mode_only":
+		return "code_mode_rejected"
+	case "invalid_api_key":
+		return "authentication_rejected"
+	case "model_not_found", "invalid_model":
+		return "model_rejected"
+	}
+	switch kind {
+	case "invalid_api_key":
+		return "authentication_rejected"
+	case "model_not_found", "invalid_model":
+		return "model_rejected"
+	}
+	switch param {
+	case "service_tier":
+		return "parameter_service_tier"
+	case "max_output_tokens":
+		return "parameter_max_output_tokens"
+	case "parallel_tool_calls":
+		return "parameter_parallel_tool_calls"
+	case "context_management":
+		return "parameter_context_management"
+	}
+	message = strings.ToLower(message)
+	if strings.Contains(message, "custom tools require mimo freeform responses lite mode") {
+		return "responses_lite_required"
+	}
+	if strings.Contains(message, "code_mode is required") || strings.Contains(message, "code_mode must be enabled") || strings.Contains(message, "invalid code_mode") {
+		return "code_mode_rejected"
+	}
+	switch code {
+	case "unsupported_parameter", "unknown_parameter":
+		return "unsupported_parameter"
+	case "invalid_request_error":
+		return "invalid_request"
+	}
+	switch kind {
+	case "unsupported_parameter", "unknown_parameter":
+		return "unsupported_parameter"
+	case "invalid_request_error":
+		return "invalid_request"
+	}
+	return "unknown"
+}
+
+func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
+	target, err := s.gatewayNativeTargetURL(a)
+	if err != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	upstreamBody := body
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
+		// Internal admission still requires default. MiMo does not document this
+		// provider field: delete only its top-level span after validation, keeping
+		// every unrelated tool/user byte. Other profiles retain the original body.
+		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
+		if err != nil {
+			return nil, ErrGatewayNativeIdentity
+		}
+	}
+	upstreamCtx, stopUpstream := context.WithCancel(ctx)
+	defer stopUpstream()
+	request, err := http.NewRequestWithContext(WithHTTPUpstreamProfile(upstreamCtx, HTTPUpstreamProfileOpenAI), http.MethodPost, target, bytes.NewReader(upstreamBody))
+	if err != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
+	if a.Type != AccountTypeOAuth {
+		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
+		request.Header.Set("x-openai-internal-codex-responses-lite", "true")
+	}
+	// Only trusted profile protocol headers; no caller affinity, turn-state,
+	// auth or routing headers.
+	request.Header.Set("Accept", "application/json")
+	if gjson.GetBytes(body, "stream").Bool() {
+		request.Header.Set("Accept", "text/event-stream")
+	}
+	// This seam has no effect on return identity, dispatch or settlement. Only
+	// bounded status and static phases reach the private process stderr channel.
+	// It works without initializing the general logger and leaves readiness on
+	// stdout intact. Never include context fields, headers, bodies or error text.
+	status := 0
+	providerErrorCategory := ""
+	providerErrorShape, providerErrorParameter := "", ""
+	upstreamMediaCategory := ""
+	upstreamBodyShape := ""
+	upstreamBodyPrefix := ""
+	readErrorReason := ""
+	fail := func(phase gatewayNativeResponseFailurePhase) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			phase = gatewayNativeFailureDeadline
+		}
+		event := struct {
+			Event                  string                            `json:"event"`
+			Phase                  gatewayNativeResponseFailurePhase `json:"phase"`
+			HTTPStatus             int                               `json:"http_status,omitempty"`
+			ProviderErrorCategory  string                            `json:"provider_error_category,omitempty"`
+			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
+			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
+			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
+			UpstreamMediaCategory  string                            `json:"upstream_media_category,omitempty"`
+			UpstreamBodyShape      string                            `json:"upstream_body_shape,omitempty"`
+			UpstreamBodyPrefix     string                            `json:"upstream_body_prefix,omitempty"`
+		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
+		if phase == gatewayNativeFailureSSERead {
+			event.ReadErrorReason = readErrorReason
+		}
+		if phase == gatewayNativeFailureContentType {
+			event.UpstreamMediaCategory = upstreamMediaCategory
+			if upstreamMediaCategory == "missing" {
+				event.UpstreamBodyShape = upstreamBodyShape
+				event.UpstreamBodyPrefix = upstreamBodyPrefix
+			}
+		}
+		if status >= 100 && status <= 599 {
+			event.HTTPStatus = status
+		}
+		line, _ := json.Marshal(event) // fixed strings and integer cannot fail.
+		_, _ = fmt.Fprintln(os.Stderr, string(line))
+		return ErrGatewayNativeEffectUnknown
+	}
+	start := time.Now()
+	resp, err := s.doOpenAIUpstream(request, "", a)
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	if err != nil {
+		if err == ErrGatewayNativeIdentity || err == ErrGatewayNativeReplay {
+			return nil, err
+		}
+		return nil, fail(gatewayNativeFailureTransport)
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, fail(gatewayNativeFailureResponse)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// HTTP400 diagnostics never export vendor content or alter settlement.
+		if resp.StatusCode == http.StatusBadRequest {
+			diagnostic := gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+			if a.Type == AccountTypeOAuth {
+				shape, _ := json.Marshal(gatewayNativeCodexRequestShape(upstreamBody))
+				_, _ = fmt.Fprintln(os.Stderr, string(shape))
+			}
+		}
+		return nil, fail(gatewayNativeFailureHTTP)
+	}
+	var reader io.Reader = resp.Body
+	if life := gatewayNativeLifetime(ctx); life != nil {
+		idle, _ := ctx.Value(gatewayNativeProviderReadIdleKey{}).(time.Duration)
+		if idle <= 0 || idle > gatewayNativeUpstreamReadIdle {
+			idle = gatewayNativeUpstreamReadIdle
+		}
+		reader = &gatewayNativeIdleReader{reader: resp.Body, idle: idle, cancel: func() {
+			// Cancel the real HTTP request to interrupt its blocked Read BEFORE
+			// requesting physical Close. Cancellation alone proves no closure.
+			stopUpstream()
+			life.Cancel()
+		}}
+	}
+	stream := gjson.GetBytes(body, "stream").Bool()
+	result := &OpenAIForwardResult{Stream: stream, Model: gjson.GetBytes(body, "model").String(), UpstreamEndpoint: "/v1/responses"}
+	if !stream {
+		output, err := io.ReadAll(io.LimitReader(reader, gatewayNativeResponseLimit+1))
+		if err != nil {
+			if errors.Is(err, errGatewayNativeOutputLimit) {
+				return nil, fail(gatewayNativeFailureLimit)
+			}
+			return nil, fail(gatewayNativeFailureRead)
+		}
+		if len(output) > gatewayNativeResponseLimit {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
+		fields, ok := gatewayNativeCanonicalObject(output, "status")
+		if !ok || gjson.ParseBytes(fields["status"]).String() != "completed" {
+			return nil, fail(gatewayNativeFailureFinal)
+		}
+		result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(output, "usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(output, "usage.output_tokens").Int())}
+		c.Header("Content-Type", "application/json")
+		if n, err := c.Writer.Write(output); err != nil || n != len(output) {
+			return nil, fail(gatewayNativeFailureWrite)
+		}
+		if gatewayNativeFlush(c.Writer) != nil {
+			return nil, fail(gatewayNativeFailureFlush)
+		}
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	// Only the entered, protected Codex OAuth stream may establish its protocol
+	// from a complete frame when the upstream omits its media declaration.
+	state, _ := ctx.Value(gatewayNativeContextKey{}).(*gatewayNativeDispatch)
+	encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	awaitingCodexFrame := gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type")) == "missing" &&
+		a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile &&
+		state != nil && state.account == a && state.oauth != nil && state.entered.Load() &&
+		state.route.Profile == GatewayCodexOAuthResponsesProfile && state.route.BaseURL == GatewayCodexOAuthBaseURL && state.route.Model == GatewayCodexOAuthModel &&
+		request.URL.String() == GatewayCodexOAuthBaseURL+"/responses" && request.Header.Get("Accept") == "text/event-stream" &&
+		(encoding == "" || strings.EqualFold(encoding, "identity"))
+	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") && !awaitingCodexFrame {
+		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
+		if upstreamMediaCategory == "json" {
+			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+		} else if upstreamMediaCategory == "missing" {
+			var diagnostic gatewayNativeHTTPErrorDiagnostic
+			upstreamBodyShape, upstreamBodyPrefix, diagnostic = gatewayNativeMissingMediaDiagnostic(reader, resp.Header.Get("Content-Encoding"))
+			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+		}
+		return nil, fail(gatewayNativeFailureContentType)
+	}
+	if !awaitingCodexFrame {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+	}
+	// One bounded event at a time; no producer goroutine, unbounded queue, history,
+	// error-body cache or stream reconstruction. Cancellation uses the request ctx.
+	scanner := bufio.NewScanner(io.LimitReader(reader, gatewayNativeResponseLimit+1))
+	// Include original LF/CRLF bytes in each token for bounds and forwarding.
+	scanner.Split(gatewayNativeRawSSELine)
+	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
+	var event bytes.Buffer
+	var data []string
+	total := 0
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		total += len(raw)
+		if total > gatewayNativeResponseLimit || event.Len()+len(raw) > gatewayNativeSSEFrameLimit {
+			return nil, fail(gatewayNativeFailureFrameLimit)
+		}
+		_, _ = event.Write(raw) // bytes.Buffer.Write cannot fail.
+		line := bytes.TrimSuffix(bytes.TrimSuffix(raw, []byte{'\n'}), []byte{'\r'})
+		if len(line) > 0 {
+			if awaitingCodexFrame && line[0] != ':' {
+				field, _, _ := bytes.Cut(line, []byte(":"))
+				if !bytes.Equal(field, []byte("data")) && !bytes.Equal(field, []byte("event")) &&
+					!bytes.Equal(field, []byte("id")) && !bytes.Equal(field, []byte("retry")) {
+					return nil, fail(gatewayNativeFailureFrame)
+				}
+			}
+			if bytes.HasPrefix(line, []byte("data:")) {
+				value := line[5:]
+				if len(value) > 0 && value[0] == ' ' {
+					value = value[1:]
+				}
+				data = append(data, string(value))
+			} else if bytes.Equal(line, []byte("data")) {
+				data = append(data, "")
+			}
+			continue
+		}
+		// Comments and other forwarded SSE fields also belong to the UTF-8 frame.
+		if !utf8.Valid(event.Bytes()) {
+			return nil, fail(gatewayNativeFailureFrame)
+		}
+		completed := false
+		if len(data) > 0 {
+			// SSE joins all data fields in an event before JSON interpretation.
+			payload := []byte(strings.Join(data, "\n"))
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				return nil, fail(gatewayNativeFailureIncomplete)
+			}
+			fields, ok := gatewayNativeCanonicalObject(payload, "type", "response")
+			if !ok {
+				return nil, fail(gatewayNativeFailureEvent)
+			}
+			kind := gjson.ParseBytes(fields["type"]).String()
+			// Check only the protocol response object, never tool/user payloads.
+			var status string
+			if response := fields["response"]; response != nil {
+				responseFields, ok := gatewayNativeCanonicalObject(response, "status")
+				if !ok {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				status = gjson.ParseBytes(responseFields["status"]).String()
+			}
+			if kind == "error" || kind == "response.failed" || kind == "response.incomplete" {
+				return nil, fail(gatewayNativeFailureProvider)
+			}
+			if kind == "response.completed" {
+				if status != "completed" {
+					return nil, fail(gatewayNativeFailureFinal)
+				}
+				completed = true
+				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
+			}
+			if awaitingCodexFrame {
+				if !((kind == "response.created" || kind == "response.in_progress") && status == "in_progress") && !completed {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				awaitingCodexFrame = false
+				c.Header("Content-Type", "text/event-stream")
+				c.Header("Cache-Control", "no-cache")
+			}
+		}
+		if awaitingCodexFrame {
+			// Keep legal comments/heartbeats with the first protocol frame. The
+			// same event buffer remains bounded; these bytes alone prove nothing.
+			continue
+		}
+		if n, err := c.Writer.Write(event.Bytes()); err != nil || n != event.Len() {
+			return nil, fail(gatewayNativeFailureWrite)
+		}
+		if gatewayNativeFlush(c.Writer) != nil {
+			return nil, fail(gatewayNativeFailureFlush)
+		}
+		if completed {
+			// Protocol completion and successful delivery settle the accepted effect.
+			// A keepalive/EOF/read failure after this point cannot revise that outcome.
+			_ = resp.Body.Close()
+			result.Duration = time.Since(start)
+			return result, nil
+		}
+		event.Reset()
+		data = nil
+	}
+	if err := scanner.Err(); err != nil {
+		if errors.Is(err, errGatewayNativeOutputLimit) {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
+		if err == bufio.ErrTooLong {
+			return nil, fail(gatewayNativeFailureFrameLimit)
+		}
+		readErrorReason = gatewayNativeSSEReadErrorReason(err, reader)
+		return nil, fail(gatewayNativeFailureSSERead)
+	}
+	return nil, fail(gatewayNativeFailureIncomplete)
+}
+
+// Inspect typed identities only; error text and provider data never enter this
+// closed projection. The body idle timer owns its classification precedence.
+func gatewayNativeSSEReadErrorReason(err error, reader io.Reader) string {
+	if idleReader, ok := reader.(*gatewayNativeIdleReader); ok {
+		idleReader.mu.Lock()
+		expired := idleReader.expired
+		idleReader.mu.Unlock()
+		if expired {
+			return "idle_expired"
+		}
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, http.ErrBodyReadAfterClose):
+		return "body_after_close"
+	case errors.Is(err, net.ErrClosed):
+		return "connection_closed"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "transport_timeout"
+	}
+	var corrupt flate.CorruptInputError
+	if errors.As(err, &corrupt) || errors.Is(err, gzip.ErrChecksum) || errors.Is(err, gzip.ErrHeader) {
+		return "compression_error"
+	}
+	// Only the supported zstd decoder's exported error identities qualify.
+	for _, decoderError := range []error{
+		zstd.ErrReservedBlockType, zstd.ErrCompressedSizeTooBig, zstd.ErrBlockTooSmall,
+		zstd.ErrUnexpectedBlockSize, zstd.ErrMagicMismatch, zstd.ErrWindowSizeExceeded,
+		zstd.ErrWindowSizeTooSmall, zstd.ErrDecoderSizeExceeded, zstd.ErrUnknownDictionary,
+		zstd.ErrFrameSizeExceeded, zstd.ErrFrameSizeMismatch, zstd.ErrCRCMismatch,
+		zstd.ErrDecoderClosed, zstd.ErrDecoderNilInput,
+	} {
+		if errors.Is(err, decoderError) {
+			return "compression_error"
+		}
+	}
+	return "other"
+}
+
+// The forwarding goroutine is the sole reader. One timer per pending Read,
+// no reader goroutine/queue. The lock orders timeout against Read return: a
+// timer that loses that race cannot cancel later downstream work or reads.
+type gatewayNativeIdleReader struct {
+	reader  io.Reader
+	idle    time.Duration
+	cancel  func()
+	mu      sync.Mutex
+	expired bool
+}
+
+func (r *gatewayNativeIdleReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	r.mu.Lock()
+	if r.expired {
+		r.mu.Unlock()
+		return 0, ErrGatewayNativeEffectUnknown
+	}
+	pending := true
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(r.idle, func() {
+		defer close(timerDone)
+		r.mu.Lock()
+		if !pending {
+			r.mu.Unlock()
+			return
+		}
+		r.expired = true
+		r.mu.Unlock()
+		r.cancel()
+	})
+	r.mu.Unlock()
+	var n int
+	var err error
+	for {
+		n, err = r.reader.Read(p)
+		if n != 0 || err != nil {
+			break
+		}
+		// A zero-byte nil-error read is not provider progress and cannot reset
+		// the pending read-idle clock.
+		r.mu.Lock()
+		expired := r.expired
+		r.mu.Unlock()
+		if expired {
+			break
+		}
+	}
+	r.mu.Lock()
+	pending = false
+	stopped := timer.Stop()
+	expired := r.expired
+	r.mu.Unlock()
+	if !stopped {
+		// Join an already fired callback before another Read can arm a timer.
+		// Only cancellation is joined, never physical body Close.
+		<-timerDone
+	}
+	if expired {
+		return 0, ErrGatewayNativeEffectUnknown
+	}
+	return n, err
+}
+
+func gatewayNativeRawSSELine(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i+1], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// Go's response controller observes FlushError on the actual HTTP writer.
+// Skip Unwrap-capable wrappers with only a void Flush, but retain an outer
+// writer's explicit FlushError contract (for delivery-aware middleware).
+func gatewayNativeFlush(writer http.ResponseWriter) error {
+	for {
+		if _, ok := writer.(interface{ FlushError() error }); ok {
+			break
+		}
+		unwrap, ok := writer.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		writer = unwrap.Unwrap()
+	}
+	return http.NewResponseController(writer).Flush()
+}

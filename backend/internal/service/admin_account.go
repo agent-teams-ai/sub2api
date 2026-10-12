@@ -53,7 +53,11 @@ func (s *adminServiceImpl) ListOpenAISchedulableAccountsForSchedulerScore(ctx co
 }
 
 func (s *adminServiceImpl) GetAccount(ctx context.Context, id int64) (*Account, error) {
-	return s.accountRepo.GetByID(ctx, id)
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if HasGatewayNativeIdentity(a) {
+		return nil, ErrGatewayNativeIdentity
+	}
+	return a, err
 }
 
 func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([]*Account, error) {
@@ -66,6 +70,11 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 		return nil, fmt.Errorf("failed to get accounts by IDs: %w", err)
 	}
 
+	for _, a := range accounts {
+		if HasGatewayNativeIdentity(a) {
+			return nil, ErrGatewayNativeIdentity
+		}
+	}
 	return accounts, nil
 }
 
@@ -255,6 +264,9 @@ func (s *adminServiceImpl) DuplicateAccount(ctx context.Context, id int64, actor
 	if err != nil {
 		return nil, err
 	}
+	if HasGatewayNativeIdentity(source) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	if source.IsCredentialShadow() {
 		return nil, infraerrors.BadRequest(
 			"ACCOUNT_DUPLICATE_SHADOW_UNSUPPORTED",
@@ -323,7 +335,7 @@ func (s *adminServiceImpl) DuplicateAccount(ctx context.Context, id int64, actor
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
-	if err := NormalizeOpenCodeGoProtocolRulesCredentials(input.Credentials); err != nil {
+	if err := NormalizeProtocolRulesCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
 	duplicate, err := buildAccountForCreate(input, accountExtra)
@@ -437,6 +449,13 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 		Status:      StatusActive,
 		Schedulable: true,
 	}
+	if HasGatewayNativeIdentity(account) {
+		account.Status = StatusDisabled
+		account.Schedulable = false
+		if validateGatewayNativeShape(account) != nil {
+			return nil, ErrGatewayNativeIdentity
+		}
+	}
 	if input.ProbeEnabled != nil && *input.ProbeEnabled {
 		if !isUpstreamBillingProbeAccount(account) {
 			return nil, ErrUpstreamBillingProbeAccountInvalid
@@ -479,22 +498,43 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
-	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
-	if err != nil {
-		return nil, err
+	if HasGatewayNativeIdentity(&Account{Extra: input.Extra}) && !isGatewayNativeControl(ctx) {
+		return nil, ErrGatewayNativeIdentity
 	}
-	accountExtra, err = normalizeGrokMediaEligibilityExtra(input.Platform, accountExtra)
-	if err != nil {
-		return nil, err
-	}
-	accountExtra, err = normalizeOpenAIAutoResetCreditExtra(input.Platform, input.Type, false, accountExtra)
-	if err != nil {
-		return nil, err
-	}
-	if err := ValidateUpstreamRequestIDHeaderExtra(accountExtra); err != nil {
-		return nil, err
+	var accountExtra map[string]any
+	var err error
+	if HasGatewayNativeIdentity(&Account{Extra: input.Extra}) {
+		// Validate ingress before build helpers can discard any forbidden extras.
+		if validateGatewayNativeShape(&Account{Platform: input.Platform, Type: input.Type,
+			Credentials: input.Credentials, Extra: input.Extra, ProxyID: input.ProxyID}) != nil {
+			return nil, ErrGatewayNativeIdentity
+		}
+		accountExtra = maps.Clone(input.Extra)
+	} else {
+		accountExtra, err = normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
+		if err != nil {
+			return nil, err
+		}
+		accountExtra, err = normalizeGrokMediaEligibilityExtra(input.Platform, accountExtra)
+		if err != nil {
+			return nil, err
+		}
+		accountExtra, err = normalizeOpenAIAutoResetCreditExtra(input.Platform, input.Type, false, accountExtra)
+		if err != nil {
+			return nil, err
+		}
+		if err := ValidateUpstreamRequestIDHeaderExtra(accountExtra); err != nil {
+			return nil, err
+		}
 	}
 
+	// Reserved descriptors opt in only through the trusted native admin boundary.
+	if _, marked := input.Extra[GatewayGenerationExtraKey]; marked {
+		if len(input.GroupIDs) != 0 || (input.ProbeEnabled != nil && *input.ProbeEnabled) {
+			return nil, ErrGatewayNativeIdentity
+		}
+		input.SkipDefaultGroupBind = true
+	}
 	// 绑定分组
 	groupIDs := input.GroupIDs
 	// 如果没有指定分组,自动绑定对应平台的默认分组
@@ -522,7 +562,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
-	if err := NormalizeOpenCodeGoProtocolRulesCredentials(input.Credentials); err != nil {
+	if err := NormalizeProtocolRulesCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
 	// Never persist ephemeral SSO/password secrets after OAuth conversion.
@@ -578,6 +618,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if HasGatewayNativeIdentity(account) && !isGatewayNativeControl(ctx) {
+		return nil, ErrGatewayNativeIdentity
 	}
 	if account.Platform == PlatformTypeSafe && input.Type != "" && input.Type != AccountTypeAPIKey {
 		return nil, errors.New("typesafe accounts only support apikey credentials")
@@ -655,7 +698,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err := NormalizeHeaderOverrideCredentials(account.Credentials); err != nil {
 			return nil, err
 		}
-		if err := NormalizeOpenCodeGoProtocolRulesCredentials(account.Credentials); err != nil {
+		if err := NormalizeProtocolRulesCredentials(account.Credentials); err != nil {
 			return nil, err
 		}
 		// Strip SSO/password residue that must never sit next to OAuth tokens.
@@ -926,6 +969,13 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 // UpdateAccountExtra 仅对 Extra JSONB 做 key 级合并，避免覆盖其它运行态键
 // （如 model_rate_limits / passive_usage_* 等）。
 func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return ErrGatewayNativeIdentity
+	}
 	updates = sanitizedCodexFingerprintExtraUpdates(updates)
 	updates = stripOpenAIAutoResetCreditManagedExtra(updates, true)
 	delete(updates, UpstreamBillingProbeEnabledExtraKey)
@@ -974,6 +1024,15 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 		input.AccountIDs = accountIDs
 	}
 
+	targets, guardErr := s.accountRepo.GetByIDs(ctx, input.AccountIDs)
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	for _, a := range targets {
+		if HasGatewayNativeIdentity(a) {
+			return nil, ErrGatewayNativeIdentity
+		}
+	}
 	result := &BulkUpdateAccountsResult{
 		SuccessIDs: make([]int64, 0, len(input.AccountIDs)),
 		FailedIDs:  make([]int64, 0, len(input.AccountIDs)),
@@ -1102,7 +1161,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
-	if err := NormalizeOpenCodeGoProtocolRulesCredentials(input.Credentials); err != nil {
+	if err := NormalizeProtocolRulesCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
 	// Bulk may mix platforms; always drop ephemeral SSO/password keys (cookie
@@ -1283,6 +1342,13 @@ func (s *adminServiceImpl) resolveBulkUpdateTargetIDs(ctx context.Context, filte
 }
 
 func (s *adminServiceImpl) DeleteAccount(ctx context.Context, id int64) error {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return ErrGatewayNativeIdentity
+	}
 	// 级联删除 spark 影子账号（先删影子，再删母账号）
 	shadows, err := s.accountRepo.ListShadowsByParent(ctx, id)
 	if err != nil {
@@ -1304,11 +1370,21 @@ func (s *adminServiceImpl) RefreshAccountCredentials(ctx context.Context, id int
 	if err != nil {
 		return nil, err
 	}
+	if HasGatewayNativeIdentity(account) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	// TODO: Implement refresh logic
 	return account, nil
 }
 
 func (s *adminServiceImpl) ClearAccountError(ctx context.Context, id int64) (*Account, error) {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	if err := s.accountRepo.ClearError(ctx, id); err != nil {
 		return nil, err
 	}
@@ -1331,10 +1407,24 @@ func (s *adminServiceImpl) ClearAccountError(ctx context.Context, id int64) (*Ac
 }
 
 func (s *adminServiceImpl) SetAccountError(ctx context.Context, id int64, errorMsg string) error {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return ErrGatewayNativeIdentity
+	}
 	return s.accountRepo.SetError(ctx, id, errorMsg)
 }
 
 func (s *adminServiceImpl) SetAccountSchedulable(ctx context.Context, id int64, schedulable bool) (*Account, error) {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	if err := s.accountRepo.SetSchedulable(ctx, id, schedulable); err != nil {
 		return nil, err
 	}
@@ -1346,6 +1436,13 @@ func (s *adminServiceImpl) SetAccountSchedulable(ctx context.Context, id int64, 
 }
 
 func (s *adminServiceImpl) RevertAccountProxyFallback(ctx context.Context, id int64) error {
+	a, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if HasGatewayNativeIdentity(a) {
+		return ErrGatewayNativeIdentity
+	}
 	if err := s.accountRepo.RevertProxyFallback(ctx, id); err != nil {
 		return err
 	}
@@ -1648,6 +1745,9 @@ func (s *adminServiceImpl) ResetAccountQuota(ctx context.Context, id int64) erro
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
 		return err
+	}
+	if HasGatewayNativeIdentity(account) {
+		return ErrGatewayNativeIdentity
 	}
 	// spark 影子账号不持自有配额(凭据透传母账号、spark 用量走独立 codex_* 维度由 QueryUsage 维护),
 	// 通用 quota 重置对其无意义且语义不一致——明确 400 拒绝(与 OpenAI reset-credit 对影子一致)(外审第7轮 P2)。

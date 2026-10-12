@@ -92,6 +92,9 @@ func (r *OpenAITokenRefresher) CacheKey(account *Account) string {
 
 // CanRefresh 检查是否能处理此账号
 func (r *OpenAITokenRefresher) CanRefresh(account *Account) bool {
+	if account == nil || HasGatewayNativeIdentity(account) {
+		return false
+	}
 	if account.IsCredentialShadow() {
 		return false
 	}
@@ -101,6 +104,9 @@ func (r *OpenAITokenRefresher) CanRefresh(account *Account) bool {
 // NeedsRefresh 检查token是否需要刷新
 // expires_at 缺失且处于限流状态时需要刷新，防止限流期间 token 静默过期
 func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time.Duration) bool {
+	if account == nil || HasGatewayNativeIdentity(account) {
+		return false
+	}
 	if account.IsOpenAIPersonalAccessToken() {
 		return false
 	}
@@ -118,6 +124,9 @@ func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time
 // Refresh 执行token刷新
 // 保留原有credentials中的所有字段，只更新token相关字段
 func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (map[string]any, error) {
+	if account == nil || HasGatewayNativeIdentity(account) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	tokenInfo, err := r.openaiOAuthService.RefreshAccountToken(ctx, account)
 	if err != nil {
 		return nil, err

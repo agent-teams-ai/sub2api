@@ -1004,7 +1004,9 @@ func (r *accountRepository) List(ctx context.Context, params pagination.Paginati
 }
 
 func (r *accountRepository) accountListFilteredQuery(platform, accountType, status, search string, groupID int64, privacyMode string) *dbent.AccountQuery {
-	q := r.client.Account.Query()
+	q := r.client.Account.Query().Where(func(sel *entsql.Selector) {
+		sel.Where(entsql.ExprP("NOT (" + sel.C("extra") + " ?| ARRAY['gateway_generation_v1','gateway_profile_v1'])"))
+	})
 
 	if platform != "" {
 		q = q.Where(dbaccount.PlatformEQ(platform))
