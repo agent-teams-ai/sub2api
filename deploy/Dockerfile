@@ -6,7 +6,7 @@
 # Stage 3: Final minimal image
 # =============================================================================
 
-ARG NODE_IMAGE=node:24-alpine
+ARG NODE_IMAGE=node:26.11.1-alpine
 ARG GOLANG_IMAGE=golang:1.27.2-alpine
 ARG ALPINE_IMAGE=alpine:3.20
 ARG GOPROXY=https://goproxy.cn,direct
@@ -18,14 +18,16 @@ ARG GOSUMDB=sum.golang.google.cn
 FROM ${NODE_IMAGE} AS frontend-builder
 
 WORKDIR /app/frontend
-ENV NODE_OPTIONS=--max-old-space-size=1536
+ENV NODE_OPTIONS=--max-old-space-size=4096
 
-# Install pnpm. Keep this pinned to the lockfile-compatible major version so
-# Docker builds remain reproducible when pnpm changes config validation rules.
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+# Install pnpm directly: Node 26 does not bundle Corepack.
+# Keep pnpm 9.15.9 aligned with CI and the existing v9 lockfile.
+ENV npm_config_engine_strict=true
+RUN npm install --prefix /opt/pnpm pnpm@9.15.9
+ENV PATH="/opt/pnpm/node_modules/.bin:${PATH}"
 
 # Install dependencies first (better caching)
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/.npmrc ./
 COPY frontend/vendor/ ./vendor/
 RUN pnpm install --frozen-lockfile
 
