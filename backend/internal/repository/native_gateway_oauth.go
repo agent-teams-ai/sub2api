@@ -584,6 +584,23 @@ func (r *accountRepository) CleanupGatewayNativeOAuth(ctx context.Context, in se
 			return deny()
 		}
 		route.Profile, route.BaseURL, route.Model = service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthBaseURL, service.GatewayCodexOAuthModel
+		// Cleanup alone preserves an immutable historical qualification model.
+		// Current enrollment, qualification and dispatch still use the fixed model.
+		var savedModel string
+		var exactQualification bool
+		err = tx.QueryRowContext(bounded, `SELECT q.model,
+ q.native_created_at=$2 AND q.consumer=$3 AND q.owner_ref=$4 AND q.account_ref=$5 AND q.generation=$6 AND q.operation_ref=$7
+ AND q.profile=$8 AND q.base_url=$9 AND q.qualification=$10
+ AND EXISTS(SELECT 1 FROM gateway_oauth_identity_reservations r WHERE r.account_id=q.account_id AND r.issuer=q.issuer AND r.subject=q.subject)
+ FROM gateway_oauth_profile_qualifications q WHERE q.account_id=$1`, id, route.CreatedAt,
+			in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Operation,
+			service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthBaseURL, service.GatewayCodexOAuthQualification).Scan(&savedModel, &exactQualification)
+		if err != nil && err != sql.ErrNoRows || err == nil && (!exactQualification || savedModel != "gpt-6.1-sol" && savedModel != service.GatewayCodexOAuthModel) {
+			return deny()
+		}
+		if err == nil {
+			route.Model = savedModel
+		}
 		out.Native, out.CredentialsErased = &route, erased
 	}
 	// Lock all attempts before reauthorizing. Never rewrite completed/unknown.

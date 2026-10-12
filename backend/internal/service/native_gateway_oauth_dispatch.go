@@ -20,7 +20,7 @@ import (
 
 const GatewayCodexOAuthResponsesProfile = "openai-codex-oauth-responses-v1"
 const GatewayCodexOAuthBaseURL = "https://chatgpt.com/backend-api/codex"
-const GatewayCodexOAuthModel = "gpt-6.1-sol"
+const GatewayCodexOAuthModel = "gpt-5.6-sol"
 const gatewayCodexAccountCheckURL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 
 // This receipt qualifies controlled source fixtures only. It does not attest a

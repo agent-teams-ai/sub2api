@@ -589,7 +589,7 @@ func oauthDispatchPGForward(ctx context.Context, dispatch *service.GatewayNative
 		result.err = err
 		return
 	}
-	body := []byte(`{"model":"gpt-6.1-sol","stream":true,"store":false,"service_tier":"default","max_output_tokens":128,"input":"controlled fence"}`)
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"store":false,"service_tier":"default","max_output_tokens":128,"input":"controlled fence"}`)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(body))
 	_, result.entered, result.err = gateway.ForwardGatewayRoute(ctx, c, route, body)

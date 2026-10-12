@@ -130,6 +130,7 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	const newFile = "247_gateway_native_openrouter_profile.sql"
 	const nanoFile = "248_gateway_native_openrouter_nano_model.sql"
 	const reconnectFile = "249_gateway_oauth_reconnect_claims.sql"
+	const supportedModelFile = "250_gateway_oauth_supported_codex_model.sql"
 	oldSQL, err := migrations.FS.ReadFile(oldFile)
 	require.NoError(t, err)
 	newSQL, err := migrations.FS.ReadFile(newFile)
@@ -140,13 +141,13 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	require.GreaterOrEqual(t, guardStart, 0)
 	oldGuard := string(oldSQL)[guardStart:]
 	var newApplied, nanoApplied bool
-	for _, file := range []string{oldFile, "246_gateway_oauth_profile_qualification.sql", newFile, nanoFile, reconnectFile} {
+	for _, file := range []string{oldFile, "246_gateway_oauth_profile_qualification.sql", newFile, nanoFile, reconnectFile, supportedModelFile} {
 		content, readErr := migrations.FS.ReadFile(file)
 		require.NoError(t, readErr)
 		digest := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
 		var checksum string
 		err = tx.QueryRowContext(ctx, `SELECT checksum FROM public.schema_migrations WHERE filename=$1`, file).Scan(&checksum)
-		if (file == newFile || file == nanoFile || file == reconnectFile) && errors.Is(err, sql.ErrNoRows) {
+		if (file == newFile || file == nanoFile || file == reconnectFile || file == supportedModelFile) && errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		require.True(t, err == nil, "known profile migration history required")
@@ -160,7 +161,7 @@ func TestGatewayNativeOpenRouterProfilePostgresRollback(t *testing.T) {
 	}
 	var later int
 	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM public.schema_migrations
-		WHERE substring(filename from '^([0-9]{3})_')::integer>246 AND filename NOT IN ($1,$2,$3)`, newFile, nanoFile, reconnectFile).Scan(&later)
+		WHERE substring(filename from '^([0-9]{3})_')::integer>246 AND filename NOT IN ($1,$2,$3,$4)`, newFile, nanoFile, reconnectFile, supportedModelFile).Scan(&later)
 	require.True(t, err == nil, "read later migration precondition")
 	require.Zero(t, later, "future schema requires separate qualification")
 	var originalFunction, originalBody, originalHistory string
