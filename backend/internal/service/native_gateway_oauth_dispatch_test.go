@@ -215,7 +215,7 @@ func (f *oauthDispatchFixture) qualify(t *testing.T) GatewayNativeRoute {
 	return *out.Native
 }
 func oauthDispatchPayload() []byte {
-	return []byte(`{"model":"gpt-6.1-sol","stream":true,"store":false,"service_tier":"default","max_output_tokens":128,"input":"controlled fixture","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
+	return []byte(`{"model":"gpt-5.6-sol","stream":true,"store":false,"service_tier":"default","max_output_tokens":128,"input":"controlled fixture","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
 }
 func (f *oauthDispatchFixture) call(t *testing.T, route GatewayNativeRoute, body []byte) (*httptest.ResponseRecorder, bool, error, *GatewayNativeLifetime) {
 	t.Helper()
@@ -376,7 +376,7 @@ func TestGatewayOAuthNativeResponsesRefreshBeforeEntryAndCancellation(t *testing
 }
 
 func TestGatewayOAuthInvalidEntryHasNoProviderEffect(t *testing.T) {
-	for _, scenario := range []string{"unowned-transport", "wrong-birth", "wrong-created", "wrong-row", "wrong-profile", "wrong-owner", "wrong-principal", "wrong-operation-at-entry", "erased", "grouped", "proxy", "model-alias", "store", "previous", "cap-alias", "cap-type", "cap-missing", "cap-over-limit", "bytes", "unqualified", "unsigned", "expired-current"} {
+	for _, scenario := range []string{"unowned-transport", "wrong-birth", "wrong-created", "wrong-row", "wrong-profile", "wrong-owner", "wrong-principal", "wrong-operation-at-entry", "erased", "grouped", "proxy", "model-alias", "historical-model", "store", "previous", "cap-alias", "cap-type", "cap-missing", "cap-over-limit", "bytes", "unqualified", "unsigned", "expired-current"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newOAuthDispatchFixture(t)
 			route := f.qualify(t)
@@ -410,7 +410,9 @@ func TestGatewayOAuthInvalidEntryHasNoProviderEffect(t *testing.T) {
 				id := int64(1)
 				f.store.row.ProxyID = &id
 			case "model-alias":
-				body = bytes.ReplaceAll(body, []byte("gpt-6.1-sol"), []byte("gpt-6.1"))
+				body = bytes.ReplaceAll(body, []byte("gpt-5.6-sol"), []byte("gpt-5.6"))
+			case "historical-model":
+				body = bytes.ReplaceAll(body, []byte("gpt-5.6-sol"), []byte("gpt-6.1-sol"))
 			case "store":
 				body = bytes.ReplaceAll(body, []byte(`"store":false`), []byte(`"store":true`))
 			case "previous":

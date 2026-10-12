@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/Wei-Shaw/sub2api/migrations"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,7 +53,7 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	names, err := fs.Glob(migrations.FS, "*.sql")
 	require.NoError(t, err)
 	for _, name := range names {
-		if name == "249_gateway_oauth_reconnect_claims.sql" {
+		if name == "249_gateway_oauth_reconnect_claims.sql" || name == "250_gateway_oauth_supported_codex_model.sql" {
 			continue
 		}
 		body, err := migrations.FS.ReadFile(name)
@@ -116,8 +118,8 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	dispatch, err := service.NewGatewayNativeOAuthDispatch(dispatchRepo, custody, verifier, checkTransport)
 	require.NoError(t, err)
 
-	// Seed one valid persisted 248 birth, then qualify it through the real normal
-	// Descriptor. This tests transactional backfill of populated old receipts.
+	// Seed a historical 248 birth and its old fixed-model receipt. The unchanged
+	// database guard verifies its completed enrollment/birth before insertion.
 	operation := uuid.NewString()
 	_, err = connect.BeginConnect(ownerCtx, scope, operation)
 	require.NoError(t, err)
@@ -149,9 +151,25 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	oldOutcome := service.GatewayNativeOAuthOutcome{Operation: intent.EnrollmentOperation, AccountID: oldID, Generation: scope.Generation, State: "staged"}
 	_, err = connectRepo.FinishConnect(ownerCtx, intent, "completed", oldOutcome)
 	require.NoError(t, err)
-	oldDescriptor, err := dispatch.Descriptor(ownerCtx, scope, operation)
-	require.NoError(t, err)
-	require.NotNil(t, oldDescriptor.Native)
+	insertReceipt := func(model string) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO gateway_oauth_profile_qualifications
+ (account_id,native_created_at,consumer,owner_ref,account_ref,generation,operation_ref,issuer,subject,provider_account_id,profile,base_url,model,qualification,qualified_at)
+ SELECT a.id,a.created_at,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp() FROM accounts a WHERE a.id=$1`,
+			oldID, scope.Consumer, scope.Owner, scope.Account, scope.Generation, operation, service.GatewayOAuthIssuer, subject, provider,
+			service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthBaseURL, model, service.GatewayCodexOAuthQualification)
+		return err
+	}
+	// The real pre250 constraint rejects the new model before the additive DDL.
+	err = insertReceipt(service.GatewayCodexOAuthModel)
+	var constraint *pq.Error
+	require.True(t, errors.As(err, &constraint))
+	require.Equal(t, "23514", string(constraint.Code))
+	require.Equal(t, "gateway_oauth_profile_qualifications_model_check", constraint.Constraint)
+	require.NoError(t, insertReceipt("gpt-6.1-sol"))
+	var oldBirth time.Time
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT created_at FROM accounts WHERE id=$1`, oldID).Scan(&oldBirth))
+	oldRoute := service.GatewayNativeRoute{AccountID: oldID, CreatedAt: oldBirth, Generation: scope.Generation,
+		Profile: service.GatewayCodexOAuthResponsesProfile, BaseURL: service.GatewayCodexOAuthBaseURL, Model: "gpt-6.1-sol"}
 	snapshot := func() string {
 		var value string
 		require.NoError(t, db.QueryRowContext(ctx, `SELECT jsonb_build_object('reservation',to_jsonb(r),'qualification',to_jsonb(q),'account',to_jsonb(a),'connect',to_jsonb(c))::text FROM gateway_oauth_identity_reservations r JOIN accounts a ON a.id=r.account_id JOIN gateway_oauth_profile_qualifications q ON q.account_id=a.id JOIN gateway_oauth_connect_intents c ON c.consumer=r.consumer AND c.enrollment_operation=r.operation_ref WHERE a.id=$1`, oldID).Scan(&value))
@@ -180,11 +198,23 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	current, err := dispatch.Descriptor(ownerCtx, nextScope, nextOperation)
 	require.NoError(t, err)
 	require.NotNil(t, current.Native)
+	require.Equal(t, "gpt-5.6-sol", current.Native.Model)
 	require.NotEqual(t, oldID, current.Native.AccountID)
 	require.NotEqual(t, scope.Generation, current.Native.Generation)
 	require.Equal(t, original, snapshot())
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_oauth_profile_qualifications WHERE consumer=$1 AND account_ref=$2 AND provider_account_id=$3`, scope.Consumer, scope.Account, provider).Scan(&count))
 	require.Equal(t, 2, count)
+	// Both retained and new model receipts exist; every other model stays denied.
+	var oldModel, currentModel string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT model FROM gateway_oauth_profile_qualifications WHERE account_id=$1`, oldID).Scan(&oldModel))
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT model FROM gateway_oauth_profile_qualifications WHERE account_id=$1`, current.Native.AccountID).Scan(&currentModel))
+	require.Equal(t, "gpt-6.1-sol", oldModel)
+	require.Equal(t, "gpt-5.6-sol", currentModel)
+	err = insertReceipt("gpt-5.6")
+	require.True(t, errors.As(err, &constraint))
+	require.Equal(t, "23514", string(constraint.Code))
+	require.Equal(t, "gateway_oauth_profile_qualifications_model_check", constraint.Constraint)
+	require.Equal(t, original, snapshot())
 	replay, err := connect.CompleteCallback(ownerCtx, authorize.Query().Get("state"), uuid.NewString())
 	require.NoError(t, err)
 	require.Equal(t, completed, replay)
@@ -239,4 +269,37 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 		require.Error(t, err)
 	}
 	require.Equal(t, original, snapshot())
+	// Cleanup uses the retained model only for this exact old birth. A current-
+	// model grant cannot erase it; the matching historical grant can, without
+	// altering either immutable qualification or the new account credentials.
+	cleanupRepo := repo.(service.GatewayNativeOAuthCleanupRepository)
+	request := service.GatewayNativeOAuthCleanupRequest{Scope: scope, Operation: operation, Action: "erase", CleanupRef: uuid.NewString(), CleanupToken: uuid.NewString()}
+	grant := func(route service.GatewayNativeRoute) service.GatewayNativeOAuthCleanupAuthorizer {
+		return func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+			return service.GatewayNativeOAuthCleanupAuthority{Owner: scope.Owner, LeaseExpiresAt: time.Now().Add(5 * time.Second), Native: &route}, nil
+		}
+	}
+	wrongModel := oldRoute
+	wrongModel.Model = service.GatewayCodexOAuthModel
+	_, err = cleanupRepo.CleanupGatewayNativeOAuth(ownerCtx, request, grant(wrongModel))
+	require.Error(t, err)
+	require.Equal(t, original, snapshot())
+	qualification := func() string {
+		var raw string
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT to_jsonb(q)::text FROM gateway_oauth_profile_qualifications q WHERE account_id=$1`, oldID).Scan(&raw))
+		return raw
+	}
+	beforeCleanup := qualification()
+	var currentCredentials string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials::text FROM accounts WHERE id=$1`, current.Native.AccountID).Scan(&currentCredentials))
+	closed, err := cleanupRepo.CleanupGatewayNativeOAuth(ownerCtx, request, grant(oldRoute))
+	require.NoError(t, err)
+	require.True(t, closed.CredentialsErased)
+	require.Equal(t, "closed", closed.Closure)
+	require.NotNil(t, closed.Native)
+	require.Equal(t, oldRoute.Model, closed.Native.Model)
+	require.Equal(t, beforeCleanup, qualification())
+	var afterCredentials string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials::text FROM accounts WHERE id=$1`, current.Native.AccountID).Scan(&afterCredentials))
+	require.Equal(t, currentCredentials, afterCredentials)
 }
