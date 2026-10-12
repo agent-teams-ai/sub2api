@@ -149,6 +149,11 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 			raw, err := io.ReadAll(r.Body)
 			require.NoError(t, err)
 			f.lastPayload.Store(string(raw))
+			if f.mode == "badrequest" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"detail":"Instructions are required"}`)
+				return
+			}
 			if f.mode == "error" {
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = io.WriteString(w, uuid.NewString())

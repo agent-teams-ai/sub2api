@@ -182,6 +182,26 @@ func gatewayNativeHTTPErrorSSE(body []byte) ([]byte, string, bool) {
 	return payload, event, len(data) > 0 && json.Valid(payload)
 }
 
+// Private scalar-only shape evidence for a failed protected Codex request.
+func gatewayNativeCodexRequestShape(body []byte) any {
+	unsupported := []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "chat_template_kwargs", "user", "metadata", "prompt_cache_retention", "safety_identifier", "stream_options", "truncation", "stop_sequences"}
+	fields, canonical := gatewayNativeCanonicalObject(body, append([]string{"instructions"}, unsupported...)...)
+	var instructions string
+	stringValue := canonical && bytes.HasPrefix(bytes.TrimSpace(fields["instructions"]), []byte(`"`)) && json.Unmarshal(fields["instructions"], &instructions) == nil
+	present := make(map[string]bool, len(unsupported))
+	for _, field := range unsupported {
+		present[field] = canonical && fields[field] != nil
+	}
+	return struct {
+		Event                string          `json:"event"`
+		Canonical            bool            `json:"canonical_object"`
+		InstructionsPresent  bool            `json:"instructions_present"`
+		InstructionsString   bool            `json:"instructions_string"`
+		InstructionsNonblank bool            `json:"instructions_nonblank"`
+		Unsupported          map[string]bool `json:"unsupported_fields_present"`
+	}{"gateway_native_codex_request_shape", canonical, canonical && fields["instructions"] != nil, stringValue, stringValue && strings.TrimSpace(instructions) != "", present}
+}
+
 // Inspect protocol paths only. Never search arbitrary nested tool/user data.
 func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTPErrorDiagnostic {
 	d := gatewayNativeHTTPErrorDiagnostic{category: "unknown"}
@@ -223,6 +243,10 @@ func gatewayNativeJSONErrorCategory(body []byte, event string) gatewayNativeHTTP
 					if match := gatewayNativeErrorParameterMessage.FindStringSubmatch(detail); len(match) == 2 {
 						d.category = "invalid_request"
 						d.parameter = gatewayNativePublicErrorParameter(strings.TrimSuffix(strings.TrimSuffix(match[1], "."), ","))
+					} else if isOpenAICodexPlanGatedModelError(http.StatusBadRequest, []byte(detail)) {
+						d.category, d.parameter = "model_rejected", "model"
+					} else if isOpenAIInstructionsRequiredError(http.StatusBadRequest, detail, nil) {
+						d.category, d.parameter = "invalid_request", "instructions"
 					}
 				}
 				return d
@@ -438,6 +462,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if resp.StatusCode == http.StatusBadRequest {
 			diagnostic := gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
+			if a.Type == AccountTypeOAuth {
+				shape, _ := json.Marshal(gatewayNativeCodexRequestShape(upstreamBody))
+				_, _ = fmt.Fprintln(os.Stderr, string(shape))
+			}
 		}
 		return nil, fail(gatewayNativeFailureHTTP)
 	}
