@@ -158,7 +158,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	const cappedJSON = `{"status":"completed","output":[]}`
 	cases := []struct {
 		name, contentType, wire, phase, category, encoding, shape, parameter string
-		readReason, mediaCategory                                            string
+		readReason, mediaCategory, bodyShape                                 string
 		idle, deadline                                                       time.Duration
 		outputCap                                                            int64
 		status                                                               int
@@ -268,7 +268,14 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "SSE deadline omits read reason", status: 200, stream: true, phase: "deadline", contentType: "text/event-stream", idle: time.Second, deadline: 100 * time.Millisecond},
 		{name: "invalid final", status: 200, phase: "invalid_final", wire: `{"status":"incomplete","private":"` + sentinel + `"}`},
 		{name: "invalid content type", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "other", contentType: sentinel, unread: true, wire: sentinel},
-		{name: "invalid content type missing", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", unread: true, wire: sentinel},
+		{name: "invalid content type missing", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", wire: sentinel},
+		{name: "missing media empty", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "empty"},
+		{name: "missing media JSON", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "json", category: "model_rejected", shape: "root_error_object", parameter: "model", wire: `{"error":{"code":"invalid_model","param":"model","message":"` + sentinel + `"}}`},
+		{name: "missing media HTML", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "html", wire: "<!DOCTYPE html><html><body>" + sentinel + "</body></html>"},
+		{name: "missing media SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", wire: "event: response.created\r\ndata: {\"type\":\"response.created\",\"private\":\"" + sentinel + "\"}\r\n\r\n" + nativeReviewCompleted},
+		{name: "missing media malformed SSE", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "other", wire: "event: error\ndata: " + sentinel + "\n\n"},
+		{name: "missing media bound", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "missing", bodyShape: "sse", category: "body_limit", wire: "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" + strings.Repeat(sentinel, 1024)},
+		{name: "missing media deadline", status: 200, stream: true, phase: "deadline", category: "body_read_failed", idle: time.Second, deadline: 100 * time.Millisecond},
 		{name: "invalid content type HTML", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "html", contentType: `text/html; private="` + sentinel + `"`, unread: true, wire: sentinel},
 		{name: "invalid content type SSE formatting", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "sse", contentType: " text/event-stream", unread: true, wire: sentinel},
 		{name: "invalid content type malformed", status: 200, stream: true, phase: "invalid_content_type", mediaCategory: "other", contentType: "application/json; " + sentinel, unread: true, wire: sentinel},
@@ -329,7 +336,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			result, entered, err := svc.ForwardGatewayRoute(ctx, c, route, payload)
 			require.True(t, entered)
 			require.Equal(t, 1, transport.requests)
-			if tc.status == 400 || tc.mediaCategory == "json" {
+			if tc.status == 400 || tc.mediaCategory == "json" || tc.mediaCategory == "missing" {
 				require.LessOrEqual(t, body.bytesRead, 8193, "diagnostic body read is bounded")
 			}
 			if tc.unread {
@@ -353,7 +360,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			}
 			require.Same(t, ErrGatewayNativeEffectUnknown, err)
 			require.Nil(t, result)
-			if tc.phase == "invalid_content_type" || tc.name == "invalid content type JSON deadline" {
+			if tc.phase == "invalid_content_type" || tc.name == "invalid content type JSON deadline" || tc.name == "missing media deadline" {
 				require.Empty(t, rec.Body.String(), "a wrong-media response is never forwarded")
 			}
 			require.Equal(t, 1, strings.Count(string(logs), "\n"), "one bounded diagnostic line per failed call")
@@ -377,10 +384,10 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			if tc.parameter != "" {
 				require.Equal(t, tc.parameter, event["provider_error_parameter"])
 			}
-			if tc.shape == "ambiguous" || tc.shape == "non_object" || tc.shape == "unrecognized_object" || tc.status != 400 && tc.mediaCategory != "json" {
+			if tc.shape == "ambiguous" || tc.shape == "non_object" || tc.shape == "unrecognized_object" || tc.status != 400 && tc.mediaCategory != "json" && tc.bodyShape != "json" {
 				require.NotContains(t, event, "provider_error_parameter")
 			}
-			if tc.status != 400 && tc.mediaCategory != "json" {
+			if tc.status != 400 && tc.mediaCategory != "json" && tc.bodyShape != "json" {
 				require.NotContains(t, event, "provider_error_shape")
 			}
 			if tc.mediaCategory != "" {
@@ -388,13 +395,18 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			} else {
 				require.NotContains(t, event, "upstream_media_category")
 			}
+			if tc.bodyShape != "" {
+				require.Equal(t, tc.bodyShape, event["upstream_body_shape"])
+			} else {
+				require.NotContains(t, event, "upstream_body_shape")
+			}
 			if tc.readReason != "" {
 				require.Equal(t, tc.readReason, event["read_error_reason"])
 			} else {
 				require.NotContains(t, event, "read_error_reason")
 			}
 			for field := range event {
-				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category"}, field)
+				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape"}, field)
 			}
 			for _, private := range []string{sentinel, "gateway native output limit", "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
