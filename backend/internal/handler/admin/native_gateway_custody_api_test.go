@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -430,5 +431,97 @@ func TestGatewayNativeCustodyPrivateAPIPostgres(t *testing.T) {
 		status, _ = custodyAPIRequest(t, cleanup.Client(), http.MethodPost, cleanup.URL+"/private/native/v1/responses", tokenA, dispatch)
 		require.GreaterOrEqual(t, status, 400)
 		require.EqualValues(t, 1, entries.Load())
+	})
+	// The BYOK export assertion above does not cover a persisted OAuth bundle or
+	// its retained operation history. Exercise the normal handlers with that row.
+	t.Run("persisted OAuth export and retained readback stay secret-free", func(t *testing.T) {
+		beforeEntries := entries.Load()
+		f := newConnectHTTPFixture(t)
+		oauthRepo, ok := repo.(service.GatewayNativeOAuthRepository)
+		require.True(t, ok)
+		enrollment, err := service.NewGatewayNativeOAuthEnrollment(service.NewGatewayNativeOAuthVerifier(f.transport), f.custody, oauthRepo, nativeReviewSyntheticBytes(t, 32))
+		require.NoError(t, err)
+		owner, err := service.WithGatewayNativeConsumer(ctx, f.scope.Consumer)
+		require.NoError(t, err)
+		owner, err = service.WithGatewayNativeOAuthOwner(owner, f.scope.Owner)
+		require.NoError(t, err)
+		var bundle service.GatewayNativeOAuthBundle
+		require.NoError(t, json.Unmarshal([]byte(f.response), &bundle))
+		bundle.SensitiveMetadata = json.RawMessage(`{"private":"fixture-sensitive-metadata"}`)
+		const operation = "export-history-oauth"
+		birth, err := enrollment.Stage(owner, f.scope, operation, bundle)
+		require.NoError(t, err)
+		persisted, err := repo.GetByID(ctx, birth.AccountID)
+		require.NoError(t, err)
+		require.Equal(t, service.AccountTypeOAuth, persisted.Type)
+		encrypted := persisted.GetCredential("oauth_bundle")
+		require.True(t, strings.HasPrefix(encrypted, "gco1."))
+		ordinary := &service.Account{Name: "ordinary export control", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+			Status: service.StatusDisabled, Credentials: map[string]any{"api_key": "ordinary-export-key"}, Concurrency: 1, Priority: 1}
+		require.NoError(t, repo.Create(ctx, ordinary))
+		h := NewAccountHandler(admin, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		router := gin.New()
+		router.GET("/api/v1/admin/accounts/data", h.ExportData)
+		router.GET("/api/v1/admin/accounts/:id", h.GetByID)
+		export := httptest.NewServer(router)
+		defer export.Close()
+		id := strconv.FormatInt(birth.AccountID, 10)
+		for _, erased := range []bool{false, true} {
+			if erased {
+				require.NoError(t, oauthRepo.EraseGatewayNativeOAuth(owner, f.scope, operation))
+			}
+			status, body := custodyAPIRequest(t, export.Client(), http.MethodGet, export.URL+"/api/v1/admin/accounts/data?include_proxies=false", "", nil)
+			require.Equal(t, http.StatusOK, status)
+			var payload dataResponse
+			require.NoError(t, json.Unmarshal(body, &payload))
+			require.Len(t, payload.Data.Accounts, 1, "ordinary export remains functional and omits managed OAuth")
+			require.Equal(t, ordinary.Name, payload.Data.Accounts[0].Name)
+			require.Equal(t, "ordinary-export-key", payload.Data.Accounts[0].Credentials["api_key"])
+			output := string(body)
+			for i, path := range []string{"/api/v1/admin/accounts/data?include_proxies=false&ids=" + id, "/api/v1/admin/accounts/" + id} {
+				status, body = custodyAPIRequest(t, export.Client(), http.MethodGet, export.URL+path, "", nil)
+				if erased && i == 0 {
+					require.Equal(t, http.StatusOK, status)
+					var absent dataResponse
+					require.NoError(t, json.Unmarshal(body, &absent))
+					require.Empty(t, absent.Data.Accounts)
+				} else {
+					require.GreaterOrEqual(t, status, http.StatusBadRequest)
+				}
+				output += string(body)
+			}
+			readback, err := oauthRepo.ReadGatewayNativeOAuth(owner, f.scope, operation)
+			require.NoError(t, err)
+			require.Equal(t, birth.AccountID, readback.AccountID)
+			require.Equal(t, birth.Generation, readback.Generation)
+			require.Equal(t, operation, readback.Operation)
+			if erased {
+				require.Equal(t, "erased", readback.State)
+			} else {
+				require.Equal(t, "staged", readback.State)
+			}
+			safe, err := json.Marshal(readback)
+			require.NoError(t, err)
+			output += string(safe)
+			require.NotContains(t, output, encrypted)
+			var history []byte
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT jsonb_build_object('account',to_jsonb(a),'reservation',to_jsonb(r),'principal',to_jsonb(p))
+			 FROM accounts a JOIN gateway_oauth_identity_reservations r ON r.account_id=a.id
+			 JOIN gateway_oauth_principal_claims p ON p.issuer=r.issuer AND p.subject=r.subject WHERE a.id=$1`, birth.AccountID).Scan(&history))
+			require.True(t, json.Valid(history))
+			if erased {
+				require.NotContains(t, string(history), encrypted)
+			} else {
+				require.Contains(t, string(history), encrypted, "the rejected export targets actual sealed persisted material")
+			}
+			for _, secret := range f.secrets {
+				require.NotContains(t, output, secret)
+				require.NotContains(t, string(history), secret)
+			}
+		}
+		require.Zero(t, f.tokens.Load(), "export/readback does not enter token exchange")
+		require.Zero(t, f.checks.Load())
+		require.Zero(t, f.destination.Load())
+		require.Equal(t, beforeEntries, entries.Load(), "OAuth export/readback never dispatches inference")
 	})
 }
