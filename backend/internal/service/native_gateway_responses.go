@@ -615,7 +615,17 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		result.Duration = time.Since(start)
 		return result, nil
 	}
-	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+	// Only the entered, protected Codex OAuth stream may establish its protocol
+	// from a complete frame when the upstream omits its media declaration.
+	state, _ := ctx.Value(gatewayNativeContextKey{}).(*gatewayNativeDispatch)
+	encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	awaitingCodexFrame := gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type")) == "missing" &&
+		a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile &&
+		state != nil && state.account == a && state.oauth != nil && state.entered.Load() &&
+		state.route.Profile == GatewayCodexOAuthResponsesProfile && state.route.BaseURL == GatewayCodexOAuthBaseURL && state.route.Model == GatewayCodexOAuthModel &&
+		request.URL.String() == GatewayCodexOAuthBaseURL+"/responses" && request.Header.Get("Accept") == "text/event-stream" &&
+		(encoding == "" || strings.EqualFold(encoding, "identity"))
+	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") && !awaitingCodexFrame {
 		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
 		if upstreamMediaCategory == "json" {
 			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
@@ -627,8 +637,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		}
 		return nil, fail(gatewayNativeFailureContentType)
 	}
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
+	if !awaitingCodexFrame {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+	}
 	// One bounded event at a time; no producer goroutine, unbounded queue, history,
 	// error-body cache or stream reconstruction. Cancellation uses the request ctx.
 	scanner := bufio.NewScanner(io.LimitReader(reader, gatewayNativeResponseLimit+1))
@@ -647,6 +659,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		_, _ = event.Write(raw) // bytes.Buffer.Write cannot fail.
 		line := bytes.TrimSuffix(bytes.TrimSuffix(raw, []byte{'\n'}), []byte{'\r'})
 		if len(line) > 0 {
+			if awaitingCodexFrame && line[0] != ':' {
+				field, _, _ := bytes.Cut(line, []byte(":"))
+				if !bytes.Equal(field, []byte("data")) && !bytes.Equal(field, []byte("event")) &&
+					!bytes.Equal(field, []byte("id")) && !bytes.Equal(field, []byte("retry")) {
+					return nil, fail(gatewayNativeFailureFrame)
+				}
+			}
 			if bytes.HasPrefix(line, []byte("data:")) {
 				value := line[5:]
 				if len(value) > 0 && value[0] == ' ' {
@@ -693,6 +712,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				completed = true
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
+			if awaitingCodexFrame {
+				if !((kind == "response.created" || kind == "response.in_progress") && status == "in_progress") && !completed {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				awaitingCodexFrame = false
+				c.Header("Content-Type", "text/event-stream")
+				c.Header("Cache-Control", "no-cache")
+			}
+		}
+		if awaitingCodexFrame {
+			// Keep legal comments/heartbeats with the first protocol frame. The
+			// same event buffer remains bounded; these bytes alone prove nothing.
+			continue
 		}
 		if n, err := c.Writer.Write(event.Bytes()); err != nil || n != event.Len() {
 			return nil, fail(gatewayNativeFailureWrite)
