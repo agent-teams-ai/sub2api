@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/Wei-Shaw/sub2api/migrations"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -549,4 +551,397 @@ func TestGatewayNativeCustodyPostgresAndRestore(t *testing.T) {
 		require.False(t, entered)
 		require.Zero(t, entries.Load())
 	})
+}
+
+type oauthTransportEntryCounter struct {
+	transport http.RoundTripper
+	entries   atomic.Int32
+}
+
+func (c *oauthTransportEntryCounter) RoundTrip(request *http.Request) (*http.Response, error) {
+	c.entries.Add(1)
+	return c.transport.RoundTrip(request)
+}
+
+// Regression: an actual data-only backup must retain the encrypted v2 native
+// OAuth row and its immutable claims/history, while restore-time key loss,
+// replay, foreign scope and erasure cannot revive or republish credentials.
+func TestGatewayNativeOAuthBackupRestoreAndRedisCustody(t *testing.T) {
+	sourceDSN := custodyPGDSN(t, "GATEWAY_NATIVE_OAUTH_TEST_DSN", "gateway_oauth_test_")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	db, accountRepo := custodyPGOpen(t, ctx, sourceDSN)
+	repo, ok := accountRepo.(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
+	refreshRepo, ok := repo.(service.GatewayNativeOAuthRefreshRepository)
+	require.True(t, ok)
+	dispatchRepo, ok := repo.(service.GatewayNativeOAuthDispatchRepository)
+	require.True(t, ok)
+
+	oldKey := custodyPGBytes(t, 32)
+	newKey := custodyPGBytes(t, 32)
+	oldCustody, err := service.NewGatewayNativeCredentialCustody("old", map[string][]byte{"old": oldKey})
+	require.NoError(t, err)
+	rotatedCustody, err := service.NewGatewayNativeCredentialCustody("new", map[string][]byte{"new": newKey, "old": oldKey})
+	require.NoError(t, err)
+	intentKey := custodyPGBytes(t, 32)
+
+	var tokenCalls, accountChecks atomic.Int32
+	providerAccount := uuid.NewString()
+	var originalBundle, returnedBundle service.GatewayNativeOAuthBundle
+	_, fixtureTransport, bundleFor := oauthPGRefreshFixture(t, func(w http.ResponseWriter, r *http.Request, next func(string) service.GatewayNativeOAuthBundle) {
+		tokenCalls.Add(1)
+		require.NoError(t, r.ParseForm())
+		require.Equal(t, "refresh_token", r.Form.Get("grant_type"))
+		require.Equal(t, originalBundle.RefreshToken, r.Form.Get("refresh_token"))
+		require.Equal(t, "app_EMoamEEZ73f0CkXaXp7hrann", r.Form.Get("client_id"))
+		require.Equal(t, "openid profile email", r.Form.Get("scope"))
+		returnedBundle = next("subject-backup-restore")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": returnedBundle.AccessToken, "refresh_token": returnedBundle.RefreshToken,
+			"id_token": returnedBundle.IDToken, "token_type": "Bearer", "expires_in": 3600,
+			"protected_hint": "f2-sensitive-metadata",
+		})
+	}, func(w http.ResponseWriter, r *http.Request) {
+		accountChecks.Add(1)
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "Bearer "+originalBundle.AccessToken, r.Header.Get("Authorization"))
+		require.Equal(t, "application/json", r.Header.Get("Accept"))
+		_, _ = fmt.Fprintf(w, `{"accounts":{"unrelated-workspace":{"account":{"account_id":%q}}}}`, providerAccount)
+	})
+	counter := &oauthTransportEntryCounter{transport: fixtureTransport}
+	verifier := service.NewGatewayNativeOAuthVerifier(counter)
+
+	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, oldCustody, repo, intentKey)
+	require.NoError(t, err)
+	principal, scope := oauthPGScope(t, "consumer-backup-restore", "owner-backup-restore", "logical-backup-restore")
+	principal, cancelPrincipal := context.WithTimeout(principal, 90*time.Second)
+	defer cancelPrincipal()
+	originalBundle = bundleFor("subject-backup-restore")
+
+	journal, err := NewGatewayNativeOAuthConnectRepository(db)
+	require.NoError(t, err)
+	connector, err := service.NewGatewayNativeOAuthConnect(intentKey, counter, journal, enrollment, repo)
+	require.NoError(t, err)
+	const connectOperation = "backup-restore-connect"
+	_, err = connector.BeginConnect(principal, scope, connectOperation)
+	require.NoError(t, err)
+	connectIntent, err := journal.ReadConnectIntent(principal, scope, connectOperation)
+	require.NoError(t, err)
+	won, err := journal.EnterConnect(principal, connectIntent)
+	require.NoError(t, err)
+	require.True(t, won)
+	binding := &oauthRefreshConnectBinding{GatewayNativeOAuthRepository: repo, journal: journal, intent: connectIntent}
+	boundEnrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, oldCustody, binding, intentKey)
+	require.NoError(t, err)
+	staged, err := boundEnrollment.Stage(principal, scope, connectIntent.EnrollmentOperation, originalBundle)
+	require.NoError(t, err)
+	finished, err := journal.FinishConnect(principal, binding.intent, "completed", staged)
+	require.NoError(t, err)
+	require.Equal(t, "completed", finished.State)
+	require.Equal(t, staged, finished.Outcome)
+
+	_, physical, release, err := dispatchRepo.LockGatewayNativeOAuthDispatch(principal, scope, connectOperation, staged.AccountID)
+	require.NoError(t, err)
+	release()
+	require.False(t, physical.QualificationValid(1))
+	require.ErrorIs(t, dispatchRepo.QualifyGatewayNativeOAuthDispatch(principal, physical, 1), service.ErrGatewayNativeIdentity)
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(dispatchRepo, oldCustody, verifier, counter)
+	require.NoError(t, err)
+	descriptor, err := dispatch.Descriptor(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayCodexOAuthQualification, descriptor.Qualification)
+	require.Equal(t, connectOperation, descriptor.Operation)
+	require.Equal(t, scope.Account, descriptor.Account)
+	require.NotNil(t, descriptor.Native)
+	require.Equal(t, physical.Route, *descriptor.Native)
+	require.Equal(t, staged.AccountID, descriptor.Native.AccountID)
+	require.Equal(t, staged.Generation, descriptor.Native.Generation)
+	require.Equal(t, service.GatewayCodexOAuthResponsesProfile, descriptor.Native.Profile)
+	require.Equal(t, service.GatewayCodexOAuthBaseURL, descriptor.Native.BaseURL)
+	require.Equal(t, service.GatewayCodexOAuthModel, descriptor.Native.Model)
+
+	var sourceID int64
+	var sourceBirth time.Time
+	var sourceCredentials, sourceExtra []byte
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT id,created_at,credentials,extra FROM accounts WHERE id=$1`, staged.AccountID).
+		Scan(&sourceID, &sourceBirth, &sourceCredentials, &sourceExtra))
+	var originalStored struct {
+		Envelope string `json:"oauth_bundle"`
+	}
+	require.NoError(t, json.Unmarshal(sourceCredentials, &originalStored))
+	require.Equal(t, staged.AccountID, sourceID)
+	require.True(t, sourceBirth.Equal(descriptor.Native.CreatedAt))
+	require.True(t, strings.HasPrefix(originalStored.Envelope, "gco1.old."))
+	require.NoError(t, oldCustody.ValidateOAuthEnvelope(originalStored.Envelope))
+	require.NoError(t, rotatedCustody.ValidateOAuthEnvelope(originalStored.Envelope), "rotation must retain the old read key")
+
+	in := service.GatewayNativeOAuthRefreshIntent{
+		Scope: scope, AccountID: staged.AccountID, CreatedAt: sourceBirth,
+		ExpectedVersion: 1, Operation: "backup-restore-refresh-one", Intent: "rotate-whole-bundle",
+	}
+	refresher, err := service.NewGatewayNativeOAuthRefresh(refreshRepo, rotatedCustody, verifier, counter)
+	require.NoError(t, err)
+	refreshed, err := refresher.Refresh(principal, in)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: 2}, refreshed)
+	require.NotEmpty(t, returnedBundle.AccessToken)
+	require.NotEmpty(t, returnedBundle.RefreshToken)
+	require.NotEmpty(t, returnedBundle.IDToken)
+	require.True(t, originalBundle.AccessToken != returnedBundle.AccessToken)
+	require.True(t, originalBundle.RefreshToken != returnedBundle.RefreshToken)
+	require.EqualValues(t, 1, tokenCalls.Load())
+	require.EqualValues(t, 1, accountChecks.Load())
+	require.EqualValues(t, 5, counter.entries.Load(), "positive control is three JWKS, one account check and one token exchange")
+
+	var afterID int64
+	var afterBirth time.Time
+	var afterCredentials, afterExtra []byte
+	var afterVersion int64
+	var status string
+	var schedulable, undeleted bool
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT id,created_at,credentials,extra,
+ gateway_oauth_credential_version(credentials),status,schedulable,deleted_at IS NULL
+ FROM accounts WHERE id=$1`, staged.AccountID).
+		Scan(&afterID, &afterBirth, &afterCredentials, &afterExtra, &afterVersion, &status, &schedulable, &undeleted))
+	require.Equal(t, sourceID, afterID)
+	require.True(t, sourceBirth.Equal(afterBirth))
+	require.True(t, bytes.Equal(sourceExtra, afterExtra))
+	require.Equal(t, int64(2), afterVersion)
+	require.Equal(t, service.StatusDisabled, status)
+	require.False(t, schedulable)
+	require.True(t, undeleted)
+	var refreshedStored struct {
+		Envelope string `json:"oauth_bundle"`
+	}
+	require.NoError(t, json.Unmarshal(afterCredentials, &refreshedStored))
+	require.True(t, strings.HasPrefix(refreshedStored.Envelope, "gco2.new.2."))
+	require.True(t, originalStored.Envelope != refreshedStored.Envelope)
+	sourcePositive, err := refresher.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "completed", sourcePositive.State)
+	require.Equal(t, in.Operation, sourcePositive.RefreshRef)
+	require.EqualValues(t, 5, counter.entries.Load(), "current v2 custody authenticity must need no additional transport entry")
+
+	refreshedRow, err := accountRepo.GetByID(ctx, staged.AccountID)
+	require.NoError(t, err)
+	oauthPGRedisGuards(t, refreshedRow, originalBundle, returnedBundle.AccessToken, returnedBundle.RefreshToken,
+		returnedBundle.IDToken, "f2-sensitive-metadata")
+	counter.entries.Store(0)
+
+	dumpBinary, err := exec.LookPath("pg_dump")
+	require.NoError(t, err)
+	dumpCommand := exec.CommandContext(ctx, dumpBinary,
+		"--data-only", "--column-inserts", "--no-owner", "--no-privileges", "--disable-triggers",
+		"--table=public.accounts", "--table=public.gateway_oauth_*", "--dbname="+sourceDSN)
+	dumpCommand.Env = []string{"PATH=" + os.Getenv("PATH"), "PGPASSFILE=/dev/null", "PGSSLMODE=disable"}
+	dump, err := dumpCommand.Output()
+	require.NoError(t, err)
+	for _, secret := range []string{
+		originalBundle.AccessToken, originalBundle.RefreshToken, originalBundle.IDToken,
+		returnedBundle.AccessToken, returnedBundle.RefreshToken, returnedBundle.IDToken,
+		"f2-sensitive-metadata",
+	} {
+		require.False(t, bytes.Contains(dump, []byte(secret)), "backup contains a controlled plaintext secret")
+	}
+	require.False(t, bytes.Contains(dump, []byte(originalStored.Envelope)), "backup retains the spent v1 envelope")
+	require.True(t, bytes.Contains(dump, []byte(refreshedStored.Envelope)), "backup omits the actual v2 envelope")
+
+	restoreDSN := custodyPGDSN(t, "GATEWAY_NATIVE_CUSTODY_RESTORE_PG_DSN", "native_custody_restore_")
+	restoreDB, restoredAccountRepo := custodyPGOpen(t, ctx, restoreDSN)
+	psqlBinary, err := exec.LookPath("psql")
+	require.NoError(t, err)
+	restoreCommand := exec.CommandContext(ctx, psqlBinary, "--no-psqlrc", "--set=ON_ERROR_STOP=1", "--dbname="+restoreDSN)
+	restoreCommand.Env = []string{"PATH=" + os.Getenv("PATH"), "PGPASSFILE=/dev/null", "PGSSLMODE=disable"}
+	restoreCommand.Stdin = bytes.NewReader(dump)
+	require.NoError(t, restoreCommand.Run())
+
+	var restoredID int64
+	var restoredBirth time.Time
+	var restoredCredentials, restoredExtra []byte
+	var restoredVersion int64
+	var restoredStatus string
+	var restoredSchedulable, restoredUndeleted bool
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT id,created_at,credentials,extra,
+ gateway_oauth_credential_version(credentials),status,schedulable,deleted_at IS NULL
+ FROM accounts WHERE id=$1`, staged.AccountID).
+		Scan(&restoredID, &restoredBirth, &restoredCredentials, &restoredExtra, &restoredVersion,
+			&restoredStatus, &restoredSchedulable, &restoredUndeleted))
+	require.Equal(t, sourceID, restoredID)
+	require.True(t, sourceBirth.Equal(restoredBirth))
+	require.True(t, bytes.Equal(sourceExtra, restoredExtra))
+	sourceDigest := sha256.Sum256(afterCredentials)
+	restoredDigest := sha256.Sum256(restoredCredentials)
+	require.Equal(t, sourceDigest, restoredDigest)
+	require.Equal(t, int64(2), restoredVersion)
+	require.Equal(t, service.StatusDisabled, restoredStatus)
+	require.False(t, restoredSchedulable)
+	require.True(t, restoredUndeleted)
+	var restoredStored struct {
+		Envelope string `json:"oauth_bundle"`
+	}
+	require.NoError(t, json.Unmarshal(restoredCredentials, &restoredStored))
+	require.True(t, refreshedStored.Envelope == restoredStored.Envelope)
+
+	var accountRows, reservationRows, principalRows, providerRows, connectRows, qualificationRows, refreshRows int
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT
+ (SELECT count(*) FROM accounts),
+ (SELECT count(*) FROM gateway_oauth_identity_reservations),
+ (SELECT count(*) FROM gateway_oauth_principal_claims),
+ (SELECT count(*) FROM gateway_oauth_provider_claims),
+ (SELECT count(*) FROM gateway_oauth_connect_intents),
+ (SELECT count(*) FROM gateway_oauth_profile_qualifications),
+ (SELECT count(*) FROM gateway_oauth_refresh_attempts)`).
+		Scan(&accountRows, &reservationRows, &principalRows, &providerRows, &connectRows, &qualificationRows, &refreshRows))
+	require.Equal(t, 1, accountRows)
+	require.Equal(t, 1, reservationRows)
+	require.Equal(t, 1, principalRows)
+	require.Equal(t, 1, providerRows)
+	require.Equal(t, 1, connectRows)
+	require.Equal(t, 1, qualificationRows)
+	require.Equal(t, 1, refreshRows)
+	var principalIssuer, providerIssuer string
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT
+ (SELECT issuer FROM gateway_oauth_principal_claims),
+ (SELECT issuer FROM gateway_oauth_provider_claims)`).Scan(&principalIssuer, &providerIssuer))
+	require.Equal(t, service.GatewayOAuthIssuer, principalIssuer)
+	require.Equal(t, service.GatewayOAuthIssuer, providerIssuer)
+
+	var connectState, connectOutcomeOperation, connectOutcomeGeneration, connectOutcomeState string
+	var connectOutcomeAccount int64
+	var refreshState string
+	var expectedVersion, resultVersion int64
+	var publicationRecorded bool
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT c.state,c.outcome_operation,c.outcome_account_id,
+ c.outcome_generation,c.outcome_state,f.state,f.expected_version,f.result_version,f.publication_xid IS NOT NULL
+ FROM gateway_oauth_connect_intents c,gateway_oauth_refresh_attempts f
+ WHERE c.consumer=$1 AND c.operation_ref=$2 AND f.consumer=$1 AND f.operation_ref=$3`,
+		scope.Consumer, connectOperation, in.Operation).
+		Scan(&connectState, &connectOutcomeOperation, &connectOutcomeAccount, &connectOutcomeGeneration,
+			&connectOutcomeState, &refreshState, &expectedVersion, &resultVersion, &publicationRecorded))
+	require.Equal(t, "completed", connectState)
+	require.Equal(t, connectIntent.EnrollmentOperation, connectOutcomeOperation)
+	require.Equal(t, staged.AccountID, connectOutcomeAccount)
+	require.Equal(t, staged.Generation, connectOutcomeGeneration)
+	require.Equal(t, "staged", connectOutcomeState)
+	require.Equal(t, "completed", refreshState)
+	require.Equal(t, int64(1), expectedVersion)
+	require.Equal(t, int64(2), resultVersion)
+	require.True(t, publicationRecorded)
+
+	var enabledGuards, disabledGuards int
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT count(*),count(*) FILTER (WHERE tgenabled<>'O')
+ FROM pg_trigger WHERE NOT tgisinternal AND tgrelid = ANY(ARRAY[
+ 'accounts'::regclass,'gateway_oauth_identity_reservations'::regclass,
+ 'gateway_oauth_principal_claims'::regclass,'gateway_oauth_provider_claims'::regclass,
+ 'gateway_oauth_connect_intents'::regclass,'gateway_oauth_profile_qualifications'::regclass,
+ 'gateway_oauth_refresh_attempts'::regclass])`).Scan(&enabledGuards, &disabledGuards))
+	require.Positive(t, enabledGuards)
+	require.Zero(t, disabledGuards)
+	_, err = restoreDB.ExecContext(ctx, `INSERT INTO accounts
+ (name,platform,type,status,schedulable,concurrency,priority,credentials,extra)
+ SELECT 'rejected-v2-insert',platform,type,status,schedulable,concurrency,priority,$1::jsonb,extra
+ FROM accounts WHERE id=$2`, string(restoredCredentials), staged.AccountID)
+	require.Error(t, err, "SQL244 must reject a direct v2 account insert")
+	_, err = restoreDB.ExecContext(ctx, `UPDATE gateway_oauth_refresh_attempts SET state='unknown' WHERE account_id=$1`, staged.AccountID)
+	require.Error(t, err, "completed refresh history must remain immutable")
+
+	restoredRepo, ok := restoredAccountRepo.(service.GatewayNativeOAuthRepository)
+	require.True(t, ok)
+	restoredRefreshRepo, ok := restoredRepo.(service.GatewayNativeOAuthRefreshRepository)
+	require.True(t, ok)
+	restoredDispatchRepo, ok := restoredRepo.(service.GatewayNativeOAuthDispatchRepository)
+	require.True(t, ok)
+	readback, err := restoredRepo.ReadGatewayNativeOAuth(principal, scope, connectIntent.EnrollmentOperation)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayNativeOAuthOutcome{
+		Operation: connectIntent.EnrollmentOperation, AccountID: staged.AccountID,
+		Generation: staged.Generation, State: "staged",
+	}, readback)
+
+	missingKey := custodyPGBytes(t, 32)
+	missingCustody, err := service.NewGatewayNativeCredentialCustody("missing", map[string][]byte{
+		"missing": missingKey, "old": oldKey,
+	})
+	require.NoError(t, err)
+	wrongCustody, err := service.NewGatewayNativeCredentialCustody("new", map[string][]byte{
+		"new": custodyPGBytes(t, 32), "old": oldKey,
+	})
+	require.NoError(t, err)
+	missingRefresh, err := service.NewGatewayNativeOAuthRefresh(restoredRefreshRepo, missingCustody, verifier, counter)
+	require.NoError(t, err)
+	_, err = missingRefresh.Maintain(principal, scope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	wrongRefresh, err := service.NewGatewayNativeOAuthRefresh(restoredRefreshRepo, wrongCustody, verifier, counter)
+	require.NoError(t, err)
+	_, err = wrongRefresh.Maintain(principal, scope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+
+	restoredDispatch, err := service.NewGatewayNativeOAuthDispatch(restoredDispatchRepo, rotatedCustody, verifier, counter)
+	require.NoError(t, err)
+	restoredRefresh, err := service.NewGatewayNativeOAuthRefresh(restoredRefreshRepo, rotatedCustody, verifier, counter)
+	require.NoError(t, err)
+	restoredPositive, err := restoredRefresh.Maintain(principal, scope, connectOperation)
+	require.NoError(t, err)
+	require.Equal(t, "completed", restoredPositive.State)
+	require.Equal(t, in.Operation, restoredPositive.RefreshRef)
+	require.Zero(t, counter.entries.Load(), "restored v2 custody authenticity must precede and suppress transport")
+	foreignPrincipal, _ := oauthPGScope(t, scope.Consumer, "owner-foreign", scope.Account)
+	_, err = restoredDispatch.Descriptor(foreignPrincipal, scope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	foreignScope := scope
+	foreignScope.Owner = "owner-foreign"
+	_, err = restoredDispatch.Descriptor(principal, foreignScope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	_, err = restoredRefresh.Maintain(foreignPrincipal, scope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	_, err = restoredRefresh.Maintain(principal, foreignScope, connectOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+
+	replayed, err := restoredRefresh.Refresh(principal, in)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayNativeOAuthRefreshOutcome{Operation: in.Operation, State: "completed", Version: 2}, replayed)
+	spent := in
+	spent.Operation = "spent-refresh-revival"
+	_, err = restoredRefresh.Refresh(principal, spent)
+	require.ErrorIs(t, err, service.ErrGatewayOAuthConflict)
+	require.Zero(t, counter.entries.Load(), "restore denials and completed replay must precede every controlled transport entry")
+	require.EqualValues(t, 1, tokenCalls.Load(), "exact replay must not perform another exchange")
+
+	err = restoredRepo.EraseGatewayNativeOAuth(foreignPrincipal, scope, connectIntent.EnrollmentOperation)
+	require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
+	require.NoError(t, restoredRepo.EraseGatewayNativeOAuth(principal, scope, connectIntent.EnrollmentOperation))
+	require.NoError(t, restoredRepo.EraseGatewayNativeOAuth(principal, scope, connectIntent.EnrollmentOperation))
+	erased, err := restoredRepo.ReadGatewayNativeOAuth(principal, scope, connectIntent.EnrollmentOperation)
+	require.NoError(t, err)
+	require.Equal(t, service.GatewayNativeOAuthOutcome{
+		Operation: connectIntent.EnrollmentOperation, AccountID: staged.AccountID,
+		Generation: staged.Generation, State: "erased",
+	}, erased)
+	var erasedCredentials []byte
+	var erasedTombstone, envelopeAbsent bool
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT credentials,deleted_at IS NOT NULL,NOT credentials ? 'oauth_bundle'
+ FROM accounts WHERE id=$1`, staged.AccountID).Scan(&erasedCredentials, &erasedTombstone, &envelopeAbsent))
+	require.Equal(t, "{}", string(erasedCredentials))
+	require.True(t, erasedTombstone)
+	require.True(t, envelopeAbsent)
+
+	counter.entries.Store(0)
+	restoredEnrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, oldCustody, restoredRepo, intentKey)
+	require.NoError(t, err)
+	recreated, err := restoredEnrollment.Stage(principal, scope, connectIntent.EnrollmentOperation, originalBundle)
+	require.NoError(t, err)
+	require.Equal(t, staged, recreated)
+	var finalAccounts, finalReservations int
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT
+ (SELECT count(*) FROM accounts),(SELECT count(*) FROM gateway_oauth_identity_reservations)`).
+		Scan(&finalAccounts, &finalReservations))
+	require.Equal(t, 1, finalAccounts)
+	require.Equal(t, 1, finalReservations)
+	require.NoError(t, restoreDB.QueryRowContext(ctx, `SELECT credentials,deleted_at IS NOT NULL,NOT credentials ? 'oauth_bundle'
+ FROM accounts WHERE id=$1`, staged.AccountID).Scan(&erasedCredentials, &erasedTombstone, &envelopeAbsent))
+	require.Equal(t, "{}", string(erasedCredentials))
+	require.True(t, erasedTombstone)
+	require.True(t, envelopeAbsent)
+	require.Zero(t, counter.entries.Load(), "same-operation Stage must return the reserved tombstone without transport")
 }
