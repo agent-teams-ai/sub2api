@@ -273,7 +273,7 @@ func TestGatewayNativeOAuthPostgresReservationAndCustody(t *testing.T) {
 
 // Failure: scheduler full/meta publication or ordinary token cache/refresh could
 // expose managed tokens despite inert DB staging. Actual Redis + HTTP fixture.
-func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.GatewayNativeOAuthBundle) {
+func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.GatewayNativeOAuthBundle, sentinels ...string) {
 	t.Helper()
 	addr := os.Getenv("GATEWAY_NATIVE_OAUTH_TEST_REDIS_ADDR")
 	if addr == "" {
@@ -333,7 +333,8 @@ func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.Gatew
 	require.Len(t, keys, 1)
 	dump, err := client.Dump(ctx, keys[0]).Result()
 	require.NoError(t, err)
-	for _, secret := range []string{bundle.AccessToken, bundle.RefreshToken, bundle.IDToken, "synthetic-f1-metadata"} {
+	secrets := append([]string{bundle.AccessToken, bundle.RefreshToken, bundle.IDToken, "synthetic-f1-metadata"}, sentinels...)
+	for _, secret := range secrets {
 		require.NotContains(t, dump, secret)
 	}
 }
@@ -1099,6 +1100,7 @@ func (b *oauthRefreshConnectBinding) StageGatewayNativeOAuth(ctx context.Context
 	b.intent = saved
 	return b.GatewayNativeOAuthRepository.StageGatewayNativeOAuth(ctx, in)
 }
+
 func (r *oauthRefreshLostACK) ResolveGatewayNativeOAuthRefresh(ctx context.Context, scope service.GatewayNativeCredentialScope, operation string) (service.GatewayNativeOAuthRefreshResolution, error) {
 	resolver, ok := r.GatewayNativeOAuthRefreshRepository.(service.GatewayNativeOAuthRefreshResolver)
 	if !ok {
