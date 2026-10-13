@@ -30,8 +30,16 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	account *Account,
 	body []byte,
 ) (*OpenAIForwardResult, error) {
-	startTime := time.Now()
+	return s.forwardResponsesViaRawChatCompletionsWithStartTime(ctx, c, account, body, time.Now())
+}
 
+func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletionsWithStartTime(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	startTime time.Time,
+) (*OpenAIForwardResult, error) {
 	var responsesReq apicompat.ResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
