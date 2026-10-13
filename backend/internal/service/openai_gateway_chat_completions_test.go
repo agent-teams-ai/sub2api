@@ -1865,7 +1865,7 @@ func TestGPT61SolOnlyChatFallbackRejectsToolsAndDisabledReasoning(t *testing.T) 
 			svc := &OpenAIGatewayService{cfg: &config.Config{}}
 			var err error
 			if responses {
-				_, err = svc.forwardResponsesViaRawChatCompletions(context.Background(), c, account, []byte(body), time.Now())
+				_, err = svc.forwardResponsesViaRawChatCompletionsWithStartTime(context.Background(), c, account, []byte(body), time.Now())
 			} else {
 				_, err = svc.forwardAnthropicViaRawChatCompletions(context.Background(), c, account, []byte(body), "")
 			}

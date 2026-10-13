@@ -262,6 +262,12 @@ func (h *GatewayHandler) GeminiCachedContentsCreate(c *gin.Context) {
 				return
 			}
 			reqLog.Warn("gemini.cached_content.upstream_create_error", zap.Int64("account_id", account.ID), zap.Error(err))
+			// A transport failure may follow a successful billable creation. Only
+			// a proven pre-dispatch failure permits creating on another account.
+			if !errors.Is(err, service.ErrGeminiCachedContentRequestNotSent) {
+				googleError(c, http.StatusBadGateway, "Upstream cached content creation outcome is unknown")
+				return
+			}
 			excluded[account.ID] = struct{}{}
 			continue
 		}

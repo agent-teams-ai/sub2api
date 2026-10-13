@@ -457,6 +457,30 @@ func TestGeminiCachedContentsCreate_ChargesInputAndStorage(t *testing.T) {
 	}
 }
 
+func TestGeminiCachedContentsCreate_TransportFailureRetryBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		posts int
+	}{
+		{name: "unknown outcome", err: errors.New("connection reset"), posts: 1},
+		{name: "request not sent", err: fmt.Errorf("%w: unavailable client", service.ErrGeminiCachedContentRequestNotSent), posts: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newCachedBillingEnv(t, 500, 900, 901)
+			env.upstream.transportErrors = map[string]error{http.MethodPost: tc.err}
+			rec := env.create()
+			require.NotEqual(t, http.StatusOK, rec.Code)
+			if tc.posts == 1 {
+				require.Equal(t, http.StatusBadGateway, rec.Code)
+			}
+			require.Equal(t, tc.posts, env.upstream.methodCalls(http.MethodPost))
+			require.Empty(t, env.repo.records)
+			require.Empty(t, env.usage.totals())
+		})
+	}
+}
+
 func TestGeminiCachedContentsCreate_UnaffordableStorageDeletesUpstreamAndBillsInputOnly(t *testing.T) {
 	env := newCachedBillingEnv(t, 1, 900)
 	env.upstream.createBody = cachedBillingCreateBody(time.Now().Add(24 * time.Hour))

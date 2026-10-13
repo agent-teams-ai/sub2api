@@ -36,7 +36,7 @@ func TestForwardResponses_ChatFallbackPreservesProvidedStartTime(t *testing.T) {
 			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(responseBody))}}
 			svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
 			startTime := time.Now().Add(-time.Minute)
-			result, err := svc.forwardResponsesViaRawChatCompletions(context.Background(), c, forceChatResponsesFallbackAccount(), body, startTime)
+			result, err := svc.forwardResponsesViaRawChatCompletionsWithStartTime(context.Background(), c, forceChatResponsesFallbackAccount(), body, startTime)
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			require.GreaterOrEqual(t, result.Duration, time.Minute)
