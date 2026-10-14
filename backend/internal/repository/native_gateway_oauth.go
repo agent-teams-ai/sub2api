@@ -55,8 +55,11 @@ func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in serv
 	var consumer, owner, account string
 	err = tx.QueryRowContext(ctx, `SELECT consumer,owner_ref,account_ref
  FROM gateway_oauth_principal_claims WHERE issuer=$1 AND subject=$2 FOR UPDATE`, issuer, subject).Scan(&consumer, &owner, &account)
-	if err == sql.ErrNoRows || err == nil && (consumer != in.Scope.Consumer || owner != in.Scope.Owner || account != in.Scope.Account) {
-		return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayOAuthConflict
+	if err == sql.ErrNoRows {
+		return service.GatewayNativeOAuthOutcome{}, service.GatewayNativeOAuthConflict("logical_claim_conflict")
+	}
+	if err == nil && (consumer != in.Scope.Consumer || owner != in.Scope.Owner || account != in.Scope.Account) {
+		return service.GatewayNativeOAuthOutcome{}, service.GatewayNativeOAuthConflict("principal_claim_scope_mismatch")
 	}
 	if err != nil {
 		return deny()
@@ -79,8 +82,11 @@ func (r *accountRepository) StageGatewayNativeOAuth(ctx context.Context, in serv
  FROM gateway_oauth_identity_reservations r JOIN accounts a ON a.id=r.account_id
  WHERE r.consumer=$1 AND r.operation_ref=$2 AND r.owner_ref=$3 AND r.account_ref=$4
  AND r.generation=$5 AND r.issuer=$6 AND r.subject=$7`, in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, issuer, subject).Scan(&accepted, &outcome.Operation, &outcome.AccountID, &outcome.Generation, &outcome.State)
-		if err != nil || accepted != in.IntentMAC {
-			return service.GatewayNativeOAuthOutcome{}, service.ErrGatewayOAuthConflict
+		if err != nil {
+			return service.GatewayNativeOAuthOutcome{}, service.GatewayNativeOAuthConflict("reservation_readback_failed")
+		}
+		if accepted != in.IntentMAC {
+			return service.GatewayNativeOAuthOutcome{}, service.GatewayNativeOAuthConflict("reservation_commitment_mismatch")
 		}
 		if tx.Commit() != nil {
 			return deny()
@@ -175,7 +181,7 @@ func (r *accountRepository) ReplayGatewayNativeOAuth(ctx context.Context, s serv
 		return service.GatewayNativeOAuthOutcome{}, false, service.ErrGatewayNativeIdentity
 	}
 	if owner != s.Owner || account != s.Account || out.Generation != s.Generation || digest != commitment {
-		return service.GatewayNativeOAuthOutcome{}, false, service.ErrGatewayOAuthConflict
+		return service.GatewayNativeOAuthOutcome{}, false, service.GatewayNativeOAuthConflict("replay_mismatch")
 	}
 	return out, true, nil
 }

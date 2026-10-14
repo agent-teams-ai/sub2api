@@ -111,8 +111,11 @@ func (r *gatewayOAuthConnectRepository) BindConnectEnrollment(ctx context.Contex
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
 	saved, err := r.ReadConnectIntent(ctx, in.Scope, in.Operation)
-	if err != nil || saved.StateHash != in.StateHash || saved.EnrollmentOperation != in.EnrollmentOperation || saved.EnrollmentMAC != mac || saved.RecoveryDenied {
-		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayOAuthConflict
+	if err != nil {
+		return service.GatewayNativeOAuthConnectIntent{}, service.GatewayNativeOAuthConflict("connect_binding_read_failed")
+	}
+	if saved.StateHash != in.StateHash || saved.EnrollmentOperation != in.EnrollmentOperation || saved.EnrollmentMAC != mac || saved.RecoveryDenied {
+		return service.GatewayNativeOAuthConnectIntent{}, service.GatewayNativeOAuthConflict("connect_binding_mismatch")
 	}
 	return saved, nil
 }
