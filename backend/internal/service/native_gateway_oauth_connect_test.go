@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -13,6 +14,47 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// A conflict without exact intent binding cannot diagnose an owner's quarantine;
+// provider/SQL error strings and persisted private material must remain absent.
+func TestGatewayNativeOAuthConnectConflictDiagnosticExactIntent(t *testing.T) {
+	s, r, ctx, scope := connectPureFixture(t)
+	_, err := s.BeginConnect(ctx, scope, "operation")
+	require.NoError(t, err)
+	in := r.row
+	in.Scope.Owner = "private-owner-sentinel"
+	in.Envelope = "private-envelope-sentinel"
+	in.EnrollmentMAC = "a" + in.StateHash[1:]
+	for _, reason := range []string{"connect_scope_mismatch", "connect_binding_read_failed", "connect_binding_mismatch", "principal_claim_scope_mismatch", "logical_claim_conflict", "reservation_readback_failed", "reservation_commitment_mismatch", "replay_mismatch"} {
+		t.Run(reason, func(t *testing.T) {
+			conflict := GatewayNativeOAuthConflict(reason)
+			require.ErrorIs(t, conflict, ErrGatewayOAuthConflict)
+			wrapped := gatewayOAuthFail("stage_repository", fmt.Errorf("private-provider-token-subject-callback: %w", conflict))
+			require.ErrorIs(t, wrapped, ErrGatewayOAuthConflict)
+			raw := gatewayOAuthFailureRecord(wrapped, in)
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(raw, &got))
+			require.Equal(t, map[string]any{
+				"event": "gateway_native_oauth_connect_failure", "phase": "stage_conflict", "reason": reason,
+				"consumer": scope.Consumer, "account_ref": scope.Account, "generation": scope.Generation, "operation_ref": in.Operation,
+			}, got)
+			for _, secret := range []string{in.Scope.Owner, in.Envelope, in.StateHash, in.EnrollmentOperation, in.EnrollmentMAC, "private-provider-token-subject-callback"} {
+				require.NotContains(t, string(raw), secret)
+			}
+		})
+	}
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(gatewayOAuthFailureRecord(GatewayNativeOAuthConflict("private-unknown-reason"), in), &got))
+	require.Equal(t, "unclassified", got["reason"])
+	require.NotContains(t, string(gatewayOAuthFailureRecord(GatewayNativeOAuthConflict("private-unknown-reason"), in)), "private-unknown-reason")
+	invalid := in
+	invalid.Scope.Generation = ""
+	// Decode afresh: json.Unmarshal preserves absent keys in an existing map.
+	got = nil
+	require.NoError(t, json.Unmarshal(gatewayOAuthFailureRecord(GatewayNativeOAuthConflict("replay_mismatch"), invalid), &got))
+	require.Len(t, got, 3)
+	require.Nil(t, gatewayOAuthFailureRecord(fmt.Errorf("private-error"), in))
+}
 
 // Sequential fixture only. Durable races/restart are tested at actual PG.
 type connectPureStore struct {

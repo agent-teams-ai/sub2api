@@ -32,6 +32,7 @@ const GatewayOAuthConnectTTL = 10 * time.Minute
 // Private, finite diagnostics. Provider text and credential material never enter it.
 type gatewayOAuthFailure struct {
 	phase  string
+	reason string
 	status int
 	cause  error
 }
@@ -39,25 +40,69 @@ type gatewayOAuthFailure struct {
 func (e *gatewayOAuthFailure) Error() string { return "gateway native oauth failure" }
 func (e *gatewayOAuthFailure) Unwrap() error { return e.cause }
 func gatewayOAuthFail(phase string, cause error) error {
+	reason := ""
 	if errors.Is(cause, ErrGatewayOAuthConflict) {
 		phase = "stage_conflict"
+		var detail *gatewayOAuthFailure
+		if errors.As(cause, &detail) {
+			reason = detail.reason
+		}
 	}
-	return &gatewayOAuthFailure{phase: phase, cause: cause}
+	return &gatewayOAuthFailure{phase: phase, reason: reason, cause: cause}
 }
-func gatewayOAuthReportFailure(err error) {
+
+// Repository branches retain the same conflict semantics with a closed private
+// diagnostic. No SQL/provider text or conflicting principal enters this value.
+func GatewayNativeOAuthConflict(reason string) error {
+	return &gatewayOAuthFailure{phase: "stage_conflict", reason: gatewayOAuthConflictReason(reason), cause: ErrGatewayOAuthConflict}
+}
+
+func gatewayOAuthConflictReason(reason string) string {
+	switch reason {
+	case "connect_scope_mismatch", "connect_binding_read_failed", "connect_binding_mismatch",
+		"principal_claim_scope_mismatch", "logical_claim_conflict", "reservation_readback_failed",
+		"reservation_commitment_mismatch", "replay_mismatch":
+		return reason
+	default:
+		return "unclassified"
+	}
+}
+
+func gatewayOAuthFailureRecord(err error, in GatewayNativeOAuthConnectIntent) []byte {
 	var detail *gatewayOAuthFailure
 	if !errors.As(err, &detail) {
-		return
+		return nil
 	}
 	event := struct {
 		Event      string `json:"event"`
 		Phase      string `json:"phase"`
+		Reason     string `json:"reason,omitempty"`
 		HTTPStatus int    `json:"http_status,omitempty"`
+		Consumer   string `json:"consumer,omitempty"`
+		Account    string `json:"account_ref,omitempty"`
+		Generation string `json:"generation,omitempty"`
+		Operation  string `json:"operation_ref,omitempty"`
 	}{Event: "gateway_native_oauth_connect_failure", Phase: detail.phase}
+	if detail.phase == "stage_conflict" {
+		event.Reason = gatewayOAuthConflictReason(detail.reason)
+	}
 	if detail.phase == "exchange_http_status" && detail.status >= 100 && detail.status <= 599 {
 		event.HTTPStatus = detail.status
 	}
+	// Both callers supply the accepted persisted intent, never callback fields.
+	if GatewayNativeOAuthConnectIntentValid(in) {
+		event.Consumer, event.Account = in.Scope.Consumer, in.Scope.Account
+		event.Generation, event.Operation = in.Scope.Generation, in.Operation
+	}
 	line, _ := json.Marshal(event)
+	return line
+}
+
+func gatewayOAuthReportFailure(err error, in GatewayNativeOAuthConnectIntent) {
+	line := gatewayOAuthFailureRecord(err, in)
+	if len(line) == 0 {
+		return
+	}
 	_, _ = fmt.Fprintln(os.Stderr, string(line))
 }
 
@@ -314,7 +359,7 @@ type connectEnrollmentRepository struct {
 
 func (r connectEnrollmentRepository) StageGatewayNativeOAuth(ctx context.Context, reservation GatewayNativeOAuthReservation) (GatewayNativeOAuthOutcome, error) {
 	if reservation.Scope != r.intent.Scope || reservation.Operation != r.intent.EnrollmentOperation {
-		return GatewayNativeOAuthOutcome{}, ErrGatewayOAuthConflict
+		return GatewayNativeOAuthOutcome{}, GatewayNativeOAuthConflict("connect_scope_mismatch")
 	}
 	saved, err := r.connect.BindConnectEnrollment(ctx, *r.intent, reservation.IntentMAC)
 	if err != nil {
@@ -395,7 +440,7 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 	}
 	bundle, err := s.exchange(bounded, code, material.Verifier)
 	if err != nil {
-		gatewayOAuthReportFailure(err)
+		gatewayOAuthReportFailure(err, in)
 	}
 	material = connectMaterial{}
 	quarantine := err != nil
@@ -404,7 +449,7 @@ func (s *GatewayNativeOAuthConnect) CompleteCallback(ctx context.Context, state,
 		enrollment.repository = connectEnrollmentRepository{enrollment.repository, s.repository, &in}
 		out, stageErr := enrollment.Stage(bounded, in.Scope, in.EnrollmentOperation, bundle)
 		if stageErr != nil {
-			gatewayOAuthReportFailure(stageErr)
+			gatewayOAuthReportFailure(stageErr, in)
 		}
 		quarantine = errors.Is(stageErr, ErrGatewayOAuthConflict) || in.EnrollmentMAC == ""
 		if stageErr == nil {
