@@ -201,7 +201,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		p.ProviderTokenUpperBound < p.Tokens || p.ProviderTokenUpperBound > 10000000 ||
 		cfg.MaxEntries < 1 || cfg.MaxEntries > 10000 || cfg.EnvelopeBytes < 1 || cfg.EnvelopeBytes > 5<<20 || cfg.CallbackBytes < 1 || cfg.CallbackBytes > 262144 ||
 		cfg.CallbackTimeout <= 0 || cfg.CallbackTimeout > 30*time.Second || cfg.IOTimeout <= 0 || cfg.IOTimeout > 30*time.Second ||
-		cfg.ProviderReadIdle <= 0 || cfg.ProviderReadIdle > cfg.IOTimeout ||
+		cfg.ProviderReadIdle <= 0 || cfg.ProviderReadIdle > service.GatewayNativeProviderReadIdle ||
 		cfg.CleanupTimeout <= 0 || cfg.CleanupTimeout > 30*time.Second || len(cfg.CallbackCredential) < 1 || len(cfg.CallbackCredential) > 2048 || !bearerToken.MatchString(cfg.CallbackCredential) {
 		return nil, errDenied
 	}
