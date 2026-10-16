@@ -267,7 +267,8 @@ func (h *Handler) OpenRouterProfile() (QualifiedProfile, bool) {
 
 // Reserve before callback/claim. The secondary request identity prevents a new
 // generation or nonce from rearming a duplicate while any evidence is retained.
-// Only durably acknowledged CLOSED receipts are eligible for bounded eviction.
+// Only acknowledged CLOSED receipts are eligible for bounded eviction, including
+// a fully validated callback that positively denies dispatch without a proof.
 func (h *Handler) reserve(consumer string, input Request, ctx context.Context, cancel context.CancelFunc, interrupt func()) (*reservation, bool, error) {
 	key := requestKey{consumer, input.Admission.ExecutionRef, input.RequestRef}
 	digest := sha256.Sum256(input.Payload)
@@ -413,6 +414,13 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 		if reply.NativeDescriptor != nil || reply.LeaseExpiresAt != "" {
 			return false, errDenied
 		}
+		// This positive denial has no dispatch proof to ACK through cleanup.
+		// Reclaimability still requires NoForward and positive local closure.
+		h.mu.Lock()
+		if reply.Status.Effect == "not_dispatched" && callbackCtx.Err() == nil {
+			e.acknowledged = true
+		}
+		h.mu.Unlock()
 		return false, nil
 	}
 	d := reply.Dispatch
