@@ -49,10 +49,10 @@ func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error
 const gatewayNativeResponseLimit = 8 << 20
 const gatewayNativeSSEFrameLimit = 1 << 20
 
-// Draft fallback for direct private service callers. The dedicated handler
-// supplies its trusted IOTimeout-aligned policy; the approved context deadline
-// always wins. This is provider BODY inactivity, not listener idle or H2 PING.
-const gatewayNativeUpstreamReadIdle = 30 * time.Second
+// GatewayNativeProviderReadIdle is the trusted private provider BODY inactivity
+// default and ceiling, independent of control/write I/O. The approved context
+// deadline always wins; listener idle and H2 PING do not constitute body progress.
+const GatewayNativeProviderReadIdle = 300 * time.Second
 
 type gatewayNativeProviderReadIdleKey struct{}
 
@@ -577,8 +577,8 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	var reader io.Reader = resp.Body
 	if life := gatewayNativeLifetime(ctx); life != nil {
 		idle, _ := ctx.Value(gatewayNativeProviderReadIdleKey{}).(time.Duration)
-		if idle <= 0 || idle > gatewayNativeUpstreamReadIdle {
-			idle = gatewayNativeUpstreamReadIdle
+		if idle <= 0 || idle > GatewayNativeProviderReadIdle {
+			idle = GatewayNativeProviderReadIdle
 		}
 		reader = &gatewayNativeIdleReader{reader: resp.Body, idle: idle, cancel: func() {
 			// Cancel the real HTTP request to interrupt its blocked Read BEFORE
