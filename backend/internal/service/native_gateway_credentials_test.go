@@ -60,6 +60,7 @@ func TestGatewayNativeCustodyAEAD(t *testing.T) {
 	authorization, err := c.authorization(envelope, scope)
 	require.NoError(t, err)
 	require.Equal(t, "Bearer "+key, authorization)
+	require.NoError(t, c.authenticateRetainedAPIKey(envelope, scope))
 	id, nonce, sealed, err := gatewayNativeParseEnvelope(envelope)
 	require.NoError(t, err)
 	// Regression: omitting any one scope member from AAD permits cross-scope use.
@@ -82,6 +83,7 @@ func TestGatewayNativeCustodyAEAD(t *testing.T) {
 			require.Error(t, err)
 			_, err = c.authorization(envelope, changed)
 			require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+			require.ErrorIs(t, c.authenticateRetainedAPIKey(envelope, changed), ErrGatewayNativeIdentity)
 		})
 	}
 	// Regression: ciphertext/nonce changes that preserve envelope shape evade a
@@ -98,6 +100,7 @@ func TestGatewayNativeCustodyAEAD(t *testing.T) {
 			require.NoError(t, c.ValidateEnvelope(bad), "shape remains valid")
 			_, err := c.authorization(bad, scope)
 			require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+			require.ErrorIs(t, c.authenticateRetainedAPIKey(bad, scope), ErrGatewayNativeIdentity)
 		})
 	}
 	// Regression: a guessed/default key can turn key loss into silent adoption.
@@ -105,10 +108,12 @@ func TestGatewayNativeCustodyAEAD(t *testing.T) {
 		wrong := custodyTestKeyring(t, id)
 		_, err := wrong.authorization(envelope, scope)
 		require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+		require.ErrorIs(t, wrong.authenticateRetainedAPIKey(envelope, scope), ErrGatewayNativeIdentity)
 		missing := custodyTestKeyring(t, "different-id")
 		require.ErrorIs(t, missing.ValidateEnvelope(envelope), ErrGatewayNativeIdentity)
 		_, err = missing.authorization(envelope, scope)
 		require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+		require.ErrorIs(t, missing.authenticateRetainedAPIKey(envelope, scope), ErrGatewayNativeIdentity)
 	})
 	// Regression: deterministic nonces disclose repeated plaintext and violate GCM.
 	t.Run("independent nonce and encrypted JSON", func(t *testing.T) {
@@ -354,6 +359,27 @@ func TestGatewayNativeOAuthVersionCustody(t *testing.T) {
 	}
 	_, err = custody.openOAuthVersion(initial, scope, 2)
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	policy, err := custody.inspectRetainedOAuth(initial, scope, 1, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, "unasserted", policy.ProviderValidity)
+	require.Equal(t, "not-qualified-by-existing-policy", policy.ExpiredButRefreshable)
+	wrong := custodyTestKeyring(t, "fixture")
+	_, err = wrong.inspectRetainedOAuth(initial, scope, 1, time.Now())
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+	_, err = custody.inspectRetainedOAuth(rotated, scope, 1, time.Now())
+	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
+
+	timed := bundle
+	timed.SensitiveMetadata = json.RawMessage(`{"expires_in":3600,"protected":"fixture"}`)
+	timed, err = gatewayOAuthTimedBundle(timed, time.Now().Add(-2*time.Hour), GatewayNativeOAuthIdentity{
+		issuer: GatewayOAuthIssuer, subject: "fixture-subject", expiresAt: time.Now().Add(time.Hour),
+	}, custody)
+	require.NoError(t, err)
+	expired, err := custody.sealOAuthVersion(scope, 2, timed)
+	require.NoError(t, err)
+	policy, err = custody.inspectRetainedOAuth(expired, scope, 2, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, "eligible-by-existing-policy", policy.ExpiredButRefreshable)
 	for _, field := range []string{"consumer", "owner", "account", "generation", "purpose"} {
 		foreign := scope
 		switch field {
@@ -382,7 +408,7 @@ func TestGatewayNativeOAuthVersionCustody(t *testing.T) {
 	parts[4] = base64.RawURLEncoding.EncodeToString(ciphertext)
 	_, err = custody.openOAuthVersion(strings.Join(parts, "."), scope, 2)
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
-	wrong, err := NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": custodyTestBytes(t, 32)})
+	wrong, err = NewGatewayNativeCredentialCustody("fixture", map[string][]byte{"fixture": custodyTestBytes(t, 32)})
 	require.NoError(t, err)
 	_, err = wrong.openOAuthVersion(rotated, scope, 2)
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)

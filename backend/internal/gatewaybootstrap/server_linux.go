@@ -292,6 +292,10 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
 				valid = ok
+			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect/custody" {
+				req, ok := admin.DecodeGatewayNativeOAuthRetainedCustody(data)
+				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
+				valid = ok
 			} else {
 				valid = decodeStrict(data, &tuple) == nil
 			}
@@ -303,6 +307,13 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			var owner string
 			if c.Request.URL.Path == "/private/native/v1/oauth/refresh" {
 				owner, err = oauth.owners.AuthorizeNativeOAuthRefreshOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
+			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect/custody" {
+				custodyOwners, ok := oauth.owners.(NativeOAuthCustodyAuthority)
+				if !ok {
+					c.AbortWithStatus(http.StatusForbidden)
+					return
+				}
+				owner, err = custodyOwners.AuthorizeNativeOAuthCustodyOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
 			} else {
 				owner, err = oauth.owners.AuthorizeNativeOAuthOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
 			}
@@ -364,7 +375,10 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 			})
 		}
-		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil || admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil || (oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil) {
+		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil ||
+			admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil ||
+			admin.RegisterGatewayNativeOAuthRetainedCustodyRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil ||
+			(oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 			})
@@ -434,7 +448,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			cleanup.ServeHTTP(w, r.WithContext(bounded))
-		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return

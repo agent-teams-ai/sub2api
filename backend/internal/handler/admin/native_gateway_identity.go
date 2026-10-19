@@ -42,6 +42,12 @@ type gatewayNativeDispatchRequest struct {
 	Descriptor service.GatewayNativeRoute `json:"descriptor"`
 	Payload    json.RawMessage            `json:"payload"`
 }
+type gatewayNativeRetainedCustodyInput struct {
+	Contract   string                     `json:"contract"`
+	OwnerRef   string                     `json:"owner_ref"`
+	AccountRef string                     `json:"account_ref"`
+	Descriptor service.GatewayNativeRoute `json:"descriptor"`
+}
 
 // "inactive" is a private wire alias for native StatusDisabled.
 func gatewayNativeWireState(status string) string {
@@ -137,6 +143,29 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		if a, ok := read(c, c.Param("generation")); ok {
 			emit(c, a)
 		}
+	})
+	routes.GET("/candidates/:generation/custody", func(c *gin.Context) {
+		var req gatewayNativeRetainedCustodyInput
+		if decodeNativeRetainedCustody(c, &req) != nil || req.Contract != service.GatewayNativeRetainedCustodyContract ||
+			req.Descriptor.Generation != c.Param("generation") || !validDescriptor(req.Descriptor) ||
+			!service.GatewayNativeCredentialRefValid(req.OwnerRef) || !service.GatewayNativeCredentialRefValid(req.AccountRef) {
+			fail(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.OwnerRef, Account: req.AccountRef,
+			Generation: req.Descriptor.Generation, Purpose: service.GatewayCredentialPurpose}
+		out, err := gateway.ReadGatewayNativeRetainedAPIKeyCustody(c.Request.Context(), scope, req.Descriptor)
+		if err != nil {
+			fail(c)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, out)
 	})
 	routes.POST("/candidates", func(c *gin.Context) {
 		var req gatewayNativeCreate
@@ -324,7 +353,7 @@ func nativeGatewayCanonicalIngress(body []byte) bool {
 		token, err = decoder.Token()
 		return fields, err == nil && token == json.Delim('}')
 	}
-	fields, ok := check(body, []string{"generation", "profile", "name", "api_key", "owner_ref", "account_ref", "descriptor", "state", "payload"})
+	fields, ok := check(body, []string{"generation", "profile", "name", "api_key", "owner_ref", "account_ref", "descriptor", "state", "payload", "contract", "operation"})
 	if !ok {
 		return false
 	}
