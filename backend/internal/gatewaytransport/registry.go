@@ -148,10 +148,12 @@ type reservation struct {
 	life                                            *service.GatewayNativeLifetime
 	admitted, sealed, acknowledged, callbackStarted bool
 	status                                          *requestStatus
+	usage                                           *service.GatewayNativeUsage
 	effect                                          string
 }
 
 type Receipt struct {
+	NativeUsage  *service.GatewayNativeUsage           `json:"nativeUsage,omitempty"`
 	ConsumerID   string                                `json:"consumerId"`
 	ExecutionRef string                                `json:"executionRef"`
 	RequestRef   string                                `json:"requestRef"`
@@ -322,6 +324,16 @@ func closed(s service.GatewayNativeLifetimeSnapshot) bool {
 func (h *Handler) receipt(consumer string, e *reservation) Receipt {
 	h.mu.Lock()
 	r := Receipt{ConsumerID: consumer, ExecutionRef: e.request.Admission.ExecutionRef, RequestRef: e.request.RequestRef, Native: e.native, Phase: "reserved", Effect: e.effect, Sealed: e.sealed, Acknowledged: e.acknowledged}
+	if e.usage != nil {
+		usage := *e.usage
+		for _, field := range []**int64{&usage.InputTokens, &usage.OutputTokens, &usage.CachedInputTokens, &usage.ReasoningOutputTokens} {
+			if *field != nil {
+				value := **field
+				*field = &value
+			}
+		}
+		r.NativeUsage = &usage
+	}
 	if e.proof != nil {
 		p := *e.proof
 		r.Proof = &p
