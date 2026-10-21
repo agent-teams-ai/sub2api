@@ -25,6 +25,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/typesafe"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -1613,10 +1614,16 @@ func (h *GatewayHandler) Usage(c *gin.Context) {
 	usageData := h.buildUsageData(ctx, apiKey.ID)
 	dailyUsage := h.buildAPIKeyDailyUsage(c, subject.UserID, apiKey.ID, days)
 
-	// Best-effort: 获取模型统计
-	var modelStats any
+	// A successful query always exposes model_stats, including an empty array.
+	// A statistics failure must not look like zero usage.
+	modelStats := []usagestats.ModelStat{}
 	if h.usageService != nil {
-		if stats, err := h.usageService.GetAPIKeyModelStats(ctx, apiKey.ID, startTime, endTime); err == nil && len(stats) > 0 {
+		stats, err := h.usageService.GetAPIKeyModelStats(ctx, apiKey.ID, startTime, endTime)
+		if err != nil {
+			h.errorResponse(c, http.StatusBadGateway, "api_error", "Failed to load usage statistics")
+			return
+		}
+		if stats != nil {
 			modelStats = stats
 		}
 	}
