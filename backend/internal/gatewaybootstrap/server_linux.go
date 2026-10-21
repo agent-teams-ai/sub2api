@@ -156,8 +156,7 @@ func Run(ctx context.Context, options Options) error {
 	repo := repository.NewAccountRepository(client, db, nil)
 	// These are the proven private HTTP integration constructor arguments:
 	// group-free admin, no cache/scheduler/probe/refresh/ordinary limiter.
-	svcCfg := &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}},
-		Gateway: config.GatewayConfig{OpenAIResponseHeaderTimeout: 5}}
+	svcCfg := privateGatewayServiceConfig()
 	upstream := options.Upstream
 	if upstream == nil {
 		upstream = repository.NewHTTPUpstream(svcCfg)
@@ -667,4 +666,11 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 		return nil, ErrDenied
 	}
 	return &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup}, nil
+}
+
+// privateGatewayServiceConfig keeps provider I/O bounded by the saved request
+// context deadline. Non-streaming Responses may spend longer than five seconds
+// generating before sending headers; do not impose a shorter header deadline.
+func privateGatewayServiceConfig() *config.Config {
+	return &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}}
 }

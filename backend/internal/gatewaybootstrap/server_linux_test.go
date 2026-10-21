@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1515,6 +1516,63 @@ func TestNativeNaturalGCConsistency(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := nativeNaturalGCConsistent(before, tc.after, tc.total, tc.automatic, tc.forced); got != tc.want {
 				t.Fatalf("live consistency=%v want%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Exercise the same bootstrap configuration and concrete transport as production.
+// Restoring the old five-second header override makes the delayed case fail.
+func TestPrivateGatewayNonStreamingHeadersUseSavedDeadline(t *testing.T) {
+	for _, check := range []struct {
+		name         string
+		deadline     time.Duration
+		wantDeadline bool
+	}{
+		{name: "headers_after_five_seconds", deadline: 10 * time.Second},
+		{name: "short_saved_deadline", deadline: 100 * time.Millisecond, wantDeadline: true},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				select {
+				case <-time.After(5500 * time.Millisecond):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"completed"}`)
+				case <-r.Context().Done():
+				}
+			}))
+			defer upstream.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), check.deadline)
+			defer cancel()
+			req, err := http.NewRequestWithContext(service.WithHTTPUpstreamProfile(ctx, service.HTTPUpstreamProfileOpenAI), http.MethodPost, upstream.URL, strings.NewReader(`{"stream":false}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			begin := time.Now()
+			resp, err := repository.NewHTTPUpstream(privateGatewayServiceConfig()).Do(req, "", 1, 0)
+			select {
+			case <-started:
+			default:
+				t.Fatal("request did not reach provider fixture")
+			}
+			if check.wantDeadline {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("saved deadline did not cancel request: %T", err)
+				}
+				if time.Since(begin) >= time.Second {
+					t.Fatal("saved deadline cancellation was delayed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("non-streaming response headers rejected before saved deadline: %T", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"status":"completed"}` {
+				t.Fatal("non-streaming response not preserved")
 			}
 		})
 	}
