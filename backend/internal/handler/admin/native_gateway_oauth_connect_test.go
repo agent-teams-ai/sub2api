@@ -470,7 +470,11 @@ func TestGatewayNativeOAuthConnectHTTPTokenFailureIsSpent(t *testing.T) {
 			case "invalid-id":
 				phase = "stage_identity"
 			}
-			expected, err := json.Marshal(map[string]string{"event": "gateway_native_oauth_connect_failure", "phase": phase})
+			expected, err := json.Marshal(map[string]string{
+				"event": "gateway_native_oauth_connect_failure", "phase": phase,
+				"consumer": f.scope.Consumer, "account_ref": f.scope.Account,
+				"generation": f.scope.Generation, "operation_ref": "operation",
+			})
 			require.NoError(t, err)
 			require.JSONEq(t, string(expected), strings.TrimSpace(string(diagnostic)))
 			for _, secret := range append(f.secrets, state, "fixture-code", "fixture-upstream-secret") {
