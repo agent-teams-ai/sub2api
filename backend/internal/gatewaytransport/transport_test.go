@@ -1220,7 +1220,7 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			input := ownerRequest()
 			input.Descriptor = *descriptor.Native
 			input.Admission.ProfileID = service.GatewayCodexOAuthResponsesProfile
-			input.Payload = json.RawMessage(`{"model":"gpt-6.1-sol","input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
+			input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, service.GatewayCodexOAuthModel))
 			if mode == "forged-descriptor" {
 				input.Descriptor.CreatedAt = input.Descriptor.CreatedAt.Add(time.Microsecond)
 			}
