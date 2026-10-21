@@ -139,6 +139,11 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx = service.WithGatewayNativeCustody(ctx, h.cfg.Custody)
+	ctx = service.WithGatewayNativeUsageObserver(ctx, func(usage service.GatewayNativeUsage) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		e.usage = &usage
+	})
 	ctx = service.WithGatewayNativeLifetime(ctx, e.life)
 	ctx = service.WithGatewayNativeProviderReadIdle(ctx, h.cfg.ProviderReadIdle)
 	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {

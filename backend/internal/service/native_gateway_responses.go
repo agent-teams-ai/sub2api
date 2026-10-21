@@ -468,6 +468,13 @@ func gatewayNativeErrorFieldsCategory(code, kind, message, param string) string 
 }
 
 func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
+	observation := GatewayNativeUsage{Source: "native_provider_response", State: "unknown", CostState: "unknown"}
+	defer func() {
+		observation.Finalized = true
+		if observe, ok := ctx.Value(gatewayNativeUsageObserverKey{}).(func(GatewayNativeUsage)); ok {
+			observe(observation)
+		}
+	}()
 	target, err := s.gatewayNativeTargetURL(a)
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
@@ -601,6 +608,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			return nil, fail(gatewayNativeFailureLimit)
 		}
 		fields, ok := gatewayNativeCanonicalObject(output, "status")
+		gatewayNativeObserveUsage(output, &observation, ok && gjson.ParseBytes(fields["status"]).String() == "completed")
 		if !ok || gjson.ParseBytes(fields["status"]).String() != "completed" {
 			return nil, fail(gatewayNativeFailureFinal)
 		}
@@ -701,6 +709,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 					return nil, fail(gatewayNativeFailureEvent)
 				}
 				status = gjson.ParseBytes(responseFields["status"]).String()
+				if kind == "response.completed" || kind == "response.failed" || kind == "response.incomplete" || kind == "response.in_progress" {
+					gatewayNativeObserveUsage(response, &observation, kind == "response.completed" && status == "completed")
+				}
 			}
 			if kind == "error" || kind == "response.failed" || kind == "response.incomplete" {
 				return nil, fail(gatewayNativeFailureProvider)
