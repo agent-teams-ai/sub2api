@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -33,6 +34,37 @@ func RegisterGatewayNativeOAuthDescriptorRoute(group *gin.RouterGroup, dispatch 
 			fail()
 			return
 		}
+		c.JSON(http.StatusOK, out)
+	})
+	return nil
+}
+
+// Inert readback for the original connect scope. Unlike Descriptor, this route
+// performs no JWKS/provider/account-check call and cannot qualify or mutate it.
+func RegisterGatewayNativeOAuthRetainedCustodyRoute(group *gin.RouterGroup, dispatch *service.GatewayNativeOAuthDispatch, authorize gin.HandlerFunc) error {
+	if group == nil || group.BasePath() != "/" || dispatch == nil || authorize == nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST("/private/native/v1/oauth/connect/custody", authorize, func(c *gin.Context) {
+		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 4097))
+		input, valid := DecodeGatewayNativeOAuthRetainedCustody(raw)
+		if err != nil || !valid {
+			retainedCustodyWireFailure(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			retainedCustodyWireFailure(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: input.Owner, Account: input.Account,
+			Generation: input.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+		out, err := dispatch.RetainedCustody(c.Request.Context(), scope, input.Operation, input.Descriptor)
+		if err != nil {
+			retainedCustodyWireFailure(c)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
 		c.JSON(http.StatusOK, out)
 	})
 	return nil

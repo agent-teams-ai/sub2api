@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -241,6 +242,25 @@ func (c *GatewayNativeCredentialCustody) authorization(envelope string, scope Ga
 	return "Bearer " + string(plain), nil
 }
 
+// Retained-custody authentication is distinct from provider Authorization
+// construction. The transient plaintext buffer is always cleared; no string
+// plaintext is returned or retained by this method.
+func (c *GatewayNativeCredentialCustody) authenticateRetainedAPIKey(envelope string, scope GatewayNativeCredentialScope) error {
+	id, nonce, sealed, err := gatewayNativeParseEnvelope(envelope)
+	if err != nil || c == nil || !scope.valid() || c.keys[id] == nil {
+		return ErrGatewayNativeIdentity
+	}
+	plain, err := c.keys[id].Open(nil, nonce, sealed, gatewayCredentialAAD(scope, id))
+	if err != nil {
+		return ErrGatewayNativeIdentity
+	}
+	defer clear(plain)
+	if !GatewayNativeIngressKeyValid(string(plain)) {
+		return ErrGatewayNativeIdentity
+	}
+	return nil
+}
+
 // Separate OAuth version/domain. API-key Seal and authorization remain gcn1
 // only. There is deliberately no OAuth Authorization/dispatch entry point.
 func gatewayOAuthAAD(scope GatewayNativeCredentialScope, id string) []byte {
@@ -301,6 +321,7 @@ func (c *GatewayNativeCredentialCustody) openOAuthBundle(envelope string, scope 
 	if err != nil {
 		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
 	}
+	defer clear(raw)
 	return gatewayOAuthDecodeBundle(raw)
 }
 func gatewayOAuthDecodeBundle(raw []byte) (GatewayNativeOAuthBundle, error) {
@@ -356,5 +377,22 @@ func (c *GatewayNativeCredentialCustody) openOAuthVersion(envelope string, scope
 	if err != nil {
 		return GatewayNativeOAuthBundle{}, ErrGatewayNativeIdentity
 	}
+	defer clear(raw)
 	return gatewayOAuthDecodeBundle(raw)
+}
+
+// The retained readback authenticates the outer bundle and, where present, the
+// existing inner timing proof. It returns policy facts only. Raw plaintext
+// buffers are cleared; Go strings created by JSON decoding cannot be zeroed.
+func (c *GatewayNativeCredentialCustody) inspectRetainedOAuth(envelope string, scope GatewayNativeCredentialScope, version int64, now time.Time) (GatewayNativeOAuthRetentionPolicy, error) {
+	var policy GatewayNativeOAuthRetentionPolicy
+	if version < 1 || now.IsZero() {
+		return policy, ErrGatewayNativeIdentity
+	}
+	bundle, err := c.openOAuthVersion(envelope, scope, version)
+	if err != nil {
+		return policy, err
+	}
+	defer clear(bundle.SensitiveMetadata)
+	return retainedOAuthPolicy(now, bundle, c)
 }

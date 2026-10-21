@@ -95,24 +95,21 @@ type oauthOwnerBody struct {
 }
 
 func (a *authority) AuthorizeNativeOAuthOwner(ctx context.Context, consumer, operation, account, generation string) (string, error) {
-	if !identifier.MatchString(consumer) || !service.GatewayNativeCredentialRefValid(operation) ||
-		!service.GatewayNativeCredentialRefValid(account) || !incarnation.MatchString(generation) {
-		return "", ErrDenied
-	}
-	var reply struct {
-		OK       bool   `json:"ok"`
-		OwnerRef string `json:"ownerRef"`
-	}
-	if a.postReply(ctx, "/private/native/v1/oauth-owner-authority", oauthOwnerBody{consumer, operation, account, generation}, &reply) != nil ||
-		!reply.OK || !service.GatewayNativeCredentialRefValid(reply.OwnerRef) {
-		return "", ErrDenied
-	}
-	return reply.OwnerRef, nil
+	return a.authorizeOAuthOwner(ctx, "/private/native/v1/oauth-owner-authority", consumer, operation, account, generation)
 }
 
 // Refresh uses active-generation owner authority, separate from staging connect
 // authority and the shared ACK protocol. Origin/credential/bounds stay fixed.
 func (a *authority) AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consumer, operation, account, generation string) (string, error) {
+	return a.authorizeOAuthOwner(ctx, "/private/native/v1/oauth-refresh-authority", consumer, operation, account, generation)
+}
+
+// Custody authenticates retained bytes without granting enrollment or refresh.
+func (a *authority) AuthorizeNativeOAuthCustodyOwner(ctx context.Context, consumer, operation, account, generation string) (string, error) {
+	return a.authorizeOAuthOwner(ctx, "/private/native/v1/oauth-custody-authority", consumer, operation, account, generation)
+}
+
+func (a *authority) authorizeOAuthOwner(ctx context.Context, path, consumer, operation, account, generation string) (string, error) {
 	if !identifier.MatchString(consumer) || !service.GatewayNativeCredentialRefValid(operation) ||
 		!service.GatewayNativeCredentialRefValid(account) || !incarnation.MatchString(generation) {
 		return "", ErrDenied
@@ -121,7 +118,7 @@ func (a *authority) AuthorizeNativeOAuthRefreshOwner(ctx context.Context, consum
 		OK       bool   `json:"ok"`
 		OwnerRef string `json:"ownerRef"`
 	}
-	if a.postReply(ctx, "/private/native/v1/oauth-refresh-authority", oauthOwnerBody{consumer, operation, account, generation}, &reply) != nil ||
+	if a.postReply(ctx, path, oauthOwnerBody{consumer, operation, account, generation}, &reply) != nil ||
 		!reply.OK || !service.GatewayNativeCredentialRefValid(reply.OwnerRef) {
 		return "", ErrDenied
 	}

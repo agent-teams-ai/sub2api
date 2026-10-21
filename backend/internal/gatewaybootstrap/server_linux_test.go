@@ -933,9 +933,13 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	}
 }
 
-type oauthMountOwner struct{ live bool }
+type oauthMountOwner struct {
+	live  bool
+	calls atomic.Int32
+}
 
 func (s *oauthMountOwner) AuthorizeNativeOAuthOwner(_ context.Context, consumer, operation, account, generation string) (string, error) {
+	s.calls.Add(1)
 	if !s.live || consumer != "fixture-consumer" {
 		return "", ErrDenied
 	}
@@ -1077,6 +1081,41 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 		data, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, data
+	}
+	// A live legacy owner authority is insufficient for retained-custody reads.
+	// This body passes the production decoder, so denial must occur at the new
+	// purpose-specific capability boundary before legacy owner or native effects.
+	legacyOwner := &oauthMountOwner{live: true}
+	legacyServer := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth,
+		&privateOAuth{connect: connect, dispatch: dispatch, owners: legacyOwner}))
+	defer legacyServer.Close()
+	custodyBody := admin.GatewayNativeOAuthRetainedCustodyInput{
+		Contract: service.GatewayNativeRetainedCustodyContract, Operation: first.Operation,
+		Owner: first.OwnerRef, Account: first.AccountRef, Generation: first.Generation,
+		Descriptor: service.GatewayNativeRoute{AccountID: 42, Generation: first.Generation,
+			CreatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Profile: service.GatewayCodexOAuthResponsesProfile,
+			BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel},
+	}
+	custodyRaw, err := json.Marshal(custodyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, valid := admin.DecodeGatewayNativeOAuthRetainedCustody(custodyRaw); !valid {
+		t.Fatal("custody regression requires valid request")
+	}
+	request, err := http.NewRequest(http.MethodPost, legacyServer.URL+"/private/native/v1/oauth/connect/custody", bytes.NewReader(custodyRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.Peers[0].Credential)
+	response, err := legacyServer.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden || legacyOwner.calls.Load() != 0 || lookups.Load() != 0 || tokenEntries.Load() != 0 {
+		t.Fatal("legacy owner capability admitted custody or caused effects", response.StatusCode, legacyOwner.calls.Load(), lookups.Load(), tokenEntries.Load())
 	}
 	if code, _ := post("", first, false); code != 403 || lookups.Load() != 0 {
 		t.Fatal("owner callback ran before consumer authentication")
