@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -21,14 +22,14 @@ func NewGatewayNativeOAuthConnectRepository(db *sql.DB) (service.GatewayNativeOA
 
 const connectColumns = `consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,state,
  COALESCE(outcome_operation,''),COALESCE(outcome_account_id,0),COALESCE(outcome_generation,''),COALESCE(outcome_state,''),
- enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied`
+ enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied,method,device_phase,device_revision,COALESCE(device_poll_after,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(device_deadline,'0001-01-01 00:00:00+00'::timestamptz)`
 
 func scanConnect(row *sql.Row) (service.GatewayNativeOAuthConnectIntent, error) {
 	var in service.GatewayNativeOAuthConnectIntent
 	err := row.Scan(&in.Scope.Consumer, &in.Scope.Owner, &in.Scope.Account, &in.Scope.Generation, &in.Scope.Purpose,
 		&in.Operation, &in.ClientID, &in.Redirect, &in.Deadline, &in.StateHash, &in.Envelope, &in.State,
 		&in.Outcome.Operation, &in.Outcome.AccountID, &in.Outcome.Generation, &in.Outcome.State,
-		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied)
+		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied, &in.Method, &in.DevicePhase, &in.DeviceRevision, &in.DevicePollAfter, &in.DeviceDeadline)
 	if err != nil || !service.GatewayNativeOAuthConnectIntentValid(in) {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -45,9 +46,9 @@ func (r *gatewayOAuthConnectRepository) PrepareConnect(ctx context.Context, in s
 	}
 	// ON CONFLICT never updates the accepted scope, capability, birth or TTL.
 	_, err := r.db.ExecContext(ctx, `INSERT INTO gateway_oauth_connect_intents
- (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
-		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation)
+ (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation,method)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
+		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation, connectStoredMethod(in))
 	if err != nil {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -82,8 +83,8 @@ func (r *gatewayOAuthConnectRepository) EnterConnect(ctx context.Context, in ser
 	}
 	result, err := r.db.ExecContext(ctx, `UPDATE gateway_oauth_connect_intents SET state='entered',entered_at=clock_timestamp()
  WHERE consumer=$1 AND operation_ref=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND purpose=$6
- AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp()`,
-		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline)
+ AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp() AND method=$9 AND device_phase=$10 AND device_revision=$11 AND (method='browser' OR device_deadline IS NULL OR device_deadline>clock_timestamp())`,
+		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline, connectStoredMethod(in), in.DevicePhase, in.DeviceRevision)
 	if err != nil {
 		return false, service.ErrGatewayNativeIdentity
 	}
@@ -147,7 +148,7 @@ func (r *gatewayOAuthConnectRepository) FinishConnect(ctx context.Context, in se
 		if out != (service.GatewayNativeOAuthOutcome{}) {
 			return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 		}
-		allowed = "state='prepared' AND deadline<=clock_timestamp()"
+		allowed = "state='prepared' AND (deadline<=clock_timestamp() OR (method='device_code' AND device_deadline<=clock_timestamp()))"
 	default:
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -169,3 +170,59 @@ func (r *gatewayOAuthConnectRepository) FinishConnect(ctx context.Context, in se
 }
 
 var _ service.GatewayNativeOAuthConnectRepository = (*gatewayOAuthConnectRepository)(nil)
+
+func connectStoredMethod(in service.GatewayNativeOAuthConnectIntent) string {
+	if in.Method == "" {
+		return "browser"
+	}
+	return in.Method
+}
+
+// Each provider HTTP call has an exact durable phase/revision winner. These
+// transitions cannot replace scope, nonce, lifetime or enrollment commitments.
+func (r *gatewayOAuthConnectRepository) ClaimConnectDevice(ctx context.Context, in service.GatewayNativeOAuthConnectIntent, phase string) (bool, error) {
+	if !connectAuthorized(ctx, in) || in.Method != "device_code" || (phase != "starting" && phase != "polling") {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	previous := ""
+	if phase == "polling" {
+		previous = "pending"
+	}
+	if in.DevicePhase != previous {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE gateway_oauth_connect_intents SET device_phase=$9,device_revision=device_revision+1
+ WHERE consumer=$1 AND operation_ref=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND purpose=$6
+ AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp() AND method='device_code'
+ AND device_phase=$10 AND device_revision=$11 AND ($9='starting' OR device_poll_after<=clock_timestamp())`,
+		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline, phase, previous, in.DeviceRevision)
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	return n == 1, nil
+}
+
+func (r *gatewayOAuthConnectRepository) SaveConnectDevice(ctx context.Context, in service.GatewayNativeOAuthConnectIntent, envelope string, pollAfter time.Time) (bool, error) {
+	if !connectAuthorized(ctx, in) || in.Method != "device_code" || (in.DevicePhase != "starting" && in.DevicePhase != "polling") || len(envelope) < 65 || len(envelope) > 1024 || !strings.HasPrefix(envelope, "gcc1.") || pollAfter.IsZero() {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE gateway_oauth_connect_intents SET device_phase='pending',material_envelope=$9,device_poll_after=$10,device_deadline=$13
+ WHERE consumer=$1 AND operation_ref=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND purpose=$6
+ AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp() AND method='device_code'
+ AND device_phase=$11 AND device_revision=$12`,
+		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline, envelope, pollAfter, in.DevicePhase, in.DeviceRevision, in.DeviceDeadline)
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, service.ErrGatewayNativeIdentity
+	}
+	return n == 1, nil
+}
+
+var _ service.GatewayNativeOAuthDeviceRepository = (*gatewayOAuthConnectRepository)(nil)

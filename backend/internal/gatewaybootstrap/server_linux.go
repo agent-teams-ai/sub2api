@@ -291,6 +291,16 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
 				valid = ok
+			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect" {
+				var req struct {
+					Operation  string `json:"operation"`
+					OwnerRef   string `json:"owner_ref"`
+					AccountRef string `json:"account_ref"`
+					Generation string `json:"generation"`
+					Method     string `json:"method,omitempty"`
+				}
+				valid = decodeStrict(data, &req) == nil && (req.Method == "" || req.Method == "browser" || req.Method == "device_code")
+				tuple = nativeOAuthOwnerTuple{req.Operation, req.OwnerRef, req.AccountRef, req.Generation}
 			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect/custody" {
 				req, ok := admin.DecodeGatewayNativeOAuthRetainedCustody(data)
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
@@ -447,7 +457,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			cleanup.ServeHTTP(w, r.WithContext(bounded))
-		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/poll" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return

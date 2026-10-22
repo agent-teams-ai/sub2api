@@ -148,6 +148,9 @@ type connectHTTPFixture struct {
 	connect        *service.GatewayNativeOAuthConnect
 	enrollment     *service.GatewayNativeOAuthEnrollment
 	tokens         atomic.Int32
+	deviceStarts   atomic.Int32
+	devicePolls    atomic.Int32
+	device         bool
 	destination    atomic.Int32
 	response       string
 	redirect       bool
@@ -197,6 +200,17 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kid": "fixture", "kty": "RSA", "alg": "RS256", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": "AQAB"}}})
 			return
 		}
+
+		if r.URL.Path == "/api/accounts/deviceauth/usercode" {
+			f.deviceStarts.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"device_auth_id": "native-device-secret", "user_code": "ABCD-EFGH", "interval": "1"})
+			return
+		}
+		if r.URL.Path == "/api/accounts/deviceauth/token" {
+			f.devicePolls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]string{"authorization_code": "fixture-code", "code_verifier": strings.Repeat("v", 128), "code_challenge": openai.GenerateCodeChallenge(strings.Repeat("v", 128))})
+			return
+		}
 		f.tokens.Add(1)
 		require.Equal(t, "/oauth/token", r.URL.Path)
 		require.Equal(t, http.MethodPost, r.Method)
@@ -207,7 +221,11 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 		require.NoError(t, r.ParseForm())
 		require.Len(t, r.PostForm, 5)
 		require.Equal(t, openai.ClientID, r.PostForm.Get("client_id"))
-		require.Equal(t, service.GatewayOAuthConnectRedirect, r.PostForm.Get("redirect_uri"))
+		expectedRedirect := service.GatewayOAuthConnectRedirect
+		if f.device {
+			expectedRedirect = service.GatewayOAuthDeviceRedirect
+		}
+		require.Equal(t, expectedRedirect, r.PostForm.Get("redirect_uri"))
 		require.Equal(t, "authorization_code", r.PostForm.Get("grant_type"))
 		require.True(t, r.PostForm.Get("code") == "fixture-code")
 		require.Len(t, r.PostForm.Get("code_verifier"), 128)
@@ -679,4 +697,65 @@ func TestGatewayNativeOAuthCleanupHTTPStrictFiniteInput(t *testing.T) {
 		require.Equal(t, http.StatusForbidden, send(body, role).Code)
 		require.Equal(t, 1, r.calls)
 	}
+}
+
+func (r *connectHTTPStore) ClaimConnectDevice(_ context.Context, in service.GatewayNativeOAuthConnectIntent, phase string) (bool, error) {
+	if r.row.State != "prepared" || r.row.DevicePhase != in.DevicePhase || r.row.DeviceRevision != in.DeviceRevision {
+		return false, nil
+	}
+	r.row.DevicePhase = phase
+	r.row.DeviceRevision++
+	return true, nil
+}
+func (r *connectHTTPStore) SaveConnectDevice(_ context.Context, in service.GatewayNativeOAuthConnectIntent, envelope string, after time.Time) (bool, error) {
+	if r.row.State != "prepared" || r.row.DevicePhase != in.DevicePhase || r.row.DeviceRevision != in.DeviceRevision {
+		return false, nil
+	}
+	r.row.DevicePhase = "pending"
+	r.row.Envelope = envelope
+	r.row.DevicePollAfter = after
+	r.row.DeviceDeadline = in.DeviceDeadline
+	return true, nil
+}
+
+// HTTP boundary accepts method only on Begin, never returns internal device
+// capabilities and requires the same live owner tuple on the explicit poll.
+func TestGatewayNativeOAuthConnectHTTPDeviceMethodAndPoll(t *testing.T) {
+	f := newConnectHTTPFixture(t)
+	f.device = true
+	f.challenge = openai.GenerateCodeChallenge(strings.Repeat("v", 128))
+	body := strings.TrimSuffix(f.input(), "}") + `,"method":"device_code"}`
+	for _, invalid := range []string{strings.Replace(body, "device_code", "arbitrary", 1), strings.TrimSuffix(body, "}") + `,"method":"browser"}`, strings.Replace(body, `"method"`, `"Method"`, 1)} {
+		require.Equal(t, 404, f.request(t, "/private/native/v1/oauth/connect", invalid, true).Code)
+	}
+	begun := f.request(t, "/private/native/v1/oauth/connect", body, true)
+	require.Equal(t, 200, begun.Code)
+	var out service.GatewayNativeOAuthConnectResult
+	require.NoError(t, json.Unmarshal(begun.Body.Bytes(), &out))
+	require.Equal(t, "device_code", out.Method)
+	require.NotNil(t, out.DeviceAuthorization)
+	require.Empty(t, out.AuthorizeURL)
+	require.NotContains(t, begun.Body.String(), "native-device-secret")
+	require.EqualValues(t, 1, f.deviceStarts.Load())
+	repeat := f.request(t, "/private/native/v1/oauth/connect", body, true)
+	require.Equal(t, 200, repeat.Code)
+	require.NotContains(t, repeat.Body.String(), "ABCD-EFGH")
+	require.Equal(t, 404, f.request(t, "/private/native/v1/oauth/connect/read", body, true).Code)
+	require.Equal(t, 404, f.request(t, "/private/native/v1/oauth/connect/poll", body, true).Code)
+	require.Equal(t, 404, f.request(t, "/private/native/v1/oauth/connect/poll", f.input(), false).Code)
+	require.Equal(t, 200, f.request(t, "/private/native/v1/oauth/connect/poll", f.input(), true).Code)
+	require.Zero(t, f.devicePolls.Load())
+	time.Sleep(time.Until(f.store.row.DevicePollAfter) + 20*time.Millisecond)
+	require.Equal(t, 200, f.request(t, "/private/native/v1/oauth/connect/read", f.input(), true).Code)
+	require.Zero(t, f.devicePolls.Load())
+	completed := f.request(t, "/private/native/v1/oauth/connect/poll", f.input(), true)
+	require.Equal(t, 200, completed.Code)
+	require.NoError(t, json.Unmarshal(completed.Body.Bytes(), &out))
+	require.Equal(t, "completed", out.State)
+	require.EqualValues(t, 1, f.devicePolls.Load())
+	require.EqualValues(t, 1, f.tokens.Load())
+	require.NotContains(t, completed.Body.String(), "ABCD-EFGH")
+	require.NotContains(t, completed.Body.String(), "native-device-secret")
+	require.NotContains(t, f.logs.String(), "ABCD-EFGH")
+	require.NotContains(t, f.logs.String(), "native-device-secret")
 }
