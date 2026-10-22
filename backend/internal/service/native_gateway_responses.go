@@ -569,6 +569,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	if resp == nil || resp.Body == nil {
 		return nil, fail(gatewayNativeFailureResponse)
 	}
+	// Passive quota evidence from this already admitted response only.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusTooManyRequests {
+		s.captureGatewayAccountLimits(ctx, resp.Header)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
 		if resp.StatusCode == http.StatusBadRequest {
