@@ -44,7 +44,8 @@ func deviceUserCodeValid(value string) bool {
 		return false
 	}
 	for _, c := range value {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+		valid := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-'
+		if !valid {
 			return false
 		}
 	}
@@ -283,7 +284,8 @@ func deviceVerifierValid(value string) bool {
 		return false
 	}
 	for _, c := range value {
-		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~", c)) {
+		valid := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~", c)
+		if !valid {
 			return false
 		}
 	}

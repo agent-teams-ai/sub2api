@@ -639,10 +639,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		(encoding == "" || strings.EqualFold(encoding, "identity"))
 	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") && !awaitingCodexFrame {
 		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
-		if upstreamMediaCategory == "json" {
+		switch upstreamMediaCategory {
+		case "json":
 			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
-		} else if upstreamMediaCategory == "missing" {
+		case "missing":
 			var diagnostic gatewayNativeHTTPErrorDiagnostic
 			upstreamBodyShape, upstreamBodyPrefix, diagnostic = gatewayNativeMissingMediaDiagnostic(reader, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
@@ -728,7 +729,8 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
 			if awaitingCodexFrame {
-				if !((kind == "response.created" || kind == "response.in_progress") && status == "in_progress") && !completed {
+				inProgressFrame := (kind == "response.created" || kind == "response.in_progress") && status == "in_progress"
+				if !inProgressFrame && !completed {
 					return nil, fail(gatewayNativeFailureEvent)
 				}
 				awaitingCodexFrame = false

@@ -507,10 +507,6 @@ func (s *GatewayNativeOAuthConnect) completeEntered(ownerCtx context.Context, in
 	return connectResult(saved), nil
 }
 
-func (s *GatewayNativeOAuthConnect) exchange(ctx context.Context, code, verifier string) (GatewayNativeOAuthBundle, error) {
-	return s.exchangeRedirect(ctx, code, verifier, GatewayOAuthConnectRedirect)
-}
-
 func (s *GatewayNativeOAuthConnect) exchangeRedirect(ctx context.Context, code, verifier, redirect string) (GatewayNativeOAuthBundle, error) {
 	// One deadline covers dialing, TLS, headers AND reading/closing the body.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
