@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"io"
 	"net/http"
 
@@ -11,11 +12,19 @@ import (
 // Explicit private sanitized composition only. authorize binds the typed control
 // consumer and owner from live server policy; stock admin never registers this.
 // This does not create a listener or the local1455 callback bridge.
-func RegisterGatewayNativeOAuthDescriptorRoute(group *gin.RouterGroup, dispatch *service.GatewayNativeOAuthDispatch, authorize gin.HandlerFunc) error {
+func RegisterGatewayNativeOAuthDescriptorRoute(group *gin.RouterGroup, dispatch interface {
+	Descriptor(context.Context, service.GatewayNativeCredentialScope, string) (service.GatewayNativeOAuthDescriptorResult, error)
+}, authorize gin.HandlerFunc, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || dispatch == nil || authorize == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/connect/descriptor", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/connect/descriptor", authorize, func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_descriptor_unavailable"}) }
 		var input gatewayConnectInput
@@ -41,11 +50,19 @@ func RegisterGatewayNativeOAuthDescriptorRoute(group *gin.RouterGroup, dispatch 
 
 // Inert readback for the original connect scope. Unlike Descriptor, this route
 // performs no JWKS/provider/account-check call and cannot qualify or mutate it.
-func RegisterGatewayNativeOAuthRetainedCustodyRoute(group *gin.RouterGroup, dispatch *service.GatewayNativeOAuthDispatch, authorize gin.HandlerFunc) error {
+func RegisterGatewayNativeOAuthRetainedCustodyRoute(group *gin.RouterGroup, dispatch interface {
+	RetainedCustody(context.Context, service.GatewayNativeCredentialScope, string, service.GatewayNativeRoute) (service.GatewayNativeRetainedCustodyResult, error)
+}, authorize gin.HandlerFunc, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || dispatch == nil || authorize == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/connect/custody", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/connect/custody", authorize, func(c *gin.Context) {
 		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 4097))
 		input, valid := DecodeGatewayNativeOAuthRetainedCustody(raw)
 		if err != nil || !valid {

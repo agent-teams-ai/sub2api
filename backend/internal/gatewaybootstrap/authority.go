@@ -201,7 +201,7 @@ func (a *authority) AuthorizeNativeOAuthCleanup(ctx context.Context, in service.
 	}
 	if reply.Native != nil {
 		n := reply.Native
-		if n.AccountID <= 0 || n.Generation != in.Scope.Generation || n.CreatedAt.IsZero() || n.CreatedAt.Nanosecond()%1000 != 0 || n.Profile != service.GatewayCodexOAuthResponsesProfile || n.BaseURL != service.GatewayCodexOAuthBaseURL || n.Model != service.GatewayCodexOAuthModel {
+		if n.AccountID <= 0 || n.Generation != in.Scope.Generation || n.CreatedAt.IsZero() || n.CreatedAt.Nanosecond()%1000 != 0 || !(n.Profile == service.GatewayCodexOAuthResponsesProfile && n.BaseURL == service.GatewayCodexOAuthBaseURL && n.Model == service.GatewayCodexOAuthModel || n.Profile == service.GatewayClaudeOAuthMessagesProfile && n.BaseURL == service.GatewayClaudeOAuthBaseURL && n.Model == service.GatewayClaudeOAuthModel) {
 			return service.GatewayNativeOAuthCleanupAuthority{}, ErrDenied
 		}
 	}

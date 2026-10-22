@@ -68,6 +68,7 @@ type GatewayAccountLimitsStored struct {
 	PrincipalVersion string
 	Revision         int64
 	Raw              *GatewayCodexRawLimits
+	Claude           *GatewayClaudeRawLimits
 }
 
 // This repository has no network, credential decryption, refresh or admin API.
@@ -101,7 +102,7 @@ func (s *GatewayAccountLimitsReader) Read(ctx context.Context, in GatewayAccount
 	if err != nil || ctx.Err() != nil {
 		return unavailable
 	}
-	if in.ProfileID != GatewayCodexOAuthResponsesProfile {
+	if in.ProfileID != GatewayCodexOAuthResponsesProfile && in.ProfileID != GatewayClaudeOAuthMessagesProfile {
 		return GatewayAccountLimitsResult{Status: "unsupported"}
 	}
 	if !gatewayAccountLimitsRouteValid(before, in) {
@@ -125,13 +126,24 @@ func (s *GatewayAccountLimitsReader) Read(ctx context.Context, in GatewayAccount
 	if err != nil || ctx.Err() != nil || current.PrincipalVersion != stored.PrincipalVersion || stored.PrincipalVersion == "" {
 		return unavailable
 	}
-	if stored.Raw == nil {
+	if stored.Raw == nil && stored.Claude == nil {
 		return GatewayAccountLimitsResult{Status: "unknown"}
 	}
-	if stored.Revision < 1 || stored.Revision > gatewayLimitsMaxInteger || current.Raw == nil || current.Revision < stored.Revision || current.Revision > gatewayLimitsMaxInteger {
+	if stored.Revision < 1 || stored.Revision > gatewayLimitsMaxInteger || current.Raw == nil && current.Claude == nil || current.Revision < stored.Revision || current.Revision > gatewayLimitsMaxInteger {
 		return unavailable
 	}
-	windows := NormalizeGatewayCodexLimits(*stored.Raw)
+	var windows []GatewayAccountLimitWindow
+	if in.ProfileID == GatewayClaudeOAuthMessagesProfile {
+		if stored.Claude == nil || current.Claude == nil {
+			return unavailable
+		}
+		windows = NormalizeGatewayClaudeLimits(*stored.Claude)
+	} else {
+		if stored.Raw == nil || current.Raw == nil {
+			return unavailable
+		}
+		windows = NormalizeGatewayCodexLimits(*stored.Raw)
+	}
 	if len(windows) == 0 {
 		return GatewayAccountLimitsResult{Status: "unknown"}
 	}
@@ -140,7 +152,7 @@ func (s *GatewayAccountLimitsReader) Read(ctx context.Context, in GatewayAccount
 func gatewayAccountLimitsRouteValid(route GatewayNativeRoute, in GatewayAccountLimitsInput) bool {
 	consumer := "validation"
 	return route.AccountID > 0 && !route.CreatedAt.IsZero() && route.CreatedAt.Nanosecond()%1000 == 0 &&
-		route.Profile == in.ProfileID && route.BaseURL == GatewayCodexOAuthBaseURL && route.Model == GatewayCodexOAuthModel &&
+		route.Profile == in.ProfileID && (route.Profile == GatewayCodexOAuthResponsesProfile && route.BaseURL == GatewayCodexOAuthBaseURL && route.Model == GatewayCodexOAuthModel || route.Profile == GatewayClaudeOAuthMessagesProfile && route.BaseURL == GatewayClaudeOAuthBaseURL && route.Model == GatewayClaudeOAuthModel) &&
 		GatewayNativeOAuthScopeValid(GatewayNativeCredentialScope{consumer, in.OwnerRef, in.AccountRef, route.Generation, GatewayOAuthBundlePurpose})
 }
 

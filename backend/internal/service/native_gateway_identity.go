@@ -115,7 +115,10 @@ func HasGatewayNativeIdentity(a *Account) bool {
 	_, generation := a.Extra[GatewayGenerationExtraKey]
 	_, profile := a.Extra[GatewayProfileExtraKey]
 	_, custody := a.Extra[GatewayCredentialScopeExtraKey]
-	return generation || profile || custody
+	_, claudeGeneration := a.Extra["gateway_claude_generation_v1"]
+	_, claudeProfile := a.Extra["gateway_claude_profile_v1"]
+	_, claudeCustody := a.Extra["gateway_claude_scope_v1"]
+	return generation || profile || custody || claudeGeneration || claudeProfile || claudeCustody
 }
 
 func validateGatewayNativeShape(a *Account) error {
@@ -263,6 +266,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
 			defer lifetime.finish()
 		}
+	}
+	if ctx != nil && route.Profile == GatewayClaudeOAuthMessagesProfile {
+		return s.forwardGatewayClaudeRoute(ctx, c, route, body)
 	}
 	if ctx != nil && route.Profile == GatewayCodexOAuthResponsesProfile {
 		return s.forwardGatewayOAuthRoute(ctx, c, route, body)

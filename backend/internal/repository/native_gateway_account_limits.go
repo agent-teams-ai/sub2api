@@ -76,6 +76,13 @@ func (r *accountRepository) ReadGatewayAccountLimits(ctx context.Context, in ser
 		return out, service.ErrGatewayNativeIdentity
 	}
 	scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: in.OwnerRef, Account: in.AccountRef, Generation: route.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+	if route.Profile == service.GatewayClaudeOAuthMessagesProfile {
+		db, ok := r.sql.(*sql.DB)
+		if !ok {
+			return out, service.ErrGatewayNativeIdentity
+		}
+		return (&gatewayClaudeRepository{db}).ReadGatewayClaudeLimits(ctx, scope, route)
+	}
 	tx, p, err := r.gatewayLimitsTransaction(ctx, scope, route)
 	if err != nil {
 		return out, err
