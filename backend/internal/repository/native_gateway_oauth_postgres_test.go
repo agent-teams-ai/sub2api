@@ -675,10 +675,10 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Zero(t, calls.Load())
 	// Joining by account ID alone must not misclassify a mismatched existing
 	// qualification as absent and grant the pending-enrollment branch.
-	qualifiedOwnerUpdate := `UPDATE gateway_oauth_profile_qualifications SET owner_ref=$1 WHERE account_id=$2`
-	setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, "foreign-qualified-owner")
+	qualifiedGenerationUpdate := `UPDATE gateway_oauth_profile_qualifications SET generation=$1 WHERE account_id=$2`
+	setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedGenerationUpdate, uuid.NewString())
 	func() {
-		defer setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, scope.Owner)
+		defer setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedGenerationUpdate, scope.Generation)
 		_, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
 		require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
 	}()
