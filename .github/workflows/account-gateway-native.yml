@@ -89,6 +89,29 @@ jobs:
           test "$(grep -c '^--- PASS: TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill ' "$RUNNER_TEMP/native-oauth-reconnect-pg.log")" -eq 1
           ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-reconnect-pg.log"
 
+      - name: Claude OAuth lifecycle, passive quota and protected Messages transport
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_CLAUDE_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_claude_test_ci?sslmode=disable
+        run: |
+          set -o pipefail
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_claude_test_ci
+          go test -tags unit ./internal/service ./internal/gatewaytransport -run '^(TestGateway(Native)?Claude|TestClaudePrivateHTTP)' -count=1 -v | tee "$RUNNER_TEMP/native-claude-boundary.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-claude-boundary.log"
+          for critical in \
+            TestGatewayClaudePassiveHeaderTruthAndInertRead \
+            TestGatewayClaudeOAuthSourceIdentityAndCustody \
+            TestGatewayClaudeCustodyContainedFromOrdinaryAccounts \
+            TestGatewayNativeClaudeResponsesDispatchLifecycle \
+            TestGatewayNativeClaudeResponsesRejectsLossyInput \
+            TestGatewayNativeClaudeOAuthAttributionPreservesCanonicalIntent \
+            TestClaudePrivateHTTPRejectsLossyPayloadBeforeAdmission; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-claude-boundary.log")" -eq 1
+          done
+          go test -tags unit ./internal/repository -run '^TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-claude-pg.log"
+          test "$(grep -c '^--- PASS: TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits ' "$RUNNER_TEMP/native-claude-pg.log")" -eq 1
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-claude-pg.log"
+
       - name: Encrypted native custody and actual backup restore
         working-directory: backend
         env:
