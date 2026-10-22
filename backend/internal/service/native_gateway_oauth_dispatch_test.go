@@ -96,6 +96,7 @@ type oauthDispatchFixture struct {
 	jwksDelay         time.Duration
 	lastAuthorization atomic.Value
 	lastPayload       atomic.Value
+	limitHeaders      http.Header
 	lastContext       context.Context
 }
 
@@ -133,6 +134,9 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 			w.WriteHeader(f.accountStatus)
 			_, _ = io.WriteString(w, f.accountCheck)
 		case "/backend-api/codex/responses":
+			for key, values := range f.limitHeaders {
+				w.Header()[key] = values
+			}
 			f.entries.Add(1)
 			require.Equal(t, "chatgpt.com", r.Host)
 			require.Equal(t, http.MethodPost, r.Method)

@@ -265,6 +265,7 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	require.Error(t, err)
 	_, err = db.ExecContext(ctx, `UPDATE gateway_oauth_identity_reservations SET subject=$1 WHERE account_id=$2`, uuid.NewString(), staged.AccountID)
 	require.Error(t, err)
+	limitsSnapshot := gatewayAccountLimitsPostgresFixture(t, ownerCtx, db, repo, dispatch, scope, operation, *out.Native)
 	_, _, release, err := dispatchRepo.LockGatewayNativeOAuthDispatch(ownerCtx, scope, operation, staged.AccountID)
 	require.NoError(t, err)
 	defer release()
@@ -347,6 +348,10 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	require.Equal(t, service.StatusDisabled, a.Status)
 	require.False(t, a.Schedulable)
 	release()
+	limitsSource := repo.(service.GatewayAccountLimitsRepository)
+	afterRotation, err := limitsSource.ReadGatewayAccountLimits(ownerCtx, service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: out.Native.Profile, ExpectedAuthorizationEpoch: 3}, *out.Native)
+	require.NoError(t, err)
+	require.Equal(t, limitsSnapshot, afterRotation, "ordinary OAuth rotation must preserve native quota provenance and revision")
 	// Engine ambiguity is a fence, never automatic qualification or recovery.
 	intent.ExpectedVersion = 2
 	intent.Operation = uuid.NewString()
@@ -427,6 +432,15 @@ func TestGatewayNativeOAuthDispatchPostgresQualificationRefreshFence(t *testing.
 	_, err = dispatch.Descriptor(ownerCtx, scope, operation)
 	require.Error(t, err)
 
+	// Existing cleanup tombstones the physical birth and erases its ciphertext;
+	// qualification/principal reservations stay immutable. A limits snapshot must
+	// neither block that lifecycle nor be returned for the erased birth.
+	require.NoError(t, stageRepo.EraseGatewayNativeOAuth(ownerCtx, scope, staged.Operation))
+	_, err = limitsSource.ReadGatewayAccountLimits(ownerCtx, service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: out.Native.Profile, ExpectedAuthorizationEpoch: 3}, *out.Native)
+	require.Error(t, err)
+	var erased bool
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT deleted_at IS NOT NULL AND credentials='{}'::jsonb FROM accounts WHERE id=$1`, staged.AccountID).Scan(&erased))
+	require.True(t, erased)
 	// A distinct completed connect is required: UNKNOWN is retained and never
 	// rearmed. Delay a genuine signed JWKS answer across the fresh SQL deadline.
 	secondCtx, secondScope := oauthPGScope(t, scope.Consumer, scope.Owner, uuid.NewString())
@@ -536,12 +550,20 @@ func (u *oauthDispatchPGUpstream) Do(r *http.Request, _ string, _ int64, concurr
 func (u *oauthDispatchPGUpstream) DoWithTLS(r *http.Request, p string, id int64, c int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(r, p, id, c)
 }
-func oauthDispatchPGGateway(t *testing.T, repo service.AccountRepository, entries *atomic.Int32) *service.OpenAIGatewayService {
+func oauthDispatchPGGateway(t *testing.T, repo service.AccountRepository, entries *atomic.Int32, successfulQuota ...bool) *service.OpenAIGatewayService {
 	t.Helper()
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		entries.Add(1)
 		require.Equal(t, "chatgpt.com", r.Host)
 		require.Equal(t, "/backend-api/codex/responses", r.URL.Path)
+		if len(successfulQuota) == 1 && successfulQuota[0] {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Primary-Used-Percent", "37.5")
+			w.Header().Set("X-Codex-Primary-Window-Minutes", "300")
+			w.Header().Set("X-Codex-Primary-Reset-After-Seconds", "0")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
+			return
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(provider.Close)
