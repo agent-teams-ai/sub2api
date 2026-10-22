@@ -25,7 +25,8 @@ import (
 func testGatewayNativeDeviceConnectPostgres(t *testing.T, db *sql.DB) {
 	repo, err := NewGatewayNativeOAuthConnectRepository(db)
 	require.NoError(t, err)
-	f1 := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	f1, ok := NewAccountRepository(nil, db, nil).(service.GatewayNativeOAuthRepository)
+	require.True(t, ok, "account repository must support native OAuth enrollment")
 	verifier, bundleFor := oauthPGFixture(t)
 	bundle := bundleFor("device-controlled-principal")
 	var starts, polls, exchanges atomic.Int32
@@ -83,7 +84,9 @@ func testGatewayNativeDeviceConnectPostgres(t *testing.T, db *sql.DB) {
 		}
 	}))
 	defer provider.Close()
-	transport := provider.Client().Transport.(*http.Transport).Clone()
+	providerTransport, ok := provider.Client().Transport.(*http.Transport)
+	require.True(t, ok, "TLS provider fixture must expose its HTTP transport")
+	transport := providerTransport.Clone()
 	defer transport.CloseIdleConnections()
 	transport.TLSClientConfig.ServerName = "example.com"
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -248,9 +251,11 @@ func testGatewayNativeDeviceConnectPostgres(t *testing.T, db *sql.DB) {
 	require.EqualValues(t, 2, exchanges.Load())
 	// A restart after either durable begin claim or durable handoff-save ACK loss
 	// cannot replay the native HTTP effect or reissue a user capability.
+	deviceRepo, ok := repo.(service.GatewayNativeOAuthDeviceRepository)
+	require.True(t, ok, "connect repository must support durable device claims")
 	for _, loss := range []string{"claim", "save"} {
 		mode.Store(0)
-		wrapped := &deviceLostACK{GatewayNativeOAuthConnectRepository: repo, device: repo.(service.GatewayNativeOAuthDeviceRepository)}
+		wrapped := &deviceLostACK{GatewayNativeOAuthConnectRepository: repo, device: deviceRepo}
 		if loss == "claim" {
 			wrapped.loseClaim.Store(true)
 		} else {
@@ -281,7 +286,7 @@ func testGatewayNativeDeviceConnectPostgres(t *testing.T, db *sql.DB) {
 	pollLossIntent, err := repo.ReadConnectIntent(pollLossOwner, pollLossScope, "poll-loss")
 	require.NoError(t, err)
 	time.Sleep(time.Until(pollLossIntent.DevicePollAfter) + 20*time.Millisecond)
-	pollLost := &deviceLostACK{GatewayNativeOAuthConnectRepository: repo, device: repo.(service.GatewayNativeOAuthDeviceRepository)}
+	pollLost := &deviceLostACK{GatewayNativeOAuthConnectRepository: repo, device: deviceRepo}
 	pollLost.loseClaim.Store(true)
 	uncertainPoll, err := service.NewGatewayNativeOAuthConnect(key, transport, pollLost, enrollment, f1)
 	require.NoError(t, err)
@@ -291,7 +296,7 @@ func testGatewayNativeDeviceConnectPostgres(t *testing.T, db *sql.DB) {
 	_, err = restarted.PollDeviceConnect(pollLossOwner, pollLossScope, "poll-loss")
 	require.NoError(t, err)
 	require.Equal(t, pollsBefore, polls.Load())
-	staleWon, err := repo.(service.GatewayNativeOAuthDeviceRepository).ClaimConnectDevice(pollLossOwner, pollLossIntent, "polling")
+	staleWon, err := deviceRepo.ClaimConnectDevice(pollLossOwner, pollLossIntent, "polling")
 	require.NoError(t, err)
 	require.False(t, staleWon)
 

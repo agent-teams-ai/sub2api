@@ -230,7 +230,8 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput, allowMethod 
 	for d.More() {
 		tok, err = d.Token()
 		name, ok := tok.(string)
-		if err != nil || !ok || seen[name] || (name != "operation" && name != "owner_ref" && name != "account_ref" && name != "generation" && !(begin && name == "method")) {
+		allowedName := name == "operation" || name == "owner_ref" || name == "account_ref" || name == "generation" || (begin && name == "method")
+		if err != nil || !ok || seen[name] || !allowedName {
 			return false
 		}
 		seen[name] = true

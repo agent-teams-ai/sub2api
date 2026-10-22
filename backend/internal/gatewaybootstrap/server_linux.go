@@ -319,16 +319,17 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
 			var owner string
-			if c.Request.URL.Path == "/private/native/v1/oauth/refresh" {
+			switch c.Request.URL.Path {
+			case "/private/native/v1/oauth/refresh":
 				owner, err = oauth.owners.AuthorizeNativeOAuthRefreshOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
-			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect/custody" {
+			case "/private/native/v1/oauth/connect/custody":
 				custodyOwners, ok := oauth.owners.(NativeOAuthCustodyAuthority)
 				if !ok {
 					c.AbortWithStatus(http.StatusForbidden)
 					return
 				}
 				owner, err = custodyOwners.AuthorizeNativeOAuthCustodyOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
-			} else {
+			default:
 				owner, err = oauth.owners.AuthorizeNativeOAuthOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
 			}
 			if err != nil || bounded.Err() != nil || owner != tuple.OwnerRef {

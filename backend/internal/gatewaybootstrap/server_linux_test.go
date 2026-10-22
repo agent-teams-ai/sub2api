@@ -1587,7 +1587,11 @@ func TestPrivateGatewayNonStreamingHeadersUseSavedDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatalf("non-streaming response headers rejected before saved deadline: %T", err)
 			}
-			defer resp.Body.Close()
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("close non-streaming response body: %v", err)
+				}
+			}()
 			body, err := io.ReadAll(resp.Body)
 			if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"status":"completed"}` {
 				t.Fatal("non-streaming response not preserved")
