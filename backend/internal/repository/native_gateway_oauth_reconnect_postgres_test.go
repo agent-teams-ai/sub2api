@@ -62,8 +62,10 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	}
 	require.NoError(t, applyMigrationsFS(ctx, db, before))
 	repo := NewAccountRepository(nil, db, nil)
-	stageRepo := repo.(service.GatewayNativeOAuthRepository)
-	dispatchRepo := repo.(service.GatewayNativeOAuthDispatchRepository)
+	stageRepo, ok := repo.(service.GatewayNativeOAuthRepository)
+	require.True(t, ok, "account repository must support native OAuth enrollment")
+	dispatchRepo, ok := repo.(service.GatewayNativeOAuthDispatchRepository)
+	require.True(t, ok, "account repository must support native OAuth dispatch")
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	require.NoError(t, err)
@@ -85,7 +87,9 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"access_token": bundle.AccessToken, "refresh_token": bundle.RefreshToken, "id_token": bundle.IDToken, "token_type": "Bearer", "expires_in": 3600}))
 	}))
 	defer tokens.Close()
-	tokenTransport := tokens.Client().Transport.(*http.Transport).Clone()
+	tokenBaseTransport, ok := tokens.Client().Transport.(*http.Transport)
+	require.True(t, ok, "TLS token fixture must expose its HTTP transport")
+	tokenTransport := tokenBaseTransport.Clone()
 	tokenTransport.TLSClientConfig.ServerName = "example.com"
 	tokenTransport.DisableKeepAlives = true
 	defer tokenTransport.CloseIdleConnections()
@@ -106,7 +110,9 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 		require.NoError(t, err)
 	}))
 	defer check.Close()
-	checkTransport := check.Client().Transport.(*http.Transport).Clone()
+	checkBaseTransport, ok := check.Client().Transport.(*http.Transport)
+	require.True(t, ok, "TLS account-check fixture must expose its HTTP transport")
+	checkTransport := checkBaseTransport.Clone()
 	checkTransport.TLSClientConfig.ServerName = "example.com"
 	defer checkTransport.CloseIdleConnections()
 	checkTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -272,7 +278,8 @@ func TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill(t *testing.T) {
 	// Cleanup uses the retained model only for this exact old birth. A current-
 	// model grant cannot erase it; the matching historical grant can, without
 	// altering either immutable qualification or the new account credentials.
-	cleanupRepo := repo.(service.GatewayNativeOAuthCleanupRepository)
+	cleanupRepo, ok := repo.(service.GatewayNativeOAuthCleanupRepository)
+	require.True(t, ok, "account repository must support exact-birth native OAuth cleanup")
 	request := service.GatewayNativeOAuthCleanupRequest{Scope: scope, Operation: operation, Action: "erase", CleanupRef: uuid.NewString(), CleanupToken: uuid.NewString()}
 	grant := func(route service.GatewayNativeRoute) service.GatewayNativeOAuthCleanupAuthorizer {
 		return func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {

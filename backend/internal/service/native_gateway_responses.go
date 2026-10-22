@@ -729,7 +729,8 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
 			if awaitingCodexFrame {
-				if !((kind == "response.created" || kind == "response.in_progress") && status == "in_progress") && !completed {
+				inProgressFrame := (kind == "response.created" || kind == "response.in_progress") && status == "in_progress"
+				if !inProgressFrame && !completed {
 					return nil, fail(gatewayNativeFailureEvent)
 				}
 				awaitingCodexFrame = false
