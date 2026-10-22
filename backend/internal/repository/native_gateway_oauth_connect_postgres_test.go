@@ -718,4 +718,6 @@ func TestGatewayNativeOAuthConnectPostgresOneEntryLostACKAndRestart(t *testing.T
 	collision.RecoveryDenied = false
 	_, err = restartedRepo.PrepareConnect(owner, collision)
 	require.Error(t, err)
+	t.Run("device code durable provider effects", func(t *testing.T) { testGatewayNativeDeviceConnectPostgres(t, db) })
+
 }

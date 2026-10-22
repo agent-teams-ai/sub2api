@@ -1349,6 +1349,24 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if status != 200 {
 		t.Fatal("opt-in connect absent", status, string(raw))
 	}
+	// Begin alone accepts an optional method; existing browser callers retain
+	// their default and poll requires the original owner tuple without a method.
+	explicitBrowser := strings.TrimSuffix(input, "}") + `,"method":"browser"}`
+	if explicitStatus, _ := post(path, explicitBrowser, "management"); explicitStatus != 200 {
+		t.Fatal("explicit browser method rejected", explicitStatus)
+	}
+	invalidMethod := strings.Replace(explicitBrowser, `"browser"`, `"unknown"`, 1)
+	if invalidStatus, _ := post(path, invalidMethod, "management"); invalidStatus != 400 {
+		t.Fatal("unknown connect method accepted", invalidStatus)
+	}
+	if invalidStatus, _ := post(path+"/poll", explicitBrowser, "management"); invalidStatus != 400 {
+		t.Fatal("poll accepted expanded method selector", invalidStatus)
+	}
+	for _, role := range []string{"execution", "cleanup", "missing"} {
+		if pollStatus, _ := post(path+"/poll", input, role); pollStatus != 403 {
+			t.Fatal("poll bypassed management authorization", pollStatus)
+		}
+	}
 	var begun service.GatewayNativeOAuthConnectResult
 	if json.Unmarshal(raw, &begun) != nil || begun.Operation != "original-mount-operation" {
 		t.Fatal("operation changed")
