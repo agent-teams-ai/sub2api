@@ -36,15 +36,16 @@ type GatewayNativeOAuthRefreshFence interface {
 }
 
 type GatewayNativeOAuthPhysical struct {
-	Scope           GatewayNativeCredentialScope
-	Operation       string
-	Route           GatewayNativeRoute
-	Issuer          string
-	Subject         string
-	ProviderAccount string
-	QualifiedAt     time.Time
-	proof           *gatewayOAuthQualificationProof
-	RefreshFence    GatewayNativeOAuthRefreshFence
+	CredentialRevision int64
+	Scope              GatewayNativeCredentialScope
+	Operation          string
+	Route              GatewayNativeRoute
+	Issuer             string
+	Subject            string
+	ProviderAccount    string
+	QualifiedAt        time.Time
+	proof              *gatewayOAuthQualificationProof
+	RefreshFence       GatewayNativeOAuthRefreshFence
 }
 
 type GatewayNativeOAuthDispatchRepository interface {

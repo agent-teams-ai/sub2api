@@ -182,16 +182,27 @@ func Run(ctx context.Context, options Options) error {
 		Profile:    c.qualifiedProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
 		IOTimeout: 30 * time.Second, ProviderReadIdle: 30 * time.Second, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
 	var oauth *privateOAuth
-	if c.OAuth != nil {
+	if c.OAuth != nil || c.Claude != nil {
 		owners := options.OAuthOwnerAuthority
 		if owners == nil {
 			owners = a
 		}
-		oauth, err = composePrivateOAuth(repo, db, custody, c.OAuth, owners)
+		if c.OAuth != nil {
+			oauth, err = composePrivateOAuth(repo, db, custody, c.OAuth, owners)
+		} else {
+			oauth = &privateOAuth{owners: owners}
+		}
 		if err != nil {
 			return ErrDenied
 		}
+		if c.Claude != nil {
+			if err = composePrivateClaude(oauth, repo, db, custody, owners); err != nil {
+				return ErrDenied
+			}
+		}
 		tcfg.OAuth = oauth.dispatch
+		tcfg.ClaudeOAuth = oauth.claude
+		tcfg.Claude = c.claudeProfile()
 	}
 	a.compose(&tcfg)
 	transport, err := gatewaytransport.New(ctx, tcfg)
@@ -284,7 +295,8 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			bounded, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 			defer cancel()
-			completion := c.Request.URL.Path == "/private/native/v1/oauth/connect/complete"
+			path := strings.Replace(c.Request.URL.Path, "/private/native/v1/claude/oauth", "/private/native/v1/oauth", 1)
+			completion := path == "/private/native/v1/oauth/connect/complete"
 			bodyLimit := 4096
 			if completion {
 				bodyLimit = admin.GatewayNativeOAuthConnectCompletionBodyLimit
@@ -296,7 +308,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
 				valid = ok
-			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect" {
+			} else if path == "/private/native/v1/oauth/connect" {
 				var req struct {
 					Operation  string `json:"operation"`
 					OwnerRef   string `json:"owner_ref"`
@@ -306,7 +318,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				}
 				valid = decodeStrict(data, &req) == nil && (req.Method == "" || req.Method == "browser" || req.Method == "device_code")
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.OwnerRef, req.AccountRef, req.Generation}
-			} else if c.Request.URL.Path == "/private/native/v1/oauth/connect/custody" {
+			} else if path == "/private/native/v1/oauth/connect/custody" {
 				req, ok := admin.DecodeGatewayNativeOAuthRetainedCustody(data)
 				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
 				valid = ok
@@ -319,7 +331,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
 			var owner string
-			switch c.Request.URL.Path {
+			switch path {
 			case "/private/native/v1/oauth/refresh":
 				owner, err = oauth.owners.AuthorizeNativeOAuthRefreshOwner(bounded, peer.ConsumerID, tuple.Operation, tuple.AccountRef, tuple.Generation)
 			case "/private/native/v1/oauth/connect/custody":
@@ -385,19 +397,32 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
 			c.Next()
 		}
-		if oauth.cleanup != nil && admin.RegisterGatewayNativeOAuthCleanupRoute(router.Group(""), oauth.connect, authorizeCleanup, oauth.cleanup) != nil {
+		if oauth.connect != nil && oauth.cleanup != nil && admin.RegisterGatewayNativeOAuthCleanupRoute(router.Group(""), oauth.connect, authorizeCleanup, oauth.cleanup) != nil {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 			})
 		}
-		if admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil ||
+		if oauth.connect != nil && (admin.RegisterGatewayNativeOAuthConnectRoutes(router.Group(""), oauth.connect, authorizeOAuth) != nil ||
 			admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil ||
 			admin.RegisterGatewayNativeOAuthRetainedCustodyRoute(router.Group(""), oauth.dispatch, authorizeOAuth) != nil ||
-			(oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil) {
+			(oauth.refresh != nil && admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.refresh, authorizeOAuth) != nil)) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 			})
 		}
+		if oauth.claude != nil {
+			const prefix = "/private/native/v1/claude/oauth"
+			if admin.RegisterGatewayNativeClaudeOAuthRoutes(router.Group(""), oauth.claude, authorizeOAuth) != nil ||
+				admin.RegisterGatewayNativeOAuthDescriptorRoute(router.Group(""), oauth.claude, authorizeOAuth, prefix) != nil ||
+				admin.RegisterGatewayNativeOAuthRetainedCustodyRoute(router.Group(""), oauth.claude, authorizeOAuth, prefix) != nil ||
+				admin.RegisterGatewayNativeOAuthRefreshRoute(router.Group(""), oauth.claude, authorizeOAuth, prefix) != nil ||
+				admin.RegisterGatewayNativeOAuthCleanupRoute(router.Group(""), oauth.claude, authorizeCleanup, oauth.cleanup, prefix) != nil {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
+				})
+			}
+		}
+
 	}
 	// Telemetry uses the same management credential, typed consumer context and
 	// shared control budget as candidates. No execution/cleanup authority enters.
@@ -409,7 +434,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 		// The sole query-bearing exception is the exact canonical GET callback.
 		// F3 parses/scrubs the capability; this outer boundary also denies aliases,
 		// duplicates, noncanonical encodings and body smuggling before bypassing auth.
-		if oauth != nil && r.URL.Path == "/auth/callback" {
+		if oauth != nil && oauth.connect != nil && r.URL.Path == "/auth/callback" {
 			query := r.URL.RawQuery
 			values, err := url.ParseQuery(query)
 			scope, hasScope := values["scope"]
@@ -469,7 +494,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			management.ServeHTTP(w, r.WithContext(bounded))
 		case r.URL.Path == "/private/native/v1/runtime":
 			management.ServeHTTP(w, r)
-		case oauth != nil && r.URL.Path == "/private/native/v1/oauth/connect/cleanup":
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect/cleanup" || oauth.claude != nil && r.URL.Path == "/private/native/v1/claude/oauth/connect/cleanup"):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
@@ -482,6 +507,19 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			cleanup.ServeHTTP(w, r.WithContext(bounded))
+		case oauth != nil && oauth.claude != nil && claudeControlPath(r.URL.Path):
+			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
+				http.Error(w, "private native bootstrap denied", 400)
+				return
+			}
+			controller := http.NewResponseController(w)
+			if controller.SetReadDeadline(time.Now().Add(15*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(15*time.Second)) != nil {
+				http.Error(w, "private native bootstrap denied", 503)
+				return
+			}
+			bounded, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			defer cancel()
+			management.ServeHTTP(w, r.WithContext(bounded))
 		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/poll" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
@@ -635,6 +673,7 @@ type privateOAuth struct {
 	refresh  *service.GatewayNativeOAuthRefresh
 	cleanup  service.GatewayNativeOAuthCleanupAuthorizer
 	limits   *service.GatewayAccountLimitsReader
+	claude   *service.GatewayNativeClaudeOAuth
 }
 
 func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *service.GatewayNativeCredentialCustody, cfg *OAuthConfig, owners NativeOAuthOwnerAuthority) (*privateOAuth, error) {
@@ -726,4 +765,64 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 // generating before sending headers; do not impose a shorter header deadline.
 func privateGatewayServiceConfig() *config.Config {
 	return &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}}
+}
+
+func claudeControlPath(path string) bool {
+	switch path {
+	case "/private/native/v1/claude/oauth/connect", "/private/native/v1/claude/oauth/connect/read", "/private/native/v1/claude/oauth/connect/complete", "/private/native/v1/claude/oauth/connect/descriptor", "/private/native/v1/claude/oauth/connect/custody", "/private/native/v1/claude/oauth/refresh":
+		return true
+	}
+	return false
+}
+func composePrivateClaude(out *privateOAuth, repo service.AccountRepository, db *sql.DB, custody *service.GatewayNativeCredentialCustody, owners NativeOAuthOwnerAuthority) error {
+	cleanup, ok := owners.(NativeOAuthCleanupAuthority)
+	if !ok || out == nil || owners == nil {
+		return ErrDenied
+	}
+	out.cleanup = cleanup.AuthorizeNativeOAuthCleanup
+	source, err := repository.NewGatewayNativeClaudeRepository(db)
+	if err != nil {
+		return ErrDenied
+	}
+	out.claude, err = service.NewGatewayNativeClaudeOAuth(source, custody, nil)
+	if err != nil {
+		return ErrDenied
+	}
+	check := func(refresh bool) service.GatewayNativeOAuthEntryAuthorizer {
+		return func(ctx context.Context, scope service.GatewayNativeCredentialScope, op string) error {
+			var owner string
+			var e error
+			if refresh {
+				owner, e = owners.AuthorizeNativeOAuthRefreshOwner(ctx, scope.Consumer, op, scope.Account, scope.Generation)
+			} else {
+				owner, e = owners.AuthorizeNativeOAuthOwner(ctx, scope.Consumer, op, scope.Account, scope.Generation)
+			}
+			if e != nil || ctx.Err() != nil || owner != scope.Owner {
+				return ErrDenied
+			}
+			return nil
+		}
+	}
+	if out.claude.SetEntryAuthorizers(check(false), check(true)) != nil {
+		return ErrDenied
+	}
+	if out.limits == nil {
+		if authority, ok := owners.(NativeAccountLimitsAuthority); ok {
+			cache, ok := repo.(service.GatewayAccountLimitsCache)
+			if !ok {
+				return ErrDenied
+			}
+			out.limits, err = service.NewGatewayAccountLimitsReader(cache, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+				consumer, e := service.GatewayNativeConsumer(ctx)
+				if e != nil {
+					return service.GatewayNativeRoute{}, ErrDenied
+				}
+				return authority.AuthorizeNativeAccountLimits(ctx, consumer, in)
+			})
+			if err != nil {
+				return ErrDenied
+			}
+		}
+	}
+	return nil
 }

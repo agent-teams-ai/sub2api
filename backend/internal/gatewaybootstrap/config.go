@@ -43,6 +43,7 @@ type Config struct {
 	MaxEntries    int64           `json:"maxEntries"`
 	OAuth         *OAuthConfig    `json:"oauth,omitempty"`
 	OpenRouter    *ProfileConfig  `json:"openRouter,omitempty"`
+	Claude        *ProfileConfig  `json:"claude,omitempty"`
 }
 
 // The optional OAuth key is separate from custody, inherited in protected FD6,
@@ -226,6 +227,9 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 	if c.OpenRouter != nil && (!c.OpenRouter.valid() || c.OpenRouter.BaseURL != service.GatewayOpenRouterBaseURL || !service.GatewayOpenRouterModelValid(c.OpenRouter.Model)) {
 		return nil, ErrDenied
 	}
+	if c.Claude != nil && (!c.Claude.valid() || c.Claude.BaseURL != service.GatewayClaudeOAuthBaseURL || c.Claude.Model != service.GatewayClaudeOAuthModel || c.Claude.Tokens > 65536 || c.Claude.ProviderTokenUpperBound > 65536) {
+		return nil, ErrDenied
+	}
 	if c.OAuth != nil {
 		codex := c.OAuth.Profile
 		key, keyErr := base64.StdEncoding.Strict().DecodeString(c.OAuth.IntentKey)
@@ -295,5 +299,14 @@ func (c Config) codexProfile() *gatewaytransport.QualifiedProfile {
 	}
 	p := c.OAuth.Profile.qualified()
 	p.Profile = service.GatewayCodexOAuthResponsesProfile
+	return &p
+}
+
+func (c Config) claudeProfile() *gatewaytransport.QualifiedProfile {
+	if c.Claude == nil {
+		return nil
+	}
+	p := c.Claude.qualified()
+	p.Profile = service.GatewayClaudeOAuthMessagesProfile
 	return &p
 }

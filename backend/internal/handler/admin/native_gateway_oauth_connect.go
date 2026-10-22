@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -262,11 +263,19 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput, allowMethod 
 
 // Only the original connect selectors enter maintenance; no F2 reference/version
 // is an input. Output cannot serialize the private repository projection.
-func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *service.GatewayNativeOAuthRefresh, authorize gin.HandlerFunc) error {
+func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh interface {
+	Maintain(context.Context, service.GatewayNativeCredentialScope, string) (service.GatewayNativeOAuthMaintenanceOutcome, error)
+}, authorize gin.HandlerFunc, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || refresh == nil || authorize == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/refresh", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/refresh", authorize, func(c *gin.Context) {
 		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_refresh_unavailable"}) }
 		var req gatewayConnectInput
 		if !gatewayConnectDecode(c, &req) {
@@ -297,11 +306,19 @@ func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *ser
 }
 
 // Cleanup has its own purpose/role authorization, never connect owner policy.
-func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect *service.GatewayNativeOAuthConnect, authorize gin.HandlerFunc, authority service.GatewayNativeOAuthCleanupAuthorizer) error {
+func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect interface {
+	Cleanup(context.Context, service.GatewayNativeOAuthCleanupRequest, service.GatewayNativeOAuthCleanupAuthorizer) (service.GatewayNativeOAuthCleanupResult, error)
+}, authorize gin.HandlerFunc, authority service.GatewayNativeOAuthCleanupAuthorizer, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || connect == nil || authorize == nil || authority == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/connect/cleanup", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/connect/cleanup", authorize, func(c *gin.Context) {
 		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_cleanup_unavailable"}) }
 		c.Header("Cache-Control", "no-store")
 		if c.Request.URL.RawQuery != "" {

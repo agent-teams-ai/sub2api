@@ -33,12 +33,14 @@ type Config struct {
 	Gateway                                    *service.OpenAIGatewayService
 	Custody                                    *service.GatewayNativeCredentialCustody
 	OAuth                                      *service.GatewayNativeOAuthDispatch
+	ClaudeOAuth                                *service.GatewayNativeClaudeOAuth
 	Authorize                                  func(*http.Request) (Peer, error)
 	Enrollment                                 Enrollment
 	VerifyEnrollment                           func(context.Context, Enrollment) error
 	Profile                                    QualifiedProfile
 	OpenRouter                                 *QualifiedProfile
 	Codex                                      *QualifiedProfile
+	Claude                                     *QualifiedProfile
 	CallbackOrigin, CallbackCredential         string
 	VerifyDispatch                             func(context.Context, string, Proof, time.Time) error
 	AuthorizeCleanup                           func(context.Context, string, Proof, CleanupLease) error
@@ -234,6 +236,19 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		}
 		cfg.Codex = &codex
 	}
+	if (cfg.Claude == nil) != (cfg.ClaudeOAuth == nil) {
+		return nil, errDenied
+	}
+	if cfg.Claude != nil {
+		claude := *cfg.Claude
+		if claude.Profile != service.GatewayClaudeOAuthMessagesProfile || claude.BaseURL != service.GatewayClaudeOAuthBaseURL || claude.Model != service.GatewayClaudeOAuthModel ||
+			!identifier.MatchString(claude.QualificationRef) || claude.RequestBytes < 1 || claude.RequestBytes > 4<<20 ||
+			claude.OutputBytes < 1 || claude.OutputBytes > 8<<20 || claude.Tokens < 1 || claude.Tokens > 65536 ||
+			claude.ProviderTokenUpperBound < claude.Tokens || claude.ProviderTokenUpperBound > 65536 {
+			return nil, errDenied
+		}
+		cfg.Claude = &claude
+	}
 	enrollmentCtx, stop := context.WithTimeout(ctx, cfg.CallbackTimeout)
 	defer stop()
 	if cfg.VerifyEnrollment(enrollmentCtx, cfg.Enrollment) != nil || enrollmentCtx.Err() != nil {
@@ -255,6 +270,9 @@ func (h *Handler) profile(id string) (QualifiedProfile, bool) {
 	}
 	if id == service.GatewayCodexOAuthResponsesProfile && h.cfg.Codex != nil {
 		return *h.cfg.Codex, true
+	}
+	if id == service.GatewayClaudeOAuthMessagesProfile && h.cfg.Claude != nil {
+		return *h.cfg.Claude, true
 	}
 	return QualifiedProfile{}, false
 }
