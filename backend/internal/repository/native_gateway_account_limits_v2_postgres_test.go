@@ -49,7 +49,7 @@ func TestGatewayAccountLimitsV2KeyPostgres(t *testing.T) {
 	defer cancel()
 	db, err := openOAuthDispatchFixtureDB(dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(6)
 	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
 	require.NoError(t, ApplyMigrations(ctx, db))

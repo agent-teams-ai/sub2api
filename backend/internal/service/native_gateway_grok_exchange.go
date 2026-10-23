@@ -45,7 +45,7 @@ func (s *GatewayNativeGrokOAuth) exchange(ctx context.Context, form url.Values, 
 	if err != nil || res == nil || res.Body == nil {
 		return empty, ErrGatewayNativeIdentity
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 65537))
 	defer clear(raw)
 	if err != nil || len(raw) > 65536 || res.StatusCode != http.StatusOK || res.Request == nil || res.Request.URL.String() != xai.DefaultTokenURL {

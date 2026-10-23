@@ -36,31 +36,31 @@ func TestNEWTESTOriginalIntegerAndDecodedEnvelopeNames(t *testing.T) {
 
 func TestNEWTESTPayloadCapsAndOpaqueToolBytes(t *testing.T) {
 	base := `{"model":"NEWTESTmodel","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"NEWTEST","input":{"Store":true,"max_output_tokens":1.5}}]}`
-	if _, err := qualifyPayload([]byte(strings.Replace(base, `,"service_tier":"default"`, "", 1)), "NEWTESTmodel", 100, 200); err == nil {
+	if _, err := qualifyPayloadWithDefaultTier([]byte(strings.Replace(base, `,"service_tier":"default"`, "", 1)), "NEWTESTmodel", 100, 200, true); err == nil {
 		t.Fatal("legacy profile accepted an omitted required tier")
 	}
-	out, err := qualifyPayload([]byte(base), "NEWTESTmodel", 100, 200)
+	out, err := qualifyPayloadWithDefaultTier([]byte(base), "NEWTESTmodel", 100, 200, true)
 	if err != nil || !bytes.Contains(out, []byte(`"max_output_tokens":100`)) || !bytes.Contains(out, []byte(`"input":{"Store":true,"max_output_tokens":1.5}`)) {
 		t.Fatal("cap/tool bytes changed", err)
 	}
 	for _, cap := range []string{"0", "-1", "1.0", "1e2", "201", "null", "\"100\""} {
 		in := strings.TrimSuffix(base, "}") + `,"max_output_tokens":` + cap + `}`
-		if _, err := qualifyPayload([]byte(in), "NEWTESTmodel", 100, 200); err == nil {
+		if _, err := qualifyPayloadWithDefaultTier([]byte(in), "NEWTESTmodel", 100, 200, true); err == nil {
 			t.Fatal("invalid original cap accepted", cap)
 		}
 	}
 	for _, field := range []string{`"Max_Output_Tokens":10`, `"max_output_tokens":10,"max_output_\u0074okens":20`, `"Store":false`, `"ſtore":false`, `"stream":true`, `"previous_response_id":null`} {
-		if _, err := qualifyPayload([]byte(strings.TrimSuffix(base, "}")+","+field+"}"), "NEWTESTmodel", 100, 200); err == nil {
+		if _, err := qualifyPayloadWithDefaultTier([]byte(strings.TrimSuffix(base, "}")+","+field+"}"), "NEWTESTmodel", 100, 200, true); err == nil {
 			t.Fatal("critical alias/duplicate accepted", field)
 		}
 	}
 	for _, tier := range []string{"auto", "priority", "flex"} {
-		if _, err := qualifyPayload([]byte(strings.Replace(base, `"default"`, `"`+tier+`"`, 1)), "NEWTESTmodel", 100, 200); err == nil {
+		if _, err := qualifyPayloadWithDefaultTier([]byte(strings.Replace(base, `"default"`, `"`+tier+`"`, 1)), "NEWTESTmodel", 100, 200, true); err == nil {
 			t.Fatal("unapproved tier accepted")
 		}
 	}
 	in := strings.TrimSuffix(base, "}") + `,"max_output_\u0074okens":200}`
-	out, err = qualifyPayload([]byte(in), "NEWTESTmodel", 100, 200)
+	out, err = qualifyPayloadWithDefaultTier([]byte(in), "NEWTESTmodel", 100, 200, true)
 	if err != nil || !bytes.Contains(out, []byte(`"max_output_\u0074okens":100`)) {
 		t.Fatal("canonical escaped cap did not clamp", err)
 	}

@@ -148,20 +148,20 @@ func gatewayNativeGrokRestoredFrames(original []byte, payloads [][]byte) ([]byte
 				if len(value) == 0 || bytes.HasPrefix(value, []byte("data:")) || bytes.Equal(value, []byte("data")) || bytes.HasPrefix(value, []byte("event:")) || bytes.Equal(value, []byte("event")) {
 					continue
 				}
-				output.Write(value)
-				output.WriteByte('\n')
+				_, _ = output.Write(value)
+				_ = output.WriteByte('\n')
 			}
 		}
 		kind := gjson.GetBytes(payload, "type").String()
 		if kind == "" || strings.ContainsAny(kind, "\r\n") {
 			return nil, ErrGatewayNativeIdentity
 		}
-		output.WriteString("event: ")
-		output.WriteString(kind)
-		output.WriteByte('\n')
-		output.WriteString("data: ")
-		output.Write(payload)
-		output.WriteString("\n\n")
+		_, _ = output.WriteString("event: ")
+		_, _ = output.WriteString(kind)
+		_ = output.WriteByte('\n')
+		_, _ = output.WriteString("data: ")
+		_, _ = output.Write(payload)
+		_, _ = output.WriteString("\n\n")
 		if output.Len() > gatewayNativeSSEFrameLimit {
 			return nil, ErrGatewayNativeIdentity
 		}

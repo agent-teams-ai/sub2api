@@ -76,7 +76,7 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokConnect(ctx context.Context, 
 	if err != nil {
 		return out, service.ErrGatewayNativeIdentity
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	current, err := scanGrok(tx.QueryRowContext(ctx, `SELECT `+grokColumns+` FROM gateway_grok_connect_intents`+grokWhere+` FOR UPDATE`, grokArgs(s, op)...))
 	if err != nil || current.State != "exchanging" || current.StateHash != in.Intent.StateHash || current.Envelope != in.Intent.Envelope {
 		return out, service.ErrGatewayNativeIdentity
@@ -120,7 +120,7 @@ func (r *gatewayGrokRepository) physicalTxMode(ctx context.Context, s service.Ga
 	var envelope string
 	deny := func(tx *sql.Tx) (*sql.Tx, service.GatewayNativeOAuthPhysical, string, error) {
 		if tx != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 		}
 		return nil, p, "", service.ErrGatewayNativeIdentity
 	}
@@ -168,14 +168,14 @@ func (r *gatewayGrokRepository) LockGatewayGrokPhysical(ctx context.Context, s s
 		return p, "", nil, err
 	}
 	var once sync.Once
-	return p, envelope, func() { once.Do(func() { tx.Rollback() }) }, nil
+	return p, envelope, func() { once.Do(func() { _ = tx.Rollback() }) }, nil
 }
 func (r *gatewayGrokRepository) ClaimGatewayGrokRefresh(ctx context.Context, s service.GatewayNativeCredentialScope, op, attempt string, expectedRevision int64) (service.GatewayNativeOAuthPhysical, string, bool, error) {
 	tx, p, envelope, err := r.physicalTx(ctx, s, op, nil, true, true)
 	if err != nil {
 		return p, "", false, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if !service.GatewayNativeCredentialRefValid(attempt) {
 		return p, "", false, service.ErrGatewayNativeIdentity
 	}
@@ -213,7 +213,7 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokRefresh(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if current.Subject != p.Subject || current.ProviderAccount != p.ProviderAccount || current.CredentialRevision != p.CredentialRevision || !strings.HasPrefix(envelope, "gco1.") {
 		return service.ErrGatewayNativeIdentity
 	}
@@ -254,7 +254,7 @@ func (r *gatewayGrokRepository) CleanupGatewayGrok(ctx context.Context, in servi
 	if err != nil {
 		return empty, service.ErrGatewayNativeIdentity
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	args := grokArgs(in.Scope, in.Operation)
 	var id sql.NullInt64
 	if tx.QueryRowContext(ctx, `SELECT account_id FROM gateway_grok_connect_intents`+grokWhere, args...).Scan(&id) != nil {
@@ -385,11 +385,11 @@ func (r *gatewayGrokRepository) LockGatewayGrokMaintenance(ctx context.Context, 
 	var state, attempt string
 	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,'') FROM gateway_grok_connect_intents`+grokWhere, grokArgs(s, op)...).Scan(&state, &attempt)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return p, "", "", "", nil, service.ErrGatewayNativeIdentity
 	}
 	var once sync.Once
-	return p, envelope, state, attempt, func() { once.Do(func() { tx.Rollback() }) }, nil
+	return p, envelope, state, attempt, func() { once.Do(func() { _ = tx.Rollback() }) }, nil
 }
 
 // Cache readers retain exact birth/principal fencing without decrypting material.
@@ -399,7 +399,7 @@ func (r *gatewayGrokRepository) LockGatewayGrokCachedPhysical(ctx context.Contex
 		return p, nil, err
 	}
 	var once sync.Once
-	return p, func() { once.Do(func() { tx.Rollback() }) }, nil
+	return p, func() { once.Do(func() { _ = tx.Rollback() }) }, nil
 }
 
 // ListGatewayGrokQuotaAccounts discovers only the authenticated consumer's
@@ -418,7 +418,7 @@ func (r *gatewayGrokRepository) ListGatewayGrokQuotaAccounts(ctx context.Context
 	if err != nil {
 		return nil, service.ErrGatewayNativeIdentity
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]service.GatewayNativeOAuthPhysical, 0)
 	for rows.Next() {
 		p := service.GatewayNativeOAuthPhysical{Scope: service.GatewayNativeCredentialScope{Consumer: consumer, Purpose: service.GatewayOAuthBundlePurpose}, Issuer: service.GatewayGrokOAuthIssuer}

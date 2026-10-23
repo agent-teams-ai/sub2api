@@ -75,7 +75,7 @@ func (r *gatewayAccountLimitsRepositoryV2) physicalTx(ctx context.Context, s ser
 		err = tx.QueryRowContext(ctx, gatewayLimitsKeyPhysicalSQLV2, route.AccountID, route.CreatedAt, route.Generation, route.Profile, route.Model, route.BaseURL, s.Consumer, s.Owner, s.Account).Scan(&locked)
 	}
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return nil, p, service.ErrGatewayNativeIdentity
 	}
 	return tx, p, nil
@@ -95,7 +95,7 @@ func (r *gatewayAccountLimitsRepositoryV2) ReadGatewayAccountLimitsV2(ctx contex
 	if err != nil {
 		return out, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	out.PrincipalVersion = service.GatewayAccountLimitsPrincipalV2(p)
 	var raw []byte
 	err = tx.QueryRowContext(ctx, `SELECT revision,snapshot FROM gateway_account_limits_v2_snapshots
@@ -139,7 +139,7 @@ func (r *gatewayAccountLimitsRepositoryV2) StoreGatewayAccountLimitsV2(ctx conte
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	principal := service.GatewayAccountLimitsPrincipalV2(current)
 	if principal != service.GatewayAccountLimitsPrincipalV2(expected) || current.Operation != expected.Operation || current.CredentialRevision != expected.CredentialRevision {
 		return service.ErrGatewayNativeIdentity

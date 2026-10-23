@@ -556,7 +556,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			}
 			controller := http.NewResponseController(w)
 			if controller.SetReadDeadline(time.Now().Add(15*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(15*time.Second)) != nil {
-				http.Error(w, "private native bootstrap denied", 503)
+				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 				return
 			}
 			bounded, cancel := context.WithTimeout(r.Context(), 15*time.Second)

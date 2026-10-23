@@ -76,7 +76,7 @@ func (r *gatewayClaudeRepository) CompleteGatewayClaudeConnect(ctx context.Conte
 	if err != nil {
 		return out, service.ErrGatewayNativeIdentity
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	current, err := scanClaude(tx.QueryRowContext(ctx, `SELECT `+claudeColumns+` FROM gateway_claude_connect_intents`+claudeWhere+` FOR UPDATE`, claudeArgs(s, op)...))
 	if err != nil || current.State != "exchanging" || current.StateHash != in.Intent.StateHash || current.Envelope != in.Intent.Envelope {
 		return out, service.ErrGatewayNativeIdentity
@@ -120,7 +120,7 @@ func (r *gatewayClaudeRepository) physicalTxMode(ctx context.Context, s service.
 	var envelope string
 	deny := func(tx *sql.Tx) (*sql.Tx, service.GatewayNativeOAuthPhysical, string, error) {
 		if tx != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 		}
 		return nil, p, "", service.ErrGatewayNativeIdentity
 	}
@@ -168,14 +168,14 @@ func (r *gatewayClaudeRepository) LockGatewayClaudePhysical(ctx context.Context,
 		return p, "", nil, err
 	}
 	var once sync.Once
-	return p, envelope, func() { once.Do(func() { tx.Rollback() }) }, nil
+	return p, envelope, func() { once.Do(func() { _ = tx.Rollback() }) }, nil
 }
 func (r *gatewayClaudeRepository) ClaimGatewayClaudeRefresh(ctx context.Context, s service.GatewayNativeCredentialScope, op, attempt string, expectedRevision int64) (service.GatewayNativeOAuthPhysical, string, bool, error) {
 	tx, p, envelope, err := r.physicalTx(ctx, s, op, nil, true, true)
 	if err != nil {
 		return p, "", false, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if !service.GatewayNativeCredentialRefValid(attempt) {
 		return p, "", false, service.ErrGatewayNativeIdentity
 	}
@@ -213,7 +213,7 @@ func (r *gatewayClaudeRepository) CompleteGatewayClaudeRefresh(ctx context.Conte
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if current.Subject != p.Subject || current.ProviderAccount != p.ProviderAccount || current.CredentialRevision != p.CredentialRevision || !strings.HasPrefix(envelope, "gco1.") {
 		return service.ErrGatewayNativeIdentity
 	}
@@ -254,7 +254,7 @@ func (r *gatewayClaudeRepository) CleanupGatewayClaude(ctx context.Context, in s
 	if err != nil {
 		return empty, service.ErrGatewayNativeIdentity
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	args := claudeArgs(in.Scope, in.Operation)
 	var id sql.NullInt64
 	if tx.QueryRowContext(ctx, `SELECT account_id FROM gateway_claude_connect_intents`+claudeWhere, args...).Scan(&id) != nil {
@@ -338,7 +338,7 @@ func (r *gatewayClaudeRepository) ReadGatewayClaudeLimits(ctx context.Context, s
 	if err != nil {
 		return out, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	out.PrincipalVersion = service.GatewayAccountLimitsPrincipal(p)
 	var raw []byte
 	err = tx.QueryRowContext(ctx, `SELECT revision,raw_snapshot FROM gateway_claude_limits_snapshots WHERE account_id=$1 AND native_created_at=$2 AND generation=$3 AND principal_version=$4`, route.AccountID, route.CreatedAt, route.Generation, out.PrincipalVersion).Scan(&out.Revision, &raw)
@@ -374,7 +374,7 @@ func (r *gatewayClaudeRepository) StoreGatewayClaudeLimits(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	principal := service.GatewayAccountLimitsPrincipal(current)
 	if principal != service.GatewayAccountLimitsPrincipal(p) || current.CredentialRevision != p.CredentialRevision {
 		return service.ErrGatewayNativeIdentity
@@ -442,9 +442,9 @@ func (r *gatewayClaudeRepository) LockGatewayClaudeMaintenance(ctx context.Conte
 	var state, attempt string
 	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,'') FROM gateway_claude_connect_intents`+claudeWhere, claudeArgs(s, op)...).Scan(&state, &attempt)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return p, "", "", "", nil, service.ErrGatewayNativeIdentity
 	}
 	var once sync.Once
-	return p, envelope, state, attempt, func() { once.Do(func() { tx.Rollback() }) }, nil
+	return p, envelope, state, attempt, func() { once.Do(func() { _ = tx.Rollback() }) }, nil
 }

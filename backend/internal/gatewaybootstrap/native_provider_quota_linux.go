@@ -101,7 +101,7 @@ func collectPrivateQuota(ctx context.Context, db *sql.DB, p service.GatewayNativ
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	var acquired bool
 	if conn.QueryRowContext(bounded, `SELECT pg_try_advisory_lock(219906,$1::integer)`, p.Route.AccountID).Scan(&acquired) != nil || !acquired {
 		return

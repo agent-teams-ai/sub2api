@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math/big"
 	"net/http"
 	"strings"
 	"unicode"
@@ -51,7 +50,7 @@ func FetchProtectedJSON(ctx context.Context, client *http.Client, endpoint, acce
 	if err != nil || res == nil || res.Body == nil {
 		return ErrProtectedIdentity
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 65537))
 	defer clear(raw)
 	if err != nil || len(raw) > 65536 || res.StatusCode != http.StatusOK || res.Request == nil || res.Request.URL.String() != endpoint || json.Unmarshal(raw, target) != nil {
@@ -93,8 +92,12 @@ func VerifyProtectedPrincipal(ctx context.Context, client *http.Client, token, a
 			if e1 != nil || e2 != nil || len(x) != 32 || len(y) != 32 {
 				return nil, ErrProtectedIdentity
 			}
-			key := &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
-			if !key.Curve.IsOnCurve(key.X, key.Y) {
+			encoded := make([]byte, 65)
+			encoded[0] = 4
+			copy(encoded[1:33], x)
+			copy(encoded[33:], y)
+			key, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), encoded)
+			if err != nil {
 				return nil, ErrProtectedIdentity
 			}
 			found = key

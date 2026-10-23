@@ -46,7 +46,7 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 	defer cancel()
 	db, err := openOAuthDispatchFixtureDB(dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(6)
 	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
 	require.NoError(t, ApplyMigrations(ctx, db))
@@ -141,7 +141,8 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 		require.Error(t, e)
 	}
 	repo := NewAccountRepository(nil, db, nil)
-	cache := repo.(service.GatewayAccountLimitsCache)
+	cache, ok := repo.(service.GatewayAccountLimitsCache)
+	require.True(t, ok)
 	reader, err := service.NewGatewayAccountLimitsReader(cache, func(context.Context, service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
 		return route, nil
 	})

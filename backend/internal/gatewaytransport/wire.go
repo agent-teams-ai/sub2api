@@ -266,10 +266,6 @@ func strictValue(data []byte, typ reflect.Type, depth int) error {
 
 // Preserve every non-cap byte, including custom tools and user input. The
 // original cap token must be a canonical positive integer before clamping.
-func qualifyPayload(raw []byte, model string, approved, upper int64) ([]byte, error) {
-	return qualifyPayloadWithDefaultTier(raw, model, approved, upper, true)
-}
-
 // Only the new source-qualified provider slices allow the default tier to be
 // absent. The existing profiles keep their established required-field contract.
 func qualifyPayloadWithDefaultTier(raw []byte, model string, approved, upper int64, requireTier bool) ([]byte, error) {

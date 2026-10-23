@@ -120,7 +120,7 @@ func (c *GatewayProviderQuotaCollector) get(ctx context.Context, target, provide
 	if err != nil {
 		return nil, ErrGatewayProviderQuota
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, ErrGatewayProviderQuota
 	}
