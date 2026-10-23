@@ -84,26 +84,53 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
 	}
+	h.serveRequest(raw, r, peer, input, "")
+}
+
+// Both ingress forms use the same reservation, provider-entry CAS and lifetime.
+func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Peer, input Request, executionBearer string) {
+	public := executionBearer != ""
+	var terminal *publicTerminalWriter
+	if public {
+		terminal = &publicTerminalWriter{ResponseWriter: raw, budget: h.terminalBuffers, maximum: int(min(input.Admission.Limits.OutputBytes, 1<<20))}
+		raw = terminal
+		defer terminal.dispose()
+	}
+	controller := http.NewResponseController(raw)
 	profile, configured := h.profile(input.Admission.ProfileID)
 	if !configured || !input.Admission.valid(time.Now()) || !identifier.MatchString(input.RequestRef) || !canonicalUUID.MatchString(input.Worker) ||
 		input.Descriptor.AccountID < 1 || !canonicalUUID.MatchString(input.Descriptor.Generation) || input.Descriptor.CreatedAt.IsZero() ||
 		input.Descriptor.Profile != profile.Profile || input.Descriptor.Model != profile.Model || input.Descriptor.BaseURL != profile.BaseURL ||
 		input.Admission.Limits.RequestBytes > profile.RequestBytes || input.Admission.Limits.OutputBytes > profile.OutputBytes || input.Admission.Limits.Tokens > profile.Tokens ||
 		int64(len(input.Payload)) > input.Admission.Limits.RequestBytes {
-		http.Error(raw, "private native transport denied", http.StatusBadRequest)
+		writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 		return
 	}
-	payload, err := qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound)
-	if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
-		http.Error(raw, "private native transport denied", http.StatusBadRequest)
-		return
-	}
-	if profile.Profile == service.GatewayClaudeOAuthMessagesProfile && service.ValidateGatewayNativeClaudeResponsesBounded(payload, input.Admission.Limits.RequestBytes) != nil {
-		http.Error(raw, "private native transport denied", http.StatusBadRequest)
-		return
+	nativeMessages := public && r.URL.Path == "/v1/messages"
+	payload := []byte(input.Payload)
+	var err error
+	if nativeMessages {
+		if profile.Profile != service.GatewayClaudeOAuthMessagesProfile ||
+			service.ValidateGatewayNativeClaudeMessagesBounded(payload, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens) != nil {
+			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
+			return
+		}
+	} else {
+		payload, err = qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound)
+		if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
+			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
+			return
+		}
+		if profile.Profile == service.GatewayClaudeOAuthMessagesProfile && service.ValidateGatewayNativeClaudeResponsesBounded(payload, input.Admission.Limits.RequestBytes) != nil {
+			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
+			return
+		}
 	}
 	deadline, _ := parseInstant(input.Admission.ExpiresAt)
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	if nativeMessages {
+		ctx = service.WithGatewayNativeClaudeMessages(ctx)
+	}
 	// The original writer implements deadlines even when the Gin writer does not
 	// implement Unwrap. Cancellation interrupts both a blocked write and read.
 	var deadlineMu sync.Mutex
@@ -118,12 +145,26 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		// Do not interrupt the response writer for this duplicate's own receipt.
 		cancel()
 		if err != nil {
-			http.Error(raw, "private native transport denied", http.StatusConflict)
+			writeExecutionError(raw, public, http.StatusConflict, input.RequestRef)
 			return
 		}
 		_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-		writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+		writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
 		return
+	}
+	if executionBearer != "" {
+		h.mu.Lock()
+		e.executionBearer = executionBearer
+		h.mu.Unlock()
+		defer func() {
+			durable := h.settlePublic(peer.ConsumerID, e)
+			lifetime := e.life.Snapshot()
+			if lifetime.Entered && (!lifetime.Completed || !durable || terminal.release() != nil) {
+				// No clean streaming EOF until terminal effect and physical
+				// closure are durable. Accepted bytes/effects are not replayed.
+				_ = controller.SetWriteDeadline(time.Now())
+			}
+		}()
 	}
 	permitted, err := h.admit(ctx, peer.ConsumerID, e)
 	if err != nil || !permitted {
@@ -133,7 +174,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		h.finishNoEntry(e)
 		h.seal(e)
 		_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-		writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+		writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
 		return
 	}
 	ctx, err = service.WithGatewayNativeConsumer(ctx, peer.ConsumerID)
@@ -156,7 +197,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-			writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+			writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
 			return
 		}
 	}
@@ -166,7 +207,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-			writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+			writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
 			return
 		}
 	}

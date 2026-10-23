@@ -25,6 +25,7 @@ import (
 )
 
 const claudeStreamingRequest = `{"model":"claude-sonnet-4-6","input":"controlled SQL lifetime fixture","store":false,"stream":true,"service_tier":"default","max_output_tokens":100}`
+const claudeStreamingNativeRequest = `{"model":"claude-sonnet-4-6","max_tokens":100,"stream":true,"system":[{"type":"text","text":"Native fixture priority","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Native fixture"},{"role":"assistant","content":[{"type":"thinking","thinking":"Prior thought","signature":"opaque-fixture-history-signature"},{"type":"tool_use","id":"prior_tool","name":"read_fixture","input":{"path":"native"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"prior_tool","content":"Native result"}]}],"tools":[{"name":"read_fixture","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],"thinking":{"type":"adaptive"}}`
 const claudeStreamingStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sql_lifetime\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n"
 const claudeStreamingEnd = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"controlled answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
@@ -37,6 +38,7 @@ type claudeStreamingAccount struct {
 	organization string
 	finish       chan struct{}
 	closed       chan struct{}
+	native       bool
 }
 
 // Only the scheduling point is controlled. Both sides of the interleaving use
@@ -97,12 +99,13 @@ func (b *claudeStreamingBody) Close() error {
 }
 
 type claudeStreamingResult struct {
-	index     int
-	entered   bool
-	completed bool
-	usage     service.GatewayNativeUsage
-	lifetime  service.GatewayNativeLifetimeSnapshot
-	err       error
+	index      int
+	entered    bool
+	completed  bool
+	usage      service.GatewayNativeUsage
+	lifetime   service.GatewayNativeLifetimeSnapshot
+	err        error
+	nativeWire bool
 }
 
 // Five real, distinct Claude streams share the same four-connection SQL pool.
@@ -143,12 +146,14 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 	accounts := make([]claudeStreamingAccount, 5)
 	byToken := make(map[string]int)
 	for i := range accounts {
-		accounts[i] = claudeStreamingAccount{scope: service.GatewayNativeCredentialScope{Consumer: consumer, Owner: owner, Account: uuid.NewString(), Generation: uuid.NewString(), Purpose: service.GatewayOAuthBundlePurpose}, owner: ownerCtx, operation: uuid.NewString(), principal: uuid.NewString(), organization: uuid.NewString(), finish: make(chan struct{}), closed: make(chan struct{})}
+		accounts[i] = claudeStreamingAccount{scope: service.GatewayNativeCredentialScope{Consumer: consumer, Owner: owner, Account: uuid.NewString(), Generation: uuid.NewString(), Purpose: service.GatewayOAuthBundlePurpose}, owner: ownerCtx, operation: uuid.NewString(), principal: uuid.NewString(), organization: uuid.NewString(), finish: make(chan struct{}), closed: make(chan struct{}), native: i < 2}
 		byToken["fixture-access-"+accounts[i].scope.Account] = i
 	}
 	arrived := make(chan int, len(accounts))
 	shutdown := make(chan struct{})
 	var exchanges atomic.Int32
+	var invalidWire atomic.Int32
+	nativeEnd := claudeStreamingNativeEnd()
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host == "platform.claude.com" && r.URL.Path == "/v1/oauth/token" {
 			var body map[string]string
@@ -176,8 +181,13 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 8193))
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 8193))
 		_ = r.Body.Close()
+		if err != nil || accounts[index].native && !bytes.Equal(raw, []byte(claudeStreamingNativeRequest)) {
+			invalidWire.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		defer close(accounts[index].closed)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.25")
@@ -189,7 +199,11 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 		case <-r.Context().Done():
 		case <-shutdown:
 		case <-accounts[index].finish:
-			_, _ = io.WriteString(w, claudeStreamingEnd)
+			if accounts[index].native {
+				_, _ = io.WriteString(w, nativeEnd)
+			} else {
+				_, _ = io.WriteString(w, claudeStreamingEnd)
+			}
 		}
 	}))
 	defer provider.Close()
@@ -251,6 +265,11 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 		cancels[i] = stop
 		go func(index int, requestCtx context.Context, stop context.CancelFunc) {
 			result := claudeStreamingResult{index: index}
+			body := []byte(claudeStreamingRequest)
+			if accounts[index].native {
+				body = []byte(claudeStreamingNativeRequest)
+				requestCtx = service.WithGatewayNativeClaudeMessages(requestCtx)
+			}
 			life, e := service.NewGatewayNativeLifetime(requestCtx, stop, func() {}, 16384)
 			if e == nil {
 				life.BindAccount(consumer, accounts[index].scope.Account, accounts[index].scope.Generation)
@@ -266,9 +285,14 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 				requestCtx = service.WithGatewayNativeUsageObserver(requestCtx, func(u service.GatewayNativeUsage) { result.usage = u })
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
-				c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader([]byte(claudeStreamingRequest)))
-				_, result.entered, e = gateway.ForwardGatewayRoute(requestCtx, c, accounts[index].route, []byte(claudeStreamingRequest))
-				result.completed = strings.Contains(recorder.Body.String(), "event: response.completed")
+				c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(body))
+				_, result.entered, e = gateway.ForwardGatewayRoute(requestCtx, c, accounts[index].route, body)
+				if accounts[index].native {
+					result.completed = strings.Contains(recorder.Body.String(), "event: message_stop")
+					result.nativeWire = bytes.Equal(recorder.Body.Bytes(), []byte(claudeStreamingStart+nativeEnd))
+				} else {
+					result.completed = strings.Contains(recorder.Body.String(), "event: response.completed")
+				}
 			}
 			result.err = e
 			if life != nil {
@@ -298,13 +322,15 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("header capture did not reach the post-lock publication boundary")
 	}
-	controlCtx, controlCancel := context.WithTimeout(ownerCtx, time.Second)
+	controlCtx, controlCancel := context.WithTimeout(ownerCtx, 3*time.Second)
 	defer controlCancel()
 	var control int
 	require.NoError(t, db.QueryRowContext(controlCtx, "SELECT 1").Scan(&control), "control SQL must progress while all streams remain open")
-	snapshot, err := rows.ReadGatewayClaudeLimits(controlCtx, accounts[2].scope, accounts[2].route)
-	require.NoError(t, err)
-	require.NotNil(t, snapshot.Claude, "response-header limits must be visible before SSE completion")
+	var snapshot service.GatewayAccountLimitsStored
+	require.Eventually(t, func() bool {
+		snapshot, err = rows.ReadGatewayClaudeLimits(controlCtx, accounts[2].scope, accounts[2].route)
+		return err == nil && snapshot.Claude != nil
+	}, time.Second, time.Millisecond, "response-header limits must be visible before SSE completion")
 	require.EqualValues(t, 1, snapshot.Revision)
 	require.Eventually(t, func() bool { return db.Stats().InUse == 0 }, time.Second, time.Millisecond, "SSE bodies must retain no SQL connections")
 	select {
@@ -373,6 +399,11 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 				require.True(t, result.completed)
 				require.Equal(t, "complete", result.usage.State)
 				require.True(t, result.lifetime.Completed)
+				if accounts[result.index].native {
+					require.True(t, result.nativeWire, "real HTTP native thinking signatures, tool deltas and text must preserve exact frames")
+					require.EqualValues(t, 7, *result.usage.InputTokens)
+					require.EqualValues(t, 3, *result.usage.OutputTokens)
+				}
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("physical stream failed to close after completion or cancellation")
@@ -386,6 +417,16 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 		}
 	}
 	require.EqualValues(t, 5, physicalHTTP.calls.Load())
+	require.Zero(t, invalidWire.Load(), "native request bytes must reach real HTTP unchanged")
 	require.EqualValues(t, 5, physicalHTTP.closed.Load(), "each physical body must close exactly once")
 	require.Zero(t, db.Stats().InUse)
+}
+
+func claudeStreamingNativeEnd() string {
+	thinking := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Native fixture thought\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-native-output-signature\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+	tool := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"native_tool\",\"name\":\"read_fixture\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"native\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n"
+	tail := strings.ReplaceAll(claudeStreamingEnd, `"index":0`, `"index":1`)
+	tail = strings.Replace(tail, "event: message_delta", tool+"event: message_delta", 1)
+	tail = strings.Replace(tail, `"stop_reason":"end_turn"`, `"stop_reason":"tool_use"`, 1)
+	return thinking + tail
 }

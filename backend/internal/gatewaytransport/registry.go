@@ -152,6 +152,8 @@ type reservation struct {
 	status                                          *requestStatus
 	usage                                           *service.GatewayNativeUsage
 	effect                                          string
+	executionBearer                                 string // public per-execution capability; never serialized
+	statusOnly                                      bool   // authenticated no-dispatch reply; never authorizes SQL closure
 }
 
 type Receipt struct {
@@ -170,14 +172,16 @@ type Receipt struct {
 }
 
 type Handler struct {
-	cfg        Config
-	mu         sync.Mutex
-	entries    map[transportKey]*reservation
-	requests   map[requestKey]transportKey
-	stopping   bool
-	callback   *http.Client
-	executions chan struct{}
-	controls   chan struct{}
+	cfg               Config
+	mu                sync.Mutex
+	entries           map[transportKey]*reservation
+	requests          map[requestKey]transportKey
+	stopping          bool
+	callback          *http.Client
+	executions        chan struct{}
+	controls          chan struct{}
+	terminalCallbacks chan struct{}
+	terminalBuffers   *publicTerminalBudget
 }
 
 // Local HTTP work bounds, not account occupancy or memory qualification. The
@@ -257,7 +261,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 16384,
 		DialContext: (&net.Dialer{Timeout: cfg.CallbackTimeout}).DialContext, TLSHandshakeTimeout: cfg.CallbackTimeout, ResponseHeaderTimeout: cfg.CallbackTimeout}
 	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
-		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), terminalCallbacks: make(chan struct{}, 4), terminalBuffers: &publicTerminalBudget{maximum: 64 << 20}, callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
@@ -287,7 +291,8 @@ func (h *Handler) OpenRouterProfile() (QualifiedProfile, bool) {
 
 // Reserve before callback/claim. The secondary request identity prevents a new
 // generation or nonce from rearming a duplicate while any evidence is retained.
-// Only durably acknowledged CLOSED receipts are eligible for bounded eviction.
+// Durably acknowledged closure or an authenticated status-only attempt can
+// retire local CLOSED evidence. An ambiguous callback never earns disposal.
 func (h *Handler) reserve(consumer string, input Request, ctx context.Context, cancel context.CancelFunc, interrupt func()) (*reservation, bool, error) {
 	key := requestKey{consumer, input.Admission.ExecutionRef, input.RequestRef}
 	digest := sha256.Sum256(input.Payload)
@@ -309,7 +314,7 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	}
 	if len(h.entries) >= h.cfg.MaxEntries {
 		for k, e := range h.entries {
-			if e.acknowledged && closed(e.life.Snapshot()) {
+			if (e.acknowledged || e.statusOnly) && closed(e.life.Snapshot()) {
 				delete(h.entries, k)
 				delete(h.requests, k.requestKey)
 				break
@@ -319,7 +324,11 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	if len(h.entries) >= h.cfg.MaxEntries {
 		return nil, false, errDenied
 	}
-	nonce, err := uuid.NewRandom()
+	nonce, bound := boundReservationNonce(consumer, h.cfg.Enrollment.OriginRef, h.cfg.Enrollment.EngineIncarnation, input.Admission.ExecutionRef, input.RequestRef)
+	var err error
+	if !bound {
+		nonce, err = uuid.NewRandom()
+	}
 	if err != nil {
 		return nil, false, errDenied
 	}
@@ -334,6 +343,21 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	h.entries[full] = e
 	h.requests[key] = full
 	return e, true, nil
+}
+
+// A v2 reservation nonce is bound to the full original request identity.
+// SQL independently recognizes this derivation before retiring request detail;
+// legacy non-UUID fixture/execution identifiers retain their v4 evidence.
+func boundReservationNonce(consumer, origin, incarnation, execution, request string) (uuid.UUID, bool) {
+	incarnation, execution = strings.ToLower(incarnation), strings.ToLower(execution)
+	if !canonicalUUID.MatchString(incarnation) || !canonicalUUID.MatchString(execution) {
+		return uuid.Nil, false
+	}
+	digest := sha256.Sum256([]byte(strings.Join([]string{"account-gateway/native-reservation/v2", consumer, origin, incarnation, execution, request}, "\x00")))
+	digest[6] = digest[6]&0x0f | 0x80
+	digest[8] = digest[8]&0x3f | 0x80
+	nonce, err := uuid.FromBytes(digest[:16])
+	return nonce, err == nil
 }
 
 func closed(s service.GatewayNativeLifetimeSnapshot) bool {
@@ -398,13 +422,26 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	e.callbackStarted = true
 	h.mu.Unlock()
 	input := admitRequest{consumer, e.request.RequestRef, e.request.Worker, e.request.Admission, e.request.Descriptor, e.native}
-	body, err := json.Marshal(input)
+	path := "/private/native/v1/admit"
+	var request any = input
+	h.mu.Lock()
+	token := e.executionBearer
+	e.executionBearer = ""
+	h.mu.Unlock()
+	if token != "" {
+		path = "/private/native/v1/public-admit"
+		request = struct {
+			admitRequest
+			ExecutionBearer string `json:"executionBearer"`
+		}{input, token}
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return false, errDenied
 	}
 	callbackCtx, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+"/private/native/v1/admit", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, strings.NewReader(string(body)))
 	if err != nil {
 		return false, errDenied
 	}
@@ -443,6 +480,12 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 		if reply.NativeDescriptor != nil || reply.LeaseExpiresAt != "" {
 			return false, errDenied
 		}
+		// This authenticated SQL response grants no new claim/occupancy. Only
+		// this local NoForward attempt may later be discarded; the original
+		// durable request effect is never changed or described as non-entry.
+		h.mu.Lock()
+		e.statusOnly = true
+		h.mu.Unlock()
 		return false, nil
 	}
 	d := reply.Dispatch
