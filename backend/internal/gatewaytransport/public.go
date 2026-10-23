@@ -190,7 +190,15 @@ func writeExecutionError(w http.ResponseWriter, public bool, status int, ref str
 	http.Error(w, "private native transport denied", status)
 }
 
-func writeExecutionReceipt(w http.ResponseWriter, r Receipt, public bool) {
+func (h *Handler) writeExecutionReceipt(w http.ResponseWriter, consumer string, e *reservation, public bool) {
+	r := h.receipt(consumer, e)
+	h.mu.Lock()
+	refused := e.preclaimRefused
+	h.mu.Unlock()
+	if public && refused {
+		publicError(w, http.StatusServiceUnavailable, "admission_limited", r.RequestRef)
+		return
+	}
 	if !public {
 		writeReceipt(w, r)
 		return
@@ -265,6 +273,12 @@ func (h *Handler) publicPost(ctx context.Context, path string, body, reply any) 
 // Failed callbacks retain the original registry evidence for protected cleanup.
 func (h *Handler) settlePublic(consumer string, e *reservation) bool {
 	h.seal(e)
+	h.mu.Lock()
+	refused := e.preclaimRefused && e.proof == nil
+	h.mu.Unlock()
+	if refused && closed(e.life.Snapshot()) {
+		return true
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// Queue is bounded by active public handlers, with no SQL checkout or

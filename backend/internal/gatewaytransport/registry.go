@@ -154,6 +154,7 @@ type reservation struct {
 	effect                                          string
 	executionBearer                                 string // public per-execution capability; never serialized
 	statusOnly                                      bool   // authenticated no-dispatch reply; never authorizes SQL closure
+	preclaimRefused                                 bool   // exact private pre-work refusal for this native nonce only
 }
 
 type Receipt struct {
@@ -448,6 +449,10 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	req.Header.Set("Authorization", "Bearer "+h.cfg.CallbackCredential)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		// Issued here from the reservation, never copied from public headers.
+		req.Header.Set("X-Gateway-Reservation-Nonce", e.native.RequestNonce)
+	}
 	// There is one POST, no redirect, no automatic retry and no caller URL.
 	resp, err := h.callback.Do(req)
 	if err != nil {
@@ -455,6 +460,28 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	}
 	// Callback body cleanup is best effort; it does not attest provider closure.
 	defer func() { _ = resp.Body.Close() }()
+	if token != "" && resp.StatusCode == http.StatusServiceUnavailable && len(resp.Header.Values("Content-Type")) == 1 && len(resp.Header.Values("Content-Encoding")) == 0 && strings.Split(resp.Header.Get("Content-Type"), ";")[0] == "application/json" {
+		limit := min(h.cfg.CallbackBytes, 1024)
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		var refusal struct {
+			Kind         string `json:"kind"`
+			Claim        string `json:"claim"`
+			RequestNonce string `json:"requestNonce"`
+		}
+		if readErr == nil && int64(len(data)) <= limit && strictJSON(data, &refusal) == nil &&
+			refusal.Kind == "account-gateway/public-admit-capacity/v1" && refusal.Claim == "not_started" && refusal.RequestNonce == e.native.RequestNonce {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if e.admitted || e.proof != nil {
+				return false, errDenied
+			}
+			// This callback never claimed. Do not synthesize or alter any SQL
+			// request effect, including an earlier attempt with the same ref.
+			e.preclaimRefused, e.statusOnly = true, true
+			return false, nil
+		}
+		return false, errDenied
+	}
 	if resp.StatusCode != http.StatusOK || strings.Split(resp.Header.Get("Content-Type"), ";")[0] != "application/json" {
 		return false, errDenied
 	}

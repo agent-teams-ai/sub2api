@@ -149,7 +149,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			return
 		}
 		_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-		writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
+		h.writeExecutionReceipt(raw, peer.ConsumerID, e, public)
 		return
 	}
 	if executionBearer != "" {
@@ -174,7 +174,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 		h.finishNoEntry(e)
 		h.seal(e)
 		_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-		writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
+		h.writeExecutionReceipt(raw, peer.ConsumerID, e, public)
 		return
 	}
 	ctx, err = service.WithGatewayNativeConsumer(ctx, peer.ConsumerID)
@@ -197,7 +197,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-			writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
+			h.writeExecutionReceipt(raw, peer.ConsumerID, e, public)
 			return
 		}
 	}
@@ -207,7 +207,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
-			writeExecutionReceipt(raw, h.receipt(peer.ConsumerID, e), public)
+			h.writeExecutionReceipt(raw, peer.ConsumerID, e, public)
 			return
 		}
 	}
