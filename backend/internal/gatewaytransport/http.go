@@ -93,7 +93,8 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
 	}
-	payload, err := qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound)
+	requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
+	payload, err := qualifyPayloadWithDefaultTier(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
 	if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return

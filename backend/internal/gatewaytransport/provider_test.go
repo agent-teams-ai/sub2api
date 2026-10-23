@@ -35,6 +35,9 @@ func TestCodingPlanPrivateHTTPRejectsUnsupportedBeforeAdmission(t *testing.T) {
 			`"input":"text","tools":[{"type":"web_search"}]`,
 			`"input":"text","previous_response_id":"stateful"`,
 			`"input":"text","reasoning":{"effort":"xhigh"}`,
+			`"input":"text","reasoning":{"effort":"high"}`,
+			`"input":"text","prompt_cache_key":"not-a-uuid"`,
+			`"input":"text","client_metadata":{"x-codex-installation-id":"44444444-4444-4444-8444-444444444444","authorization":"forbidden"}`,
 		} {
 			r := ownerRequest()
 			r.Admission.ProfileID = plan.Profile

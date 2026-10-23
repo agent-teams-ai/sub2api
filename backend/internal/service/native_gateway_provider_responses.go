@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/google/uuid"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -65,9 +67,61 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	if !gatewayNativeProviderProfile(profile) || requestBytes < 1 || requestBytes > 4<<20 || int64(len(body)) > requestBytes {
 		return deny()
 	}
-	fields, ok := gatewayClaudeObject(body, "model", "input", "instructions", "stream", "store", "service_tier", "max_output_tokens", "tools", "tool_choice", "reasoning", "parallel_tool_calls", "temperature", "top_p", "text", "include")
-	if !ok || string(fields["stream"]) != "true" || string(fields["store"]) != "false" || string(fields["service_tier"]) != `"default"` {
+	// These four qualified slices do not support a reasoning setting. Codex
+	// serializes Option.None for reasoning/text as null; normalize only these
+	// exact nulls, without changing configured values or the admitted input.
+	policy, valid := GatewayNativePayloadFields(body, "reasoning", "text")
+	if !valid {
 		return deny()
+	}
+	copied := false
+	for _, name := range []string{"reasoning", "text"} {
+		raw := policy[name]
+		if raw == nil {
+			continue
+		}
+		null := bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+		if name == "reasoning" && !null {
+			return deny()
+		}
+		if null {
+			if !copied {
+				body = append([]byte(nil), body...)
+				copied = true
+			}
+			var err error
+			body, err = sjson.DeleteBytes(body, name)
+			if err != nil {
+				return deny()
+			}
+		}
+	}
+	fields, ok := gatewayClaudeObject(body, "model", "input", "instructions", "stream", "store", "service_tier", "max_output_tokens", "tools", "tool_choice", "reasoning", "parallel_tool_calls", "temperature", "top_p", "text", "include", "prompt_cache_key", "client_metadata")
+	if !ok || string(fields["stream"]) != "true" || string(fields["store"]) != "false" {
+		return deny()
+	}
+	// Codex 0.133 emits a thread UUID and the single canonical installation
+	// UUID (core/src/client.rs, installation_id.rs). These remain bounded body
+	// metadata: they never supply routing, authentication or outgoing headers.
+	if raw := fields["prompt_cache_key"]; raw != nil && !gatewayNativeProviderUUID(raw) {
+		return deny()
+	}
+	if raw := fields["client_metadata"]; raw != nil {
+		if len(raw) > 512 {
+			return deny()
+		}
+		metadata, valid := gatewayClaudeObject(raw, "x-codex-installation-id")
+		if !valid || len(metadata) != 1 || !gatewayNativeProviderUUID(metadata["x-codex-installation-id"]) {
+			return deny()
+		}
+	}
+	// The default tier is optional on the public Responses wire. Explicit
+	// provider selection remains closed: no auto/priority/null coercion.
+	if raw := fields["service_tier"]; raw != nil {
+		var tier string
+		if json.Unmarshal(raw, &tier) != nil || tier != "default" {
+			return deny()
+		}
 	}
 	var model string
 	if json.Unmarshal(fields["model"], &model) != nil {
@@ -100,24 +154,6 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 			return deny()
 		}
 	}
-	if raw := fields["reasoning"]; raw != nil {
-		reasoning, valid := gatewayClaudeObject(raw, "effort", "summary")
-		var effort string
-		if !valid || json.Unmarshal(reasoning["effort"], &effort) != nil {
-			return deny()
-		}
-		switch effort {
-		case "none", "low", "medium", "high":
-		default:
-			return deny()
-		}
-		if summary := reasoning["summary"]; summary != nil {
-			var v string
-			if json.Unmarshal(summary, &v) != nil || (v != "auto" && v != "concise" && v != "detailed") {
-				return deny()
-			}
-		}
-	}
 	if raw := fields["include"]; raw != nil {
 		var include []string
 		if json.Unmarshal(raw, &include) != nil {
@@ -135,8 +171,29 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 			return deny()
 		}
 		if format := text["format"]; format != nil {
-			v, valid := gatewayClaudeObject(format, "type")
-			if !valid || string(v["type"]) != `"text"` {
+			format, valid := gatewayClaudeObject(format, "type", "name", "strict", "schema")
+			var kind string
+			if !valid || json.Unmarshal(format["type"], &kind) != nil {
+				return deny()
+			}
+			switch kind {
+			case "text":
+				if len(format) != 1 {
+					return deny()
+				}
+			case "json_schema":
+				// Pinned Codex create_text_param_for_request uses this fixed name.
+				// Keep the strictness and schema opaque rather than reinterpret them.
+				var name string
+				var strict bool
+				if len(format) != 4 || json.Unmarshal(format["name"], &name) != nil || name != "codex_output_schema" ||
+					json.Unmarshal(format["strict"], &strict) != nil {
+					return deny()
+				}
+				if _, valid := gatewayNativeCanonicalObject(format["schema"]); !valid {
+					return deny()
+				}
+			default:
 				return deny()
 			}
 		}
@@ -275,4 +332,16 @@ func gatewayNativeProviderTextInput(raw []byte) bool {
 func gatewayNativeProviderString(raw []byte) bool {
 	var v string
 	return !bytes.Equal(raw, []byte("null")) && json.Unmarshal(raw, &v) == nil
+}
+
+func gatewayNativeProviderUUID(raw []byte) bool {
+	if len(raw) > 256 {
+		return false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil || len(value) != 36 {
+		return false
+	}
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
 }

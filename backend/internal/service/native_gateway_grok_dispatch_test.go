@@ -88,6 +88,7 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 				body, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				require.Equal(t, "grok-4.7", gjson.GetBytes(body, "model").String())
+				require.False(t, gjson.GetBytes(body, "reasoning").Exists())
 				require.Equal(t, "function", gjson.GetBytes(body, "tools.0.type").String())
 				require.Equal(t, "exec", gjson.GetBytes(body, "tools.0.name").String())
 				require.Equal(t, "function", gjson.GetBytes(body, "tools.1.type").String())
@@ -153,7 +154,7 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 			owned, err := NewGatewayNativeLifetimeUpstream(&gatewayIdentityRealHTTP{client: &http.Client{Transport: local, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}})
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{}, httpUpstream: owned}
-			payload := []byte(`{"model":"grok-4.7","input":"controlled text","store":false,"stream":true,"service_tier":"default","max_output_tokens":100,"tools":[{"type":"custom","name":"exec","format":{"type":"text"}},{"type":"function","name":"read","parameters":{"type":"object"}}]}`)
+			payload := []byte(`{"model":"grok-4.7","input":"controlled text","store":false,"stream":true,"reasoning":null,"max_output_tokens":100,"tools":[{"type":"custom","name":"exec","format":{"type":"text"}},{"type":"function","name":"read","parameters":{"type":"object"}}]}`)
 			call := func(route GatewayNativeRoute, payload []byte) (*httptest.ResponseRecorder, bool, error, *GatewayNativeLifetime, GatewayNativeUsage) {
 				timeout := time.Second
 				if mode == "deadline" {
@@ -189,7 +190,7 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 				_, entered, err := svc.ForwardGatewayRoute(ctx, c, route, payload)
 				return rec, entered, err, life, usage
 			}
-			for _, bad := range []string{strings.Replace(string(payload), `"controlled text"`, `[{"role":"user","content":[{"type":"input_image","image_url":"https://forbidden.invalid"}]}]`, 1), strings.Replace(string(payload), `"custom"`, `"web_search"`, 1)} {
+			for _, bad := range []string{strings.Replace(string(payload), `"controlled text"`, `[{"role":"user","content":[{"type":"input_image","image_url":"https://forbidden.invalid"}]}]`, 1), strings.Replace(string(payload), `"custom"`, `"web_search"`, 1), strings.Replace(string(payload), `"reasoning":null`, `"reasoning":{"effort":"high"}`, 1), strings.Replace(string(payload), `"reasoning":null`, `"reasoning":{"effort":"xhigh"}`, 1)} {
 				_, entered, err, _, _ := call(route, []byte(bad))
 				require.Error(t, err)
 				require.False(t, entered)
@@ -232,6 +233,8 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 			require.EqualValues(t, 3, *usage.OutputTokens)
 			var second map[string]any
 			require.NoError(t, json.Unmarshal(payload, &second))
+			second["service_tier"] = "default"
+			delete(second, "reasoning")
 			second["input"] = []any{map[string]any{"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": "echo preserved"}, map[string]any{"type": "custom_tool_call_output", "call_id": "c1", "output": "preserved result"}, map[string]any{"type": "function_call", "call_id": "c2", "name": "read", "arguments": "{}"}, map[string]any{"type": "function_call_output", "call_id": "c2", "output": "read result"}}
 			payload, err = json.Marshal(second)
 			require.NoError(t, err)

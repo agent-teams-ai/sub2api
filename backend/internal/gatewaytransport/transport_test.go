@@ -187,7 +187,17 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			require.Equal(t, paths[r.Host], r.URL.Path)
 			require.Equal(t, models[r.Host], payload["model"])
 			require.Equal(t, float64(40), payload["max_output_tokens"])
-			require.Equal(t, "default", payload["service_tier"])
+			if _, firstTurn := payload["input"].(string); firstTurn {
+				require.NotContains(t, payload, "service_tier")
+				require.NotContains(t, payload, "reasoning")
+				encodedText, err := json.Marshal(payload["text"])
+				require.NoError(t, err)
+				require.JSONEq(t, `{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}`, string(encodedText))
+				require.Equal(t, "33333333-3333-4333-8333-333333333333", payload["prompt_cache_key"])
+				require.Equal(t, map[string]any{"x-codex-installation-id": "44444444-4444-4444-8444-444444444444"}, payload["client_metadata"])
+			} else {
+				require.Equal(t, "default", payload["service_tier"])
+			}
 			tools, ok := payload["tools"].([]any)
 			require.True(t, ok)
 			require.NotEmpty(t, tools)
@@ -260,6 +270,9 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			input.Admission.AccountRef = fmt.Sprintf("profile-account-%d", i)
 		}
 		input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"preserved","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, profile.Model))
+		if i >= 2 {
+			input.Payload = json.RawMessage(strings.Replace(string(input.Payload), `,"service_tier":"default"`, `,"reasoning":null,"text":{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}},"prompt_cache_key":"33333333-3333-4333-8333-333333333333","client_metadata":{"x-codex-installation-id":"44444444-4444-4444-8444-444444444444"}`, 1))
+		}
 		scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "fixture-owner", Account: input.Admission.AccountRef, Generation: input.Descriptor.Generation, Purpose: service.GatewayCredentialPurpose}
 		envelope, err := custody.Seal(scope, fixtureProviderKey)
 		require.NoError(t, err)

@@ -36,6 +36,9 @@ func TestNEWTESTOriginalIntegerAndDecodedEnvelopeNames(t *testing.T) {
 
 func TestNEWTESTPayloadCapsAndOpaqueToolBytes(t *testing.T) {
 	base := `{"model":"NEWTESTmodel","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"NEWTEST","input":{"Store":true,"max_output_tokens":1.5}}]}`
+	if _, err := qualifyPayload([]byte(strings.Replace(base, `,"service_tier":"default"`, "", 1)), "NEWTESTmodel", 100, 200); err == nil {
+		t.Fatal("legacy profile accepted an omitted required tier")
+	}
 	out, err := qualifyPayload([]byte(base), "NEWTESTmodel", 100, 200)
 	if err != nil || !bytes.Contains(out, []byte(`"max_output_tokens":100`)) || !bytes.Contains(out, []byte(`"input":{"Store":true,"max_output_tokens":1.5}`)) {
 		t.Fatal("cap/tool bytes changed", err)
