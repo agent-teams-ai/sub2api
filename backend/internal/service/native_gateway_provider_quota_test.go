@@ -124,6 +124,12 @@ func TestGatewayProviderQuotaGrokBillingAndPassiveHeaders(t *testing.T) {
 	require.Equal(t, "monthly_billing_cycle", snapshot.Windows[1].Period.Kind)
 	require.Equal(t, "unknown", snapshot.Windows[1].Unit)
 	require.Equal(t, 50.0, *snapshot.Windows[1].UsedPercent)
+	uppercase, err := NormalizeGatewayProviderQuota("grok", []byte(`{"config":{"currentPeriod":{"type":"WEEKLY","start":"2026-07-09T03:25:00Z","end":"2026-07-16T03:25:00Z"},"creditUsagePercent":2.0,"productUsage":[{"product":"Api","usagePercent":2.0}]}}`), observed)
+	require.NoError(t, err)
+	require.Len(t, uppercase.Windows, 1)
+	require.Equal(t, "weekly", uppercase.Windows[0].ID)
+	require.Equal(t, 2.0, *uppercase.Windows[0].UsedPercent)
+	require.Equal(t, "2026-07-16T03:25:00Z", *uppercase.Windows[0].ResetAt)
 	require.Empty(t, CaptureGatewayGrokRateLimits(nil, observed).Windows)
 	headers := http.Header{}
 	headers.Set("x-ratelimit-limit-requests", "100")

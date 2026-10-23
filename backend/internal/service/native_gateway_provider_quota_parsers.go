@@ -156,7 +156,7 @@ func gatewayGrokBillingQuota(root gjson.Result, observed time.Time) ([]GatewayAc
 		return nil, false
 	}
 	var windows []GatewayAccountLimitWindowV2
-	if config.Get("currentPeriod.type").String() == "weekly" {
+	if strings.EqualFold(strings.TrimSpace(config.Get("currentPeriod.type").String()), "weekly") {
 		w := quotaWindow("grok", "weekly", "credits", observed)
 		w.UsedPercent = quotaNumber(config.Get("creditUsagePercent"))
 		w.ResetAt = quotaReset(config.Get("currentPeriod.end"))
