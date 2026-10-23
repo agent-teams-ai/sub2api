@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/google/uuid"
@@ -204,25 +205,8 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 			}
 		}
 	}
-	if raw := fields["tools"]; raw != nil {
-		var tools []json.RawMessage
-		if json.Unmarshal(raw, &tools) != nil || len(tools) > 128 {
-			return deny()
-		}
-		for _, raw := range tools {
-			tool, valid := gatewayClaudeObject(raw, "type", "name", "description", "parameters", "strict", "format")
-			var kind, name string
-			if !valid || json.Unmarshal(tool["type"], &kind) != nil || (kind != "function" && kind != "custom") || json.Unmarshal(tool["name"], &name) != nil || name == "" || len(name) > 128 {
-				return deny()
-			}
-			if kind == "function" {
-				if _, valid := gatewayNativeCanonicalObject(tool["parameters"]); !valid || tool["format"] != nil {
-					return deny()
-				}
-			} else if tool["parameters"] != nil || tool["strict"] != nil {
-				return deny()
-			}
-		}
+	if raw := fields["tools"]; raw != nil && !gatewayNativeProviderTools(raw) {
+		return deny()
 	}
 	if raw := fields["tool_choice"]; raw != nil {
 		var choice string
@@ -231,9 +215,12 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 				return deny()
 			}
 		} else {
-			choice, valid := gatewayClaudeObject(raw, "type", "name")
+			choice, valid := gatewayClaudeObject(raw, "type", "name", "namespace")
 			var kind, name string
 			if !valid || json.Unmarshal(choice["type"], &kind) != nil || (kind != "function" && kind != "custom") || json.Unmarshal(choice["name"], &name) != nil || name == "" {
+				return deny()
+			}
+			if namespace := choice["namespace"]; namespace != nil && (kind != "function" || !gatewayNativeProviderToolName(namespace)) {
 				return deny()
 			}
 		}
@@ -242,6 +229,9 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	// which drops unsupported tools/modalities and owns retry policy.
 	wire, mapping, err := adaptResponsesClientToolsForFunctionUpstream(body, "qualified provider")
 	if err != nil || int64(len(wire)) > requestBytes {
+		return deny()
+	}
+	if !gatewayNativeProviderNamespaceReferences(fields["input"], fields["tool_choice"], mapping) {
 		return deny()
 	}
 	return wire, mapping, nil
@@ -257,7 +247,7 @@ func gatewayNativeProviderTextInput(raw []byte) bool {
 		return false
 	}
 	for _, raw := range items {
-		fields, ok := gatewayNativeCanonicalObject(raw, "type", "role", "content", "input", "output", "name", "call_id")
+		fields, ok := gatewayNativeCanonicalObject(raw, "type", "role", "content", "input", "output", "name", "call_id", "namespace")
 		if !ok {
 			return false
 		}
@@ -286,8 +276,11 @@ func gatewayNativeProviderTextInput(raw []byte) bool {
 				}
 			}
 		case "function_call", "custom_tool_call":
-			fields, ok = gatewayClaudeObject(raw, "type", "id", "status", "name", "call_id", "arguments", "input")
+			fields, ok = gatewayClaudeObject(raw, "type", "id", "status", "name", "call_id", "arguments", "input", "namespace")
 			if !ok || !gatewayNativeProviderString(fields["call_id"]) || !gatewayNativeProviderString(fields["name"]) {
+				return false
+			}
+			if namespace := fields["namespace"]; namespace != nil && (kind != "function_call" || !gatewayNativeProviderToolName(namespace)) {
 				return false
 			}
 			if kind == "function_call" {
@@ -344,4 +337,132 @@ func gatewayNativeProviderUUID(raw []byte) bool {
 	}
 	parsed, err := uuid.Parse(value)
 	return err == nil && parsed.String() == value
+}
+
+// One explicit namespace level can contain only function children. The existing
+// pure codec preserves their namespace identities and opaque schemas. It does
+// not preserve custom children, so they are rejected instead of silently lost.
+func gatewayNativeProviderTools(raw []byte) bool {
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil || len(tools) > 128 {
+		return false
+	}
+	leaves := 0
+	namespaces := map[string]bool{}
+	for _, raw := range tools {
+		kindFields, ok := GatewayNativePayloadFields(raw, "type")
+		var kind string
+		if !ok || json.Unmarshal(kindFields["type"], &kind) != nil {
+			return false
+		}
+		if kind != "namespace" {
+			if !gatewayNativeProviderLeafTool(raw) {
+				return false
+			}
+			leaves++
+			if leaves > 128 {
+				return false
+			}
+			continue
+		}
+		namespace, ok := gatewayClaudeObject(raw, "type", "name", "description", "tools")
+		var name, description string
+		if !ok || !gatewayNativeProviderToolName(namespace["name"]) || json.Unmarshal(namespace["name"], &name) != nil || namespaces[name] {
+			return false
+		}
+		namespaces[name] = true
+		if raw := namespace["description"]; raw != nil && json.Unmarshal(raw, &description) != nil {
+			return false
+		}
+		var children []json.RawMessage
+		if json.Unmarshal(namespace["tools"], &children) != nil || len(children) == 0 || len(children) > 128 {
+			return false
+		}
+		childNames := map[string]bool{}
+		for _, raw := range children {
+			child, ok := GatewayNativePayloadFields(raw, "type", "name")
+			var childKind, childName string
+			if !ok || json.Unmarshal(child["type"], &childKind) != nil || childKind != "function" || !gatewayNativeProviderLeafTool(raw) || json.Unmarshal(child["name"], &childName) != nil || childNames[childName] {
+				return false
+			}
+			childNames[childName] = true
+			leaves++
+			if leaves > 128 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func gatewayNativeProviderLeafTool(raw []byte) bool {
+	tool, valid := gatewayClaudeObject(raw, "type", "name", "description", "parameters", "strict", "format")
+	var kind, description string
+	if !valid || json.Unmarshal(tool["type"], &kind) != nil || !gatewayNativeProviderToolName(tool["name"]) {
+		return false
+	}
+	if raw := tool["description"]; raw != nil && json.Unmarshal(raw, &description) != nil {
+		return false
+	}
+	switch kind {
+	case "function":
+		if _, valid := gatewayNativeCanonicalObject(tool["parameters"]); !valid || tool["format"] != nil {
+			return false
+		}
+		if raw := tool["strict"]; raw != nil {
+			var strict bool
+			if json.Unmarshal(raw, &strict) != nil {
+				return false
+			}
+		}
+		return true
+	case "custom":
+		return tool["parameters"] == nil && tool["strict"] == nil
+	}
+	return false
+}
+
+func gatewayNativeProviderToolName(raw []byte) bool {
+	var name string
+	return json.Unmarshal(raw, &name) == nil && name != "" && len(name) <= 128 && strings.TrimSpace(name) == name
+}
+
+// A namespace history/choice reference must name a declared function. Otherwise
+// the pure codec would leave it unflattened and change the qualified protocol.
+func gatewayNativeProviderNamespaceReferences(input, choice []byte, mapping apicompat.ResponsesClientToolMapping) bool {
+	reference := func(raw []byte) bool {
+		fields, ok := GatewayNativePayloadFields(raw, "namespace", "name", "type")
+		if !ok {
+			return false
+		}
+		if fields["namespace"] == nil {
+			return true
+		}
+		var namespace, name string
+		if json.Unmarshal(fields["namespace"], &namespace) != nil || json.Unmarshal(fields["name"], &name) != nil {
+			return false
+		}
+		for _, entry := range mapping.NamespaceTools {
+			if entry.Namespace == namespace && entry.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	var text string
+	if json.Unmarshal(input, &text) != nil {
+		var items []json.RawMessage
+		if json.Unmarshal(input, &items) != nil {
+			return false
+		}
+		for _, item := range items {
+			if !reference(item) {
+				return false
+			}
+		}
+	}
+	if len(choice) > 0 && json.Unmarshal(choice, &text) != nil && !reference(choice) {
+		return false
+	}
+	return true
 }

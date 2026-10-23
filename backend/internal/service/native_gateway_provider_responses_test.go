@@ -3,11 +3,14 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // An omitted optional tier must reach the exact provider without forcing a
@@ -167,4 +170,117 @@ func TestGatewayProviderResponsesCodexOutputSchema(t *testing.T) {
 			require.ErrorIs(t, ValidateGatewayNativeProviderResponsesBounded(tuple.profile, payload(fmt.Sprintf(`{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":%s}`, schema)), 100), ErrGatewayNativeIdentity)
 		})
 	}
+}
+
+// The captured CLI groups five ordinary functions in one namespace. The source
+// codec must flatten declarations/choice and restore the namespace on the real
+// call lifecycle; the next caller turn must lower that history losslessly.
+func TestGatewayProviderResponsesFunctionNamespaceRoundTrip(t *testing.T) {
+	for _, tuple := range []struct{ profile, model string }{
+		{GatewayKimiCodeResponsesProfile, GatewayKimiCodeResponsesModel},
+		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
+		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
+		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+	} {
+		t.Run(tuple.profile, func(t *testing.T) {
+			schema := map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string", "description": "preserve <>& schema"}}, "additionalProperties": false}
+			children := []any{}
+			for _, name := range []string{"list", "read", "lookup", "search", "inspect"} {
+				children = append(children, map[string]any{"type": "function", "name": name, "description": "preserve " + name, "parameters": schema, "strict": true})
+			}
+			body := map[string]any{"model": tuple.model, "input": "text", "stream": true, "store": false, "max_output_tokens": 100, "tools": []any{map[string]any{"type": "namespace", "name": "functions", "description": "five client functions", "tools": children}, map[string]any{"type": "custom", "name": "apply_patch", "format": map[string]any{"type": "text"}}}, "tool_choice": map[string]any{"type": "function", "name": "read", "namespace": "functions"}}
+			raw, err := json.Marshal(body)
+			require.NoError(t, err)
+			wire, mapping, err := gatewayNativePrepareProviderResponses(tuple.profile, raw, 32768)
+			require.NoError(t, err)
+			require.Len(t, mapping.NamespaceTools, 5)
+			require.True(t, mapping.CustomTools["apply_patch"])
+			require.Equal(t, "functions__read", gjson.GetBytes(wire, "tool_choice.name").String())
+			require.False(t, gjson.GetBytes(wire, "tool_choice.namespace").Exists())
+			var prepared map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(wire, &prepared))
+			var tools []map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(prepared["tools"], &tools))
+			require.Len(t, tools, 6)
+			require.JSONEq(t, `"functions__read"`, string(tools[1]["name"]))
+			schemaBytes, err := json.Marshal(schema)
+			require.NoError(t, err)
+			require.JSONEq(t, string(schemaBytes), string(tools[1]["parameters"]))
+			require.Equal(t, "true", string(tools[1]["strict"]))
+			restorer := apicompat.NewResponsesClientToolStreamRestorer(mapping)
+			events, _, err := restorer.RestoreEvent([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"item-read","call_id":"call-read","name":"functions__read","arguments":"{\"path\":\"source.txt\"}","status":"completed"}}`))
+			require.NoError(t, err)
+			require.Len(t, events, 1)
+			require.Equal(t, "read", gjson.GetBytes(events[0], "item.name").String())
+			require.Equal(t, "functions", gjson.GetBytes(events[0], "item.namespace").String())
+			var event struct {
+				Item map[string]any `json:"item"`
+			}
+			require.NoError(t, json.Unmarshal(events[0], &event))
+			body["input"] = []any{event.Item, map[string]any{"type": "function_call_output", "call_id": "call-read", "output": "file contents"}}
+			raw, err = json.Marshal(body)
+			require.NoError(t, err)
+			wire, _, err = gatewayNativePrepareProviderResponses(tuple.profile, raw, 32768)
+			require.NoError(t, err)
+			require.Equal(t, "functions__read", gjson.GetBytes(wire, "input.0.name").String())
+			require.False(t, gjson.GetBytes(wire, "input.0.namespace").Exists())
+			require.Equal(t, `{"path":"source.txt"}`, gjson.GetBytes(wire, "input.0.arguments").String())
+			require.Equal(t, "file contents", gjson.GetBytes(wire, "input.1.output").String())
+		})
+	}
+}
+
+func TestGatewayProviderResponsesNamespaceGuards(t *testing.T) {
+	leaf := func(name string) map[string]any {
+		return map[string]any{"type": "function", "name": name, "parameters": map[string]any{"type": "object"}}
+	}
+	namespace := func(name string, children ...any) map[string]any {
+		return map[string]any{"type": "namespace", "name": name, "description": "client functions", "tools": children}
+	}
+	payload := func(tools []any, input any, choice any) []byte {
+		body := map[string]any{"model": GatewayKimiCodeResponsesModel, "input": input, "stream": true, "store": false, "max_output_tokens": 100, "tools": tools}
+		if choice != nil {
+			body["tool_choice"] = choice
+		}
+		raw, err := json.Marshal(body)
+		require.NoError(t, err)
+		return raw
+	}
+	many := []any{}
+	for i := 0; i < 129; i++ {
+		many = append(many, leaf(fmt.Sprintf("function%d", i)))
+	}
+	for _, tools := range [][]any{
+		{namespace("functions")},
+		{namespace("functions", many...)},
+		{leaf("direct"), namespace("functions", many[:128]...)},
+		{namespace("functions", map[string]any{"type": "custom", "name": "apply_patch", "format": map[string]any{"type": "text"}})},
+		{namespace("functions", namespace("nested", leaf("read")))},
+		{namespace("functions", map[string]any{"type": "web_search"})},
+		{namespace("functions", leaf("read"), leaf("read"))},
+		{namespace("functions", leaf("read")), namespace("functions", leaf("write"))},
+		{leaf("functions__read"), namespace("functions", leaf("read"))},
+		{namespace("a__b", leaf("c")), namespace("a", leaf("b__c"))},
+		{namespace(" functions ", leaf("read"))},
+		{namespace(strings.Repeat("n", 129), leaf("read"))},
+		{namespace("functions", leaf(strings.Repeat("n", 129)))},
+		{map[string]any{"type": "namespace", "name": "functions", "description": 123, "tools": []any{leaf("read")}}},
+		{map[string]any{"type": "namespace", "name": "functions", "tools": "invalid"}},
+		{map[string]any{"type": "namespace", "name": "functions", "tools": []any{leaf("read")}, "children": []any{leaf("hidden")}}},
+		{namespace("functions", map[string]any{"type": "function", "name": "read", "parameters": []any{}})},
+		{namespace("functions", map[string]any{"type": "function", "name": "read", "parameters": map[string]any{}, "strict": "true"})},
+		{namespace("functions", leaf("read")), map[string]any{"type": "web_search"}},
+	} {
+		require.ErrorIs(t, ValidateGatewayNativeProviderResponsesBounded(GatewayKimiCodeResponsesProfile, payload(tools, "text", nil), 262144), ErrGatewayNativeIdentity)
+	}
+	tools := []any{namespace("functions", leaf("read"))}
+	for _, input := range []any{
+		[]any{map[string]any{"type": "function_call", "name": "missing", "namespace": "functions", "call_id": "c", "arguments": "{}"}},
+		[]any{map[string]any{"type": "function_call", "name": "read", "namespace": "missing", "call_id": "c", "arguments": "{}"}},
+		[]any{map[string]any{"type": "function_call", "name": "read", "namespace": 123, "call_id": "c", "arguments": "{}"}},
+		[]any{map[string]any{"type": "custom_tool_call", "name": "read", "namespace": "functions", "call_id": "c", "input": "text"}},
+	} {
+		require.ErrorIs(t, ValidateGatewayNativeProviderResponsesBounded(GatewayKimiCodeResponsesProfile, payload(tools, input, nil), 32768), ErrGatewayNativeIdentity)
+	}
+	require.ErrorIs(t, ValidateGatewayNativeProviderResponsesBounded(GatewayKimiCodeResponsesProfile, payload(tools, "text", map[string]any{"type": "function", "name": "missing", "namespace": "functions"}), 32768), ErrGatewayNativeIdentity)
 }
