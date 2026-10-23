@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
@@ -32,6 +33,9 @@ import (
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile {
+		return GatewayGrokOAuthBaseURL + "/v1/responses", nil
+	}
 	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
 		return GatewayCodexOAuthBaseURL + "/responses", nil
 	}
@@ -499,6 +503,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if GatewayNativeCodingPlanProfileIDValid(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		request.Header.Set("User-Agent", "ReviewRouter/native-account-gateway")
+	}
 	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
 		request.Header.Set("x-openai-internal-codex-responses-lite", "true")
 	}
@@ -572,6 +579,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// Passive quota evidence from this already admitted response only.
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusTooManyRequests {
 		s.captureGatewayAccountLimits(ctx, resp.Header)
+		captureGatewayGrokPassiveLimits(ctx, resp.Header)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
@@ -660,6 +668,12 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// Include original LF/CRLF bytes in each token for bounds and forwarding.
 	scanner.Split(gatewayNativeRawSSELine)
 	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
+	var toolRestorer *apicompat.ResponsesClientToolStreamRestorer
+	if gatewayNativeProviderProfile(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		if mapping, ok := grokResponsesClientToolMapping(c); ok {
+			toolRestorer = apicompat.NewResponsesClientToolStreamRestorer(mapping)
+		}
+	}
 	var event bytes.Buffer
 	var data []string
 	total := 0
@@ -694,7 +708,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if !utf8.Valid(event.Bytes()) {
 			return nil, fail(gatewayNativeFailureFrame)
 		}
+		if a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile && gatewayNativeGrokPingFrame(event.Bytes()) {
+			event.Reset()
+			data = nil
+			continue
+		}
 		completed := false
+		var restoredFrames []byte
 		if len(data) > 0 {
 			// SSE joins all data fields in an event before JSON interpretation.
 			payload := []byte(strings.Join(data, "\n"))
@@ -728,6 +748,18 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				completed = true
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
+			if toolRestorer != nil {
+				payloads, changed, restoreErr := toolRestorer.RestoreEvent(payload)
+				if restoreErr != nil {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				if changed {
+					restoredFrames, restoreErr = gatewayNativeGrokRestoredFrames(event.Bytes(), payloads)
+					if restoreErr != nil {
+						return nil, fail(gatewayNativeFailureFrameLimit)
+					}
+				}
+			}
 			if awaitingCodexFrame {
 				inProgressFrame := (kind == "response.created" || kind == "response.in_progress") && status == "in_progress"
 				if !inProgressFrame && !completed {
@@ -743,7 +775,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			// same event buffer remains bounded; these bytes alone prove nothing.
 			continue
 		}
-		if n, err := c.Writer.Write(event.Bytes()); err != nil || n != event.Len() {
+		forwardFrame := event.Bytes()
+		if restoredFrames != nil {
+			forwardFrame = restoredFrames
+		}
+		if n, err := c.Writer.Write(forwardFrame); err != nil || n != len(forwardFrame) {
 			return nil, fail(gatewayNativeFailureWrite)
 		}
 		if gatewayNativeFlush(c.Writer) != nil {

@@ -270,7 +270,7 @@ func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh inte
 		return service.ErrGatewayNativeIdentity
 	}
 	path := "/private/native/v1/oauth"
-	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+	if len(prefix) == 1 && (prefix[0] == "/private/native/v1/claude/oauth" || prefix[0] == "/private/native/v1/grok/oauth") {
 		path = prefix[0]
 	} else if len(prefix) > 0 {
 		return service.ErrGatewayNativeIdentity
@@ -313,7 +313,7 @@ func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect inte
 		return service.ErrGatewayNativeIdentity
 	}
 	path := "/private/native/v1/oauth"
-	if len(prefix) == 1 && prefix[0] == "/private/native/v1/claude/oauth" {
+	if len(prefix) == 1 && (prefix[0] == "/private/native/v1/claude/oauth" || prefix[0] == "/private/native/v1/grok/oauth") {
 		path = prefix[0]
 	} else if len(prefix) > 0 {
 		return service.ErrGatewayNativeIdentity

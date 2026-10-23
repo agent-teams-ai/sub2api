@@ -102,6 +102,12 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
 	}
+	if service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) || profile.Profile == service.GatewayGrokOAuthResponsesProfile {
+		if service.ValidateGatewayNativeProviderResponsesBounded(profile.Profile, payload, input.Admission.Limits.RequestBytes) != nil {
+			http.Error(raw, "private native transport denied", http.StatusBadRequest)
+			return
+		}
+	}
 	deadline, _ := parseInstant(input.Admission.ExpiresAt)
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	// The original writer implements deadlines even when the Gin writer does not
@@ -150,6 +156,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	})
 	ctx = service.WithGatewayNativeLifetime(ctx, e.life)
 	ctx = service.WithGatewayNativeProviderReadIdle(ctx, h.cfg.ProviderReadIdle)
+	ctx = service.WithGatewayProviderLimitsWriter(ctx, h.cfg.ProviderLimits)
 	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
 		ctx, err = h.cfg.OAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
 		if err != nil {
@@ -163,6 +170,19 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	if profile.Profile == service.GatewayClaudeOAuthMessagesProfile {
 		ctx, err = h.cfg.ClaudeOAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
 		if err != nil {
+			h.finishNoEntry(e)
+			h.seal(e)
+			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
+			writeReceipt(raw, h.receipt(peer.ConsumerID, e))
+			return
+		}
+	}
+	if profile.Profile == service.GatewayGrokOAuthResponsesProfile {
+		scope, operation, resolveErr := h.cfg.GrokOAuth.ResolveApproved(ctx, input.Descriptor, input.Admission.AccountRef)
+		if resolveErr == nil {
+			ctx, resolveErr = service.WithGatewayNativeGrokDispatch(ctx, h.cfg.GrokOAuth, scope, operation, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
+		}
+		if resolveErr != nil {
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))

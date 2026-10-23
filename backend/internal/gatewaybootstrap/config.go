@@ -34,16 +34,18 @@ var integer = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 // Config is decoded only from inherited FD 6. It has no CLI/env representation,
 // provider credential, migration option, discovery or insecure-TLS switch.
 type Config struct {
-	ListenAddress string          `json:"listenAddress"`
-	PostgresDSN   string          `json:"postgresDSN"`
-	Authority     AuthorityConfig `json:"authority"`
-	Custody       CustodyConfig   `json:"custody"`
-	Peers         []ControlPeer   `json:"peers"`
-	Profile       ProfileConfig   `json:"profile"`
-	MaxEntries    int64           `json:"maxEntries"`
-	OAuth         *OAuthConfig    `json:"oauth,omitempty"`
-	OpenRouter    *ProfileConfig  `json:"openRouter,omitempty"`
-	Claude        *ProfileConfig  `json:"claude,omitempty"`
+	ListenAddress string             `json:"listenAddress"`
+	PostgresDSN   string             `json:"postgresDSN"`
+	Authority     AuthorityConfig    `json:"authority"`
+	Custody       CustodyConfig      `json:"custody"`
+	Peers         []ControlPeer      `json:"peers"`
+	Profile       ProfileConfig      `json:"profile"`
+	MaxEntries    int64              `json:"maxEntries"`
+	OAuth         *OAuthConfig       `json:"oauth,omitempty"`
+	OpenRouter    *ProfileConfig     `json:"openRouter,omitempty"`
+	Claude        *ProfileConfig     `json:"claude,omitempty"`
+	CodingPlans   []CodingPlanConfig `json:"codingPlans,omitempty"`
+	Grok          *GrokConfig        `json:"grok,omitempty"`
 }
 
 // The optional OAuth key is separate from custody, inherited in protected FD6,
@@ -52,6 +54,18 @@ type Config struct {
 type OAuthConfig struct {
 	IntentKey string        `json:"intentKey"`
 	Profile   ProfileConfig `json:"profile"`
+}
+
+// New profiles are explicit deployment qualifications, never enabled by defaults.
+type CodingPlanConfig struct {
+	ProfileID string        `json:"profileId"`
+	Profile   ProfileConfig `json:"profile"`
+}
+type GrokConfig struct {
+	Profile             ProfileConfig `json:"profile"`
+	ClientID            string        `json:"clientId"`
+	RedirectURI         string        `json:"redirectURI"`
+	DeploymentQualified bool          `json:"deploymentQualified"`
 }
 
 type AuthorityConfig struct {
@@ -230,6 +244,19 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 	if c.Claude != nil && (!c.Claude.valid() || c.Claude.BaseURL != service.GatewayClaudeOAuthBaseURL || c.Claude.Model != service.GatewayClaudeOAuthModel || c.Claude.Tokens > 65536 || c.Claude.ProviderTokenUpperBound > 65536) {
 		return nil, ErrDenied
 	}
+	if len(c.CodingPlans) > 3 {
+		return nil, ErrDenied
+	}
+	seenPlans := map[string]bool{}
+	for _, candidate := range c.CodingPlans {
+		if seenPlans[candidate.ProfileID] || !candidate.Profile.valid() || !service.GatewayNativeCodingPlanProfileValid(candidate.ProfileID, candidate.Profile.BaseURL, candidate.Profile.Model) {
+			return nil, ErrDenied
+		}
+		seenPlans[candidate.ProfileID] = true
+	}
+	if c.Grok != nil && (!c.Grok.Profile.valid() || c.Grok.Profile.BaseURL != service.GatewayGrokOAuthBaseURL || c.Grok.Profile.Model != service.GatewayGrokOAuthModel || !service.GatewayNativeGrokQualificationValid(service.GatewayNativeGrokOAuthQualification{ClientID: c.Grok.ClientID, RedirectURI: c.Grok.RedirectURI, DeploymentQualified: c.Grok.DeploymentQualified})) {
+		return nil, ErrDenied
+	}
 	if c.OAuth != nil {
 		codex := c.OAuth.Profile
 		key, keyErr := base64.StdEncoding.Strict().DecodeString(c.OAuth.IntentKey)
@@ -308,5 +335,23 @@ func (c Config) claudeProfile() *gatewaytransport.QualifiedProfile {
 	}
 	p := c.Claude.qualified()
 	p.Profile = service.GatewayClaudeOAuthMessagesProfile
+	return &p
+}
+
+func (c Config) codingPlanProfiles() []gatewaytransport.QualifiedProfile {
+	var out []gatewaytransport.QualifiedProfile
+	for _, candidate := range c.CodingPlans {
+		p := candidate.Profile.qualified()
+		p.Profile = candidate.ProfileID
+		out = append(out, p)
+	}
+	return out
+}
+func (c Config) grokProfile() *gatewaytransport.QualifiedProfile {
+	if c.Grok == nil {
+		return nil
+	}
+	p := c.Grok.Profile.qualified()
+	p.Profile = service.GatewayGrokOAuthResponsesProfile
 	return &p
 }

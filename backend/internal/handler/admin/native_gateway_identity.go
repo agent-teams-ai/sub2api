@@ -83,23 +83,22 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	admit func(*gin.Context, service.GatewayNativeRoute) error,
 	settle func(*gin.Context, bool, error), custody *service.GatewayNativeCredentialCustody, openRouter ...GatewayNativeProfile) {
 	if group == nil || admin == nil || gateway == nil || authorize == nil || admit == nil || settle == nil || custody == nil ||
-		!gatewayNativeProfileValid(profile) || len(openRouter) > 1 || len(openRouter) == 1 &&
-		(openRouter[0].ID != service.GatewayOpenRouterResponsesProfile || profile.ID == openRouter[0].ID || !gatewayNativeProfileValid(openRouter[0])) {
+		!gatewayNativeProfileValid(profile) || len(openRouter) > 4 {
 		panic("invalid private native gateway composition")
 	}
-	// Capture at most one optional preset. No request owns a URL/model or catalog.
-	var second GatewayNativeProfile
-	if len(openRouter) == 1 {
-		second = openRouter[0]
+	// Every additional profile is a closed, separately qualified server preset.
+	// The variadic API preserves the existing OpenRouter composition unchanged.
+	profiles := map[string]GatewayNativeProfile{profile.ID: profile}
+	for _, candidate := range openRouter {
+		if _, exists := profiles[candidate.ID]; exists || !gatewayNativeProfileValid(candidate) ||
+			(candidate.ID != service.GatewayOpenRouterResponsesProfile && !service.GatewayNativeCodingPlanProfileIDValid(candidate.ID)) {
+			panic("invalid private native gateway composition")
+		}
+		profiles[candidate.ID] = candidate
 	}
 	selectProfile := func(id string) (GatewayNativeProfile, bool) {
-		if id == profile.ID {
-			return profile, true
-		}
-		if second.ID != "" && id == second.ID {
-			return second, true
-		}
-		return GatewayNativeProfile{}, false
+		selected, ok := profiles[id]
+		return selected, ok
 	}
 	validDescriptor := func(d service.GatewayNativeRoute) bool {
 		selected, ok := selectProfile(d.Profile)
