@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,7 +29,7 @@ type GatewayProviderQuotaCollector struct{ client *http.Client }
 
 func NewGatewayProviderQuotaCollector(transport http.RoundTripper) *GatewayProviderQuotaCollector {
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16384, MaxConnsPerHost: 2, DisableKeepAlives: true}
 	}
 	return &GatewayProviderQuotaCollector{client: &http.Client{
 		Transport: transport, Timeout: 10 * time.Second,

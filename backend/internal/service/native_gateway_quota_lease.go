@@ -20,7 +20,7 @@ func (s *OpenAIGatewayService) WithGatewayNativeQuotaCredential(ctx context.Cont
 	defer release()
 	descriptor, err := GatewayNativeDescriptor(account)
 	actual, scopeErr := GatewayNativeCredentialScopeForAccount(account)
-	if err != nil || scopeErr != nil || actual != scope || !SameGatewayNativeDescriptor(descriptor, route) {
+	if err != nil || scopeErr != nil || actual != scope || !SameGatewayNativeDescriptor(descriptor, route) || validateGatewayNativeRoute(route, account) != nil {
 		return ErrGatewayNativeIdentity
 	}
 	id, nonce, sealed, err := gatewayNativeParseEnvelope(account.GetCredential("api_key"))
