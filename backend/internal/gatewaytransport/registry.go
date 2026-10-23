@@ -34,6 +34,8 @@ type Config struct {
 	Custody                                    *service.GatewayNativeCredentialCustody
 	OAuth                                      *service.GatewayNativeOAuthDispatch
 	ClaudeOAuth                                *service.GatewayNativeClaudeOAuth
+	GrokOAuth                                  *service.GatewayNativeGrokOAuth
+	ProviderLimits                             service.GatewayAccountLimitsRepositoryV2
 	Authorize                                  func(*http.Request) (Peer, error)
 	Enrollment                                 Enrollment
 	VerifyEnrollment                           func(context.Context, Enrollment) error
@@ -41,6 +43,8 @@ type Config struct {
 	OpenRouter                                 *QualifiedProfile
 	Codex                                      *QualifiedProfile
 	Claude                                     *QualifiedProfile
+	CodingPlans                                []QualifiedProfile
+	Grok                                       *QualifiedProfile
 	CallbackOrigin, CallbackCredential         string
 	VerifyDispatch                             func(context.Context, string, Proof, time.Time) error
 	AuthorizeCleanup                           func(context.Context, string, Proof, CleanupLease) error
@@ -249,6 +253,29 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		}
 		cfg.Claude = &claude
 	}
+	// Each optional leaf is closed and frozen before any asynchronous callback.
+	if len(cfg.CodingPlans) > 3 {
+		return nil, errDenied
+	}
+	plans := append([]QualifiedProfile(nil), cfg.CodingPlans...)
+	seen := map[string]bool{}
+	for _, plan := range plans {
+		if !service.GatewayNativeCodingPlanProfileValid(plan.Profile, plan.BaseURL, plan.Model) || seen[plan.Profile] || !providerProfileBoundsValid(plan) {
+			return nil, errDenied
+		}
+		seen[plan.Profile] = true
+	}
+	cfg.CodingPlans = plans
+	if (cfg.Grok == nil) != (cfg.GrokOAuth == nil) {
+		return nil, errDenied
+	}
+	if cfg.Grok != nil {
+		grok := *cfg.Grok
+		if grok.Profile != service.GatewayGrokOAuthResponsesProfile || grok.BaseURL != service.GatewayGrokOAuthBaseURL || grok.Model != service.GatewayGrokOAuthModel || !providerProfileBoundsValid(grok) {
+			return nil, errDenied
+		}
+		cfg.Grok = &grok
+	}
 	enrollmentCtx, stop := context.WithTimeout(ctx, cfg.CallbackTimeout)
 	defer stop()
 	if cfg.VerifyEnrollment(enrollmentCtx, cfg.Enrollment) != nil || enrollmentCtx.Err() != nil {
@@ -274,7 +301,27 @@ func (h *Handler) profile(id string) (QualifiedProfile, bool) {
 	if id == service.GatewayClaudeOAuthMessagesProfile && h.cfg.Claude != nil {
 		return *h.cfg.Claude, true
 	}
+	for _, plan := range h.cfg.CodingPlans {
+		if id == plan.Profile {
+			return plan, true
+		}
+	}
+	if h.cfg.Grok != nil && id == h.cfg.Grok.Profile {
+		return *h.cfg.Grok, true
+	}
 	return QualifiedProfile{}, false
+}
+
+func providerProfileBoundsValid(p QualifiedProfile) bool {
+	return identifier.MatchString(p.QualificationRef) && p.RequestBytes >= 1 && p.RequestBytes <= 4<<20 &&
+		p.OutputBytes >= 1 && p.OutputBytes <= 8<<20 && p.Tokens >= 1 && p.Tokens <= 10000000 &&
+		p.ProviderTokenUpperBound >= p.Tokens && p.ProviderTokenUpperBound <= 10000000
+}
+
+// CodingPlanProfiles returns a copy for private candidate routing, never a
+// runtime extension point. Unconfigured leaves are unavailable.
+func (h *Handler) CodingPlanProfiles() []QualifiedProfile {
+	return append([]QualifiedProfile(nil), h.cfg.CodingPlans...)
 }
 
 // Safe immutable configuration projection for the private candidate router.
