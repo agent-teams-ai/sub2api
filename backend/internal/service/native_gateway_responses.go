@@ -677,6 +677,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	var event bytes.Buffer
 	var data []string
 	total := 0
+	outputLimit := int64(gatewayNativeResponseLimit)
+	if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+		outputLimit = lifetime.outputBytes
+	}
+	var delivered int64
 	for scanner.Scan() {
 		raw := scanner.Bytes()
 		total += len(raw)
@@ -779,9 +784,15 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if restoredFrames != nil {
 			forwardFrame = restoredFrames
 		}
+		// The admitted output cap covers the emitted protocol, including events
+		// expanded by tool restoration, not only bytes read from the provider.
+		if int64(len(forwardFrame)) > outputLimit-delivered {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
 		if n, err := c.Writer.Write(forwardFrame); err != nil || n != len(forwardFrame) {
 			return nil, fail(gatewayNativeFailureWrite)
 		}
+		delivered += int64(len(forwardFrame))
 		if gatewayNativeFlush(c.Writer) != nil {
 			return nil, fail(gatewayNativeFailureFlush)
 		}

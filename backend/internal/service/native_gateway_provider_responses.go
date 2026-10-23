@@ -181,12 +181,9 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 			}
 		}
 	}
-	if profile != GatewayGrokOAuthResponsesProfile {
-		return body, empty, nil
-	}
 	// Use only the pure client-tool codec, never the ordinary Grok sanitizer
 	// which drops unsupported tools/modalities and owns retry policy.
-	wire, mapping, err := adaptGrokResponsesClientTools(body)
+	wire, mapping, err := adaptResponsesClientToolsForFunctionUpstream(body, "qualified provider")
 	if err != nil || int64(len(wire)) > requestBytes {
 		return deny()
 	}

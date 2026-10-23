@@ -60,7 +60,7 @@ func (r *grokPassiveLimitsStore) StoreGatewayAccountLimitsV2(ctx context.Context
 // Real fixed-origin HTTP transport, scoped AEAD custody and the existing
 // finite reader run together. This is protocol proof, not a live qualification.
 func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
-	for _, mode := range []string{"tools", "400", "422", "redirect", "idle", "deadline", "output-bound"} {
+	for _, mode := range []string{"tools", "400", "422", "redirect", "idle", "deadline", "output-bound", "restored-output-bound"} {
 		t.Run(mode, func(t *testing.T) {
 			_, _, base, scope := connectPureFixture(t)
 			route := GatewayNativeRoute{AccountID: 71, CreatedAt: time.Now().UTC().Truncate(time.Microsecond), Generation: scope.Generation, Profile: GatewayGrokOAuthResponsesProfile, BaseURL: GatewayGrokOAuthBaseURL, Model: GatewayGrokOAuthModel}
@@ -70,6 +70,7 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 			store.envelope, err = dispatch.seal(scope, gatewayGrokBundle{Kind: "grok-oauth/v1", Revision: 1, AccessToken: "fixture-access", RefreshToken: "fixture-refresh", Subject: store.physical.Subject, Team: store.physical.ProviderAccount, ExpiresAt: time.Now().Add(time.Hour), Nonce: strings.Repeat("n", 43), ClientID: "qualified-client"})
 			require.NoError(t, err)
 			limits := &grokPassiveLimitsStore{released: &store.releases}
+			restoredBoundWire := "data: " + `{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","id":"fc_bound","call_id":"c1","name":"exec","arguments":"{\"input\":\"echo preserved\"}"}]}}` + "\n\n"
 			var entries atomic.Int32
 			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				turn := entries.Add(1)
@@ -120,6 +121,10 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 					_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":%q}\n\n", strings.Repeat("x", 5000))
 					return
 				}
+				if mode == "restored-output-bound" {
+					_, _ = io.WriteString(w, restoredBoundWire)
+					return
+				}
 				// Vendor billing pings must never leak to strict Responses consumers.
 				_, _ = io.WriteString(w, "event: ping\ndata: {\"cost\":999}\n\n")
 				if turn == 1 {
@@ -156,7 +161,11 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 				}
 				ctx, cancel := context.WithTimeout(base, timeout)
 				defer cancel()
-				life, err := NewGatewayNativeLifetime(ctx, cancel, func() {}, 4096)
+				outputBytes := int64(4096)
+				if mode == "restored-output-bound" {
+					outputBytes = int64(len(restoredBoundWire))
+				}
+				life, err := NewGatewayNativeLifetime(ctx, cancel, func() {}, outputBytes)
 				require.NoError(t, err)
 				life.BindAccount(scope.Consumer, scope.Account, scope.Generation)
 				require.True(t, life.Admit(time.Now().Add(time.Second)))
@@ -200,6 +209,10 @@ func TestGatewayGrokFiniteHTTPToolsAndSingleEntry(t *testing.T) {
 			if mode != "tools" {
 				require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
 				require.False(t, life.Snapshot().Completed)
+				if mode == "restored-output-bound" {
+					require.LessOrEqual(t, rec.Body.Len(), len(restoredBoundWire))
+					require.NotContains(t, rec.Body.String(), "response.completed")
+				}
 				return
 			}
 			require.NoError(t, err)

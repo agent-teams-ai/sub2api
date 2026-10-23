@@ -188,6 +188,16 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			require.Equal(t, models[r.Host], payload["model"])
 			require.Equal(t, float64(40), payload["max_output_tokens"])
 			require.Equal(t, "default", payload["service_tier"])
+			tools, ok := payload["tools"].([]any)
+			require.True(t, ok)
+			require.NotEmpty(t, tools)
+			require.Equal(t, "function", tools[0].(map[string]any)["type"], "custom tools must use the qualified function upstream codec")
+			if input, ok := payload["input"].([]any); ok {
+				require.Equal(t, "function_call", input[0].(map[string]any)["type"])
+				require.Equal(t, "function_call_output", input[1].(map[string]any)["type"])
+				require.Equal(t, "preserved result", input[1].(map[string]any)["output"])
+			}
+
 		} else if r.Host == "openrouter.ai" {
 			require.Equal(t, "/api/v1/responses", r.URL.Path)
 			require.Equal(t, service.GatewayOpenRouterModel, payload["model"])
