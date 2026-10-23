@@ -452,6 +452,9 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	if token != "" {
 		// Issued here from the reservation, never copied from public headers.
 		req.Header.Set("X-Gateway-Reservation-Nonce", e.native.RequestNonce)
+		// Preserve Content-Encoding for strict refusal validation rather than
+		// allowing Transport's automatic gzip decode to erase that evidence.
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	// There is one POST, no redirect, no automatic retry and no caller URL.
 	resp, err := h.callback.Do(req)
@@ -460,7 +463,7 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	}
 	// Callback body cleanup is best effort; it does not attest provider closure.
 	defer func() { _ = resp.Body.Close() }()
-	if token != "" && resp.StatusCode == http.StatusServiceUnavailable && len(resp.Header.Values("Content-Type")) == 1 && len(resp.Header.Values("Content-Encoding")) == 0 && strings.Split(resp.Header.Get("Content-Type"), ";")[0] == "application/json" {
+	if token != "" && resp.StatusCode == http.StatusServiceUnavailable && len(resp.Header.Values("Content-Type")) == 1 && len(resp.Header.Values("Content-Encoding")) == 0 && resp.Header.Get("Content-Type") == "application/json" {
 		limit := min(h.cfg.CallbackBytes, 1024)
 		data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		var refusal struct {

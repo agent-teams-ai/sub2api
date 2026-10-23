@@ -4,6 +4,7 @@ package gatewaytransport
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 )
 
 func TestPublicPreworkRefusalIsExactNonceBoundAndNeverReplaysAmbiguousAdmission(t *testing.T) {
-	for _, kind := range []string{"qualified", "bare503", "wrongNonce", "wrongKind", "wrongClaim", "unknownField", "duplicate", "alias", "oversized", "wrongStatus", "wrongType", "duplicateType", "encoded", "committedLostReply"} {
+	for _, kind := range []string{"qualified", "bare503", "wrongNonce", "wrongKind", "wrongClaim", "unknownField", "duplicate", "alias", "oversized", "wrongStatus", "wrongType", "duplicateType", "parameterizedType", "encoded", "gzip", "committedLostReply"} {
 		t.Run(kind, func(t *testing.T) {
 			var original Request
 			var admits, entries, claims atomic.Int32
@@ -37,6 +38,7 @@ func TestPublicPreworkRefusalIsExactNonceBoundAndNeverReplaysAmbiguousAdmission(
 					require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
 					nonce := r.Header.Get("X-Gateway-Reservation-Nonce")
 					require.True(t, nonce == input.Native.RequestNonce)
+					require.Equal(t, "identity", r.Header.Get("Accept-Encoding"))
 					responseKind := kind
 					if useQualified.Load() {
 						responseKind = "qualified"
@@ -73,8 +75,17 @@ func TestPublicPreworkRefusalIsExactNonceBoundAndNeverReplaysAmbiguousAdmission(
 						w.Header().Set("Content-Type", "text/plain")
 					case "duplicateType":
 						w.Header().Add("Content-Type", "application/json")
+					case "parameterizedType":
+						w.Header().Set("Content-Type", "application/json; charset=utf-8")
 					case "encoded":
 						w.Header().Set("Content-Encoding", "identity")
+					case "gzip":
+						w.Header().Set("Content-Encoding", "gzip")
+						w.WriteHeader(status)
+						compressed := gzip.NewWriter(w)
+						_, _ = io.WriteString(compressed, body)
+						_ = compressed.Close()
+						return
 					}
 					w.WriteHeader(status)
 					_, _ = io.WriteString(w, body)
