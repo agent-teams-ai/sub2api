@@ -47,6 +47,7 @@ func TestCodingPlanGrokCleanupAuthorityExactTuple(t *testing.T) {
 	generation := "11111111-1111-4111-8111-111111111111"
 	route := service.GatewayNativeRoute{AccountID: 42, Generation: generation, CreatedAt: time.Date(2026, 10, 23, 1, 0, 0, 0, time.UTC), Profile: service.GatewayGrokOAuthResponsesProfile, BaseURL: service.GatewayGrokOAuthBaseURL, Model: service.GatewayGrokOAuthModel}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ownerRef": "owner", "leaseExpiresAt": time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano), "native": route})
 	}))
 	defer server.Close()

@@ -90,10 +90,10 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokConnect(ctx context.Context, 
 	if tx.QueryRowContext(ctx, `SELECT consumer=$3 AND owner_ref=$4 AND account_ref=$5 FROM gateway_grok_principal_claims WHERE subject_ref=$1 AND team_ref=$2 FOR UPDATE`, account, org, s.Consumer, s.Owner, s.Account).Scan(&owned) != nil || !owned {
 		return out, service.ErrGatewayNativeIdentity
 	}
-	var prior bool
-	if tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM gateway_grok_connect_intents c JOIN accounts a ON a.id=c.account_id WHERE c.consumer=$1 AND c.account_ref=$2 AND a.deleted_at IS NULL)`, s.Consumer, s.Account).Scan(&prior) != nil || prior {
-		return out, service.ErrGatewayNativeIdentity
-	}
+	// A reconnect seals a fresh generation before the facade switches its exact
+	// canonical binding and cleans up retained custody. Permanent principal
+	// ownership above remains authoritative; a live older birth is not a conflict.
+
 	extra, _ := json.Marshal(map[string]any{"gateway_grok_profile_v1": service.GatewayGrokOAuthResponsesProfile, "gateway_grok_generation_v1": s.Generation, "gateway_grok_scope_v1": s.Metadata()})
 	credentials, _ := json.Marshal(map[string]string{"oauth_bundle": in.Envelope})
 	var id int64

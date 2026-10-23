@@ -61,6 +61,7 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	custody, err := service.NewGatewayNativeCredentialCustody("grok-test", map[string][]byte{"grok-test": key})
 	require.NoError(t, err)
 	account, team := uuid.NewString(), uuid.NewString()
+	verifiedForeign := uuid.NewString()
 	signing, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	nonce := ""
@@ -75,7 +76,11 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 		}
 		if r.URL.String() == xai.ProtectedUserinfoURL {
 			require.Equal(t, "Bearer fixture-access-private", r.Header.Get("Authorization"))
-			body, _ := json.Marshal(map[string]string{"sub": account, "team_id": team})
+			subject := account
+			if mode.Load() == 3 {
+				subject = verifiedForeign
+			}
+			body, _ := json.Marshal(map[string]string{"sub": subject, "team_id": team})
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
 		}
 		exchanges.Add(1)
@@ -106,6 +111,9 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 		principal := account
 		if mode.Load() == 1 {
 			principal = uuid.NewString()
+		}
+		if mode.Load() == 3 {
+			principal = verifiedForeign
 		}
 		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"iss": xai.OAuthIssuer, "aud": "qualified-client", "sub": principal, "team_id": team, "nonce": nonce, "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix()})
 		token.Header["kid"] = "fixture"
@@ -277,6 +285,61 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	nextDescriptor, err := grok.Descriptor(ownerCtx, next, nextOp)
 	require.NoError(t, err)
 	require.NotEqual(t, route.AccountID, nextDescriptor.Native.AccountID)
+	// A working prior generation must survive until the facade commits the new
+	// exact binding. Native creation cannot force erase-before-exchange reconnect.
+	retained := next
+	retained.Generation = uuid.NewString()
+	retainedOp := uuid.NewString()
+	retainedBegin := begin(retained, retainedOp)
+	retainedURL, e := url.Parse(retainedBegin.AuthorizeURL)
+	require.NoError(t, e)
+	completedRetained, e := grok.CompleteOwnerCallback(ownerCtx, retained, retainedOp, retainedURL.Query().Get("state"), "fixture-code")
+	require.NoError(t, e)
+	require.Equal(t, "completed", completedRetained.State)
+	retainedDescriptor, e := grok.Descriptor(ownerCtx, retained, retainedOp)
+	require.NoError(t, e)
+	require.NotEqual(t, nextDescriptor.Native.AccountID, retainedDescriptor.Native.AccountID)
+	_, e = grok.RetainedCustody(ownerCtx, next, nextOp, *nextDescriptor.Native)
+	require.NoError(t, e)
+	_, e = grok.RetainedCustody(ownerCtx, retained, retainedOp, *retainedDescriptor.Native)
+	require.NoError(t, e)
+	effectsAfterReconnect := exchanges.Load()
+	_, e = grok.CompleteOwnerCallback(ownerCtx, retained, retainedOp, retainedURL.Query().Get("state"), "fixture-code")
+	require.NoError(t, e)
+	require.Equal(t, effectsAfterReconnect, exchanges.Load(), "replay must not exchange again")
+	oldCleanup := service.GatewayNativeOAuthCleanupRequest{Scope: next, Operation: nextOp, Action: "erase", CleanupRef: uuid.NewString(), CleanupToken: uuid.NewString()}
+	oldAuthority := func(context.Context, service.GatewayNativeOAuthCleanupRequest) (service.GatewayNativeOAuthCleanupAuthority, error) {
+		return service.GatewayNativeOAuthCleanupAuthority{Owner: next.Owner, LeaseExpiresAt: time.Now().Add(time.Second), Native: nextDescriptor.Native}, nil
+	}
+	oldErased, e := grok.Cleanup(ownerCtx, oldCleanup, oldAuthority)
+	require.NoError(t, e)
+	require.True(t, oldErased.CredentialsErased)
+	require.Equal(t, "closed", oldErased.Closure)
+	_, e = grok.Descriptor(ownerCtx, next, nextOp)
+	require.Error(t, e)
+	afterOldErase, e := grok.Descriptor(ownerCtx, retained, retainedOp)
+	require.NoError(t, e)
+	require.True(t, service.SameGatewayNativeDescriptor(*retainedDescriptor.Native, *afterOldErase.Native))
+	_, e = grok.RetainedCustody(ownerCtx, retained, retainedOp, *retainedDescriptor.Native)
+	require.NoError(t, e)
+	// Even fully verified foreign provider evidence cannot change the principal
+	// permanently owned by this same logical account during reconnect.
+	mode.Store(3)
+	changed := retained
+	changed.Generation = uuid.NewString()
+	changedOp := uuid.NewString()
+	changedBegin := begin(changed, changedOp)
+	changedURL, e := url.Parse(changedBegin.AuthorizeURL)
+	require.NoError(t, e)
+	_, e = grok.CompleteOwnerCallback(ownerCtx, changed, changedOp, changedURL.Query().Get("state"), "fixture-code")
+	require.Error(t, e)
+	var rejectedBirths int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_grok_connect_intents WHERE consumer=$1 AND operation_ref=$2 AND account_id IS NOT NULL`, changed.Consumer, changedOp).Scan(&rejectedBirths))
+	require.Zero(t, rejectedBirths)
+	_, e = grok.RetainedCustody(ownerCtx, retained, retainedOp, *retainedDescriptor.Native)
+	require.NoError(t, e)
+	mode.Store(0)
+
 	foreign := scope
 	foreign.Account = uuid.NewString()
 	foreign.Generation = uuid.NewString()
