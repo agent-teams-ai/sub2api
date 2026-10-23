@@ -332,6 +332,7 @@ func gatewayClaudeInput(raw json.RawMessage) bool {
 }
 
 func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry GatewayNativeClaudeDispatchEntry, wire []byte, headers map[string]string, transport http.RoundTripper) (*OpenAIForwardResult, error) {
+	nativeMessages := gatewayNativeClaudeMessagesMode(ctx)
 	if entry.Release == nil || entry.Claim == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
@@ -375,6 +376,11 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 	if (response.StatusCode >= 200 && response.StatusCode < 300 || response.StatusCode == http.StatusTooManyRequests) && entry.CaptureLimits != nil {
 		entry.CaptureLimits(ctx, response.Header, received)
 	}
+	// Capture only stages the response headers. Release first drops the SQL
+	// identity fence, then publishes under a fresh birth/principal/revision
+	// check. The owned response body and cancellation remain with the lifetime;
+	// a long SSE response must not retain a database connection.
+	entry.Release()
 	if response.StatusCode != http.StatusOK || gatewayNativeUpstreamMediaCategory(response.Header.Get("Content-Type")) != "sse" || (response.Header.Get("Content-Encoding") != "" && !strings.EqualFold(response.Header.Get("Content-Encoding"), "identity")) {
 		return nil, ErrGatewayNativeEffectUnknown
 	}
@@ -437,11 +443,26 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 			return nil, ErrGatewayNativeEffectUnknown
 		}
 		if len(data) == 0 {
+			if nativeMessages {
+				if frame.Len() > outputLimit-sent {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
+				c.Header("Content-Type", "text/event-stream")
+				c.Header("Cache-Control", "no-store")
+				n, err := c.Writer.Write(frame.Bytes())
+				sent += n
+				if err != nil || n != frame.Len() || gatewayNativeFlush(c.Writer) != nil {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
+			}
 			frame.Reset()
 			eventName = ""
 			continue
 		}
 		payload := []byte(strings.Join(data, "\n"))
+		if nativeMessages && !gatewayClaudeNativeJSON(payload) {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
 		fields, valid := gatewayNativeCanonicalObject(payload, "type", "message", "usage", "delta", "index", "content_block")
 		var event apicompat.AnthropicStreamEvent
 		if !valid || json.Unmarshal(payload, &event) != nil || (eventName != "" && eventName != event.Type) {
@@ -449,10 +470,12 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 		}
 		switch event.Type {
 		case "ping":
-			frame.Reset()
-			data = nil
-			eventName = ""
-			continue
+			if !nativeMessages {
+				frame.Reset()
+				data = nil
+				eventName = ""
+				continue
+			}
 		case "message_start":
 			if started || event.Message == nil || event.Message.Type != "message" || event.Message.Role != "assistant" || event.Message.ID == "" || event.Message.Model != GatewayClaudeOAuthModel || len(event.Message.Content) != 0 {
 				return nil, ErrGatewayNativeEffectUnknown
@@ -469,6 +492,9 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 				return nil, ErrGatewayNativeEffectUnknown
 			}
 			started = true
+			if nativeMessages {
+				observation.OutputTokens = gatewayNativeUsageCount(usage["output_tokens"])
+			}
 		case "content_block_start":
 			if !started || deltaSeen || blockOpen || event.Index == nil || *event.Index != nextIndex || event.ContentBlock == nil {
 				return nil, ErrGatewayNativeEffectUnknown
@@ -540,6 +566,10 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 			}
 			switch event.Delta.StopReason {
 			case "end_turn", "tool_use", "stop_sequence":
+			case "max_tokens", "pause_turn", "refusal", "model_context_window_exceeded":
+				if !nativeMessages {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
 			default:
 				return nil, ErrGatewayNativeEffectUnknown
 			}
@@ -551,11 +581,14 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 			if measuredOutput == nil {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
-			for name, prior := range map[string]*int64{"input_tokens": measuredInput, "cache_read_input_tokens": cacheRead, "cache_creation_input_tokens": cacheWrite} {
+			for name, prior := range map[string]**int64{"input_tokens": &measuredInput, "cache_read_input_tokens": &cacheRead, "cache_creation_input_tokens": &cacheWrite} {
 				if raw := usage[name]; raw != nil {
 					value := gatewayNativeUsageCount(raw)
-					if value == nil || prior == nil || *value != *prior {
+					if value == nil || !nativeMessages && (*prior == nil || *value != **prior) {
 						return nil, ErrGatewayNativeEffectUnknown
+					}
+					if nativeMessages {
+						*prior = value
 					}
 				}
 			}
@@ -577,10 +610,36 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 		default:
 			return nil, ErrGatewayNativeEffectUnknown
 		}
-		events := apicompat.AnthropicEventToResponsesEvents(&event, state)
-		for _, converted := range events {
-			encoded, err := apicompat.ResponsesEventToSSE(converted)
-			if err != nil || len(encoded) > outputLimit-sent {
+		if nativeMessages && measuredInput != nil {
+			input := *measuredInput
+			if cacheRead != nil {
+				input += *cacheRead
+			}
+			if cacheWrite != nil {
+				input += *cacheWrite
+			}
+			if input > 9007199254740991 {
+				return nil, ErrGatewayNativeEffectUnknown
+			}
+			observation.InputTokens, observation.CachedInputTokens = &input, cacheRead
+			if measuredOutput != nil {
+				observation.OutputTokens = measuredOutput
+			}
+		}
+		var encodedFrames []string
+		if nativeMessages {
+			encodedFrames = []string{frame.String()}
+		} else {
+			for _, converted := range apicompat.AnthropicEventToResponsesEvents(&event, state) {
+				encoded, err := apicompat.ResponsesEventToSSE(converted)
+				if err != nil {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
+				encodedFrames = append(encodedFrames, encoded)
+			}
+		}
+		for _, encoded := range encodedFrames {
+			if len(encoded) > outputLimit-sent {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
 			c.Header("Content-Type", "text/event-stream")
@@ -592,7 +651,7 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 			}
 		}
 		if event.Type == "message_stop" {
-			if !state.CompletedSent {
+			if !nativeMessages && !state.CompletedSent {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
 			observation.InputTokens = &inputTotal

@@ -50,8 +50,10 @@ type GatewayClaudeEnrollment struct {
 // All reads authenticate the exact owner/consumer/generation and durable birth.
 // Intent claim and refresh claim must commit before a provider effect, and may
 // never grant a second entry after an uncertain exchange. LockPhysical retains
-// its SQL lock until Release, fencing refresh/erase through dispatch. Passive
-// publication then reacquires and checks the exact birth/principal/revision.
+// its SQL lock until Release, fencing refresh/erase through provider entry and
+// receipt of response headers. SSE bodies are owned by the request lifetime.
+// Passive publication releases SQL before reacquiring and checking the exact
+// birth/principal/revision.
 type GatewayNativeClaudeRepository interface {
 	PutGatewayClaudeConnect(context.Context, GatewayClaudeConnectIntent) (GatewayClaudeConnectIntent, error)
 	ReadGatewayClaudeConnect(context.Context, GatewayNativeCredentialScope, string) (GatewayClaudeConnectIntent, error)
