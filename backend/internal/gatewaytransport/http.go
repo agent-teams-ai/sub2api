@@ -159,7 +159,13 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 		defer func() {
 			durable := h.settlePublic(peer.ConsumerID, e)
 			lifetime := e.life.Snapshot()
-			if lifetime.Entered && (!lifetime.Completed || !durable || terminal.release() != nil) {
+			if !lifetime.Entered {
+				return
+			}
+			// Only terminal delivery gets a fresh finite I/O deadline after
+			// durable settlement. Forwarding is already closed; its canceled
+			// context and approved provider lifetime must never be renewed.
+			if !lifetime.Completed || !durable || controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout)) != nil || terminal.release() != nil {
 				// No clean streaming EOF until terminal effect and physical
 				// closure are durable. Accepted bytes/effects are not replayed.
 				_ = controller.SetWriteDeadline(time.Now())

@@ -240,6 +240,14 @@ func (h *Handler) publicPost(ctx context.Context, path string, body, reply any) 
 	}
 	bounded, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
 	defer cancel()
+	if path == "/private/native/v1/execution-authority" {
+		select {
+		case h.preclaimCallbacks <- struct{}{}:
+			defer func() { <-h.preclaimCallbacks }()
+		case <-bounded.Done():
+			return errAuthorityUnavailable
+		}
+	}
 	req, err := http.NewRequestWithContext(bounded, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, bytes.NewReader(raw))
 	if err != nil {
 		return errDenied
@@ -272,6 +280,10 @@ func (h *Handler) publicPost(ctx context.Context, path string, body, reply any) 
 // Physical closure and terminal delivery are independent of client disconnect.
 // Failed callbacks retain the original registry evidence for protected cleanup.
 func (h *Handler) settlePublic(consumer string, e *reservation) bool {
+	return h.settlePublicWithin(consumer, e, 20*time.Second, 10*time.Second)
+}
+
+func (h *Handler) settlePublicWithin(consumer string, e *reservation, queueBudget, activeBudget time.Duration) bool {
 	h.seal(e)
 	h.mu.Lock()
 	refused := e.preclaimRefused && e.proof == nil
@@ -279,16 +291,24 @@ func (h *Handler) settlePublic(consumer string, e *reservation) bool {
 	if refused && closed(e.life.Snapshot()) {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	// Queue is bounded by active public handlers, with no SQL checkout or
-	// callback socket held while waiting. Terminal metadata never retries.
+	// callback socket held while waiting. Queue time must not consume the
+	// independent active settlement budget. Terminal metadata never retries.
+	queueCtx, cancelQueue := context.WithTimeout(context.Background(), queueBudget)
+	defer cancelQueue()
 	select {
 	case h.terminalCallbacks <- struct{}{}:
-	case <-ctx.Done():
+	case <-queueCtx.Done():
 		return false
 	}
+	if queueCtx.Err() != nil {
+		<-h.terminalCallbacks
+		return false
+	}
+	cancelQueue()
 	defer func() { <-h.terminalCallbacks }()
+	ctx, cancel := context.WithTimeout(context.Background(), activeBudget)
+	defer cancel()
 	var r Receipt
 	timer := time.NewTicker(5 * time.Millisecond)
 	defer timer.Stop()

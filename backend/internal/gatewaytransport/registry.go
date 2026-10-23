@@ -182,6 +182,7 @@ type Handler struct {
 	executions        chan struct{}
 	controls          chan struct{}
 	terminalCallbacks chan struct{}
+	preclaimCallbacks chan struct{}
 	terminalBuffers   *publicTerminalBudget
 }
 
@@ -262,7 +263,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 16384,
 		DialContext: (&net.Dialer{Timeout: cfg.CallbackTimeout}).DialContext, TLSHandshakeTimeout: cfg.CallbackTimeout, ResponseHeaderTimeout: cfg.CallbackTimeout}
 	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
-		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), terminalCallbacks: make(chan struct{}, 4), terminalBuffers: &publicTerminalBudget{maximum: 64 << 20}, callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), terminalCallbacks: make(chan struct{}, 4), preclaimCallbacks: make(chan struct{}, 4), terminalBuffers: &publicTerminalBudget{maximum: 64 << 20}, callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
@@ -442,6 +443,20 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	}
 	callbackCtx, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
 	defer cancel()
+	if token != "" {
+		select {
+		case h.preclaimCallbacks <- struct{}{}:
+			defer func() { <-h.preclaimCallbacks }()
+		case <-callbackCtx.Done():
+			// No POST was attempted. This invocation cannot have claimed SQL.
+			h.mu.Lock()
+			if e.proof == nil && !e.admitted {
+				e.preclaimRefused, e.statusOnly = true, true
+			}
+			h.mu.Unlock()
+			return false, nil
+		}
+	}
 	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, strings.NewReader(string(body)))
 	if err != nil {
 		return false, errDenied
@@ -522,12 +537,26 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	p := d.Closure
 	lease, err := parseInstant(reply.LeaseExpiresAt)
 	deadline, _ := parseInstant(e.request.Admission.ExpiresAt)
-	if err != nil || !lease.After(time.Now()) || !deadline.After(time.Now()) || !p.valid() ||
+	if err != nil || !p.valid() ||
 		reply.Status.Effect != "dispatch_started" || reply.NativeDescriptor == nil || !service.SameGatewayNativeDescriptor(*reply.NativeDescriptor, e.request.Descriptor) ||
 		d.ExecutionRef != e.request.Admission.ExecutionRef || d.RequestRef != e.request.RequestRef || d.Limits != e.request.Admission.Limits || d.Deadline != e.request.Admission.ExpiresAt ||
 		d.Descriptor.Generation != e.native.Generation || d.Descriptor.NativePhysicalIdentity != e.native.Generation || d.Descriptor.Profile != e.request.Admission.ProfileID ||
-		p.ExecutionRef != d.ExecutionRef || p.RequestRef != d.RequestRef || p.Worker != e.request.Worker || p.Native != e.native ||
-		h.cfg.VerifyDispatch(callbackCtx, consumer, p, lease) != nil || callbackCtx.Err() != nil {
+		p.ExecutionRef != d.ExecutionRef || p.RequestRef != d.RequestRef || p.Worker != e.request.Worker || p.Native != e.native {
+		return false, errDenied
+	}
+	h.mu.Lock()
+	// Scope-matched claim evidence is retained before dynamic verification.
+	// A later callback failure, lease expiry or cancellation denies entry, but
+	// cannot erase the committed claim needed for independent no-entry settlement.
+	if e.proof != nil && *e.proof != p {
+		h.mu.Unlock()
+		return false, errDenied
+	}
+	if e.proof == nil {
+		e.proof = &p
+	}
+	h.mu.Unlock()
+	if !lease.After(time.Now()) || !deadline.After(time.Now()) || h.cfg.VerifyDispatch(callbackCtx, consumer, p, lease) != nil || callbackCtx.Err() != nil {
 		return false, errDenied
 	}
 	h.mu.Lock()
