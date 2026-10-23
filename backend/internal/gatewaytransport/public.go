@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -16,6 +17,12 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/google/uuid"
 )
+
+var errAuthorityUnavailable = errors.New("native execution authority unavailable")
+
+type authorityHTTPError struct{ status int }
+
+func (e authorityHTTPError) Error() string { return "native execution authority status" }
 
 var publicExecutionRoute = regexp.MustCompile(`^/v1/executions/([A-Za-z0-9_-]{1,128})/requests$`)
 var publicReference = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -110,10 +117,22 @@ func (h *Handler) PublicHandler(maxActive int) http.Handler {
 			return
 		}
 		var approved publicAuthorizationReply
-		if h.publicPost(r.Context(), "/private/native/v1/execution-authority", lookup, &approved) != nil ||
-			!identifier.MatchString(approved.ConsumerID) || approved.RequestRef != requestRef || !canonicalUUID.MatchString(approved.Worker) ||
+		if err := h.publicPost(r.Context(), "/private/native/v1/execution-authority", lookup, &approved); err != nil {
+			// This callback cannot claim or enter a provider. Only here can a
+			// transient authority failure truthfully mean admission-limited.
+			var status authorityHTTPError
+			if errors.Is(err, errAuthorityUnavailable) || errors.As(err, &status) && (status.status == 503 || status.status == 429) {
+				publicError(w, 503, "admission_limited", requestRef)
+			} else if errors.As(err, &status) && (status.status == 403 || status.status == 401) {
+				publicError(w, 403, "forbidden", requestRef)
+			} else {
+				publicError(w, 502, "upstream_failure", requestRef)
+			}
+			return
+		}
+		if !identifier.MatchString(approved.ConsumerID) || approved.RequestRef != requestRef || !canonicalUUID.MatchString(approved.Worker) ||
 			!approved.Admission.valid(time.Now()) || lookup.ExecutionRef != "" && lookup.ExecutionRef != approved.Admission.ExecutionRef {
-			publicError(w, 403, "forbidden", requestRef)
+			publicError(w, 502, "upstream_failure", requestRef)
 			return
 		}
 		if r.URL.Path == "/v1/messages" && approved.Admission.ProfileID != service.GatewayClaudeOAuthMessagesProfile {
@@ -223,14 +242,20 @@ func (h *Handler) publicPost(ctx context.Context, path string, body, reply any) 
 	req.Header.Set("Accept", "application/json")
 	response, err := h.callback.Do(req)
 	if err != nil {
-		return errDenied
+		return errAuthorityUnavailable
 	}
 	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK || len(response.Header.Values("Content-Type")) != 1 || response.Header.Get("Content-Type") != "application/json" {
+	if response.StatusCode != http.StatusOK {
+		return authorityHTTPError{response.StatusCode}
+	}
+	if len(response.Header.Values("Content-Type")) != 1 || response.Header.Get("Content-Type") != "application/json" {
 		return errDenied
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, h.cfg.CallbackBytes+1))
-	if err != nil || int64(len(data)) > h.cfg.CallbackBytes || strictJSON(data, reply) != nil || bounded.Err() != nil {
+	if err != nil || bounded.Err() != nil {
+		return errAuthorityUnavailable
+	}
+	if int64(len(data)) > h.cfg.CallbackBytes || strictJSON(data, reply) != nil {
 		return errDenied
 	}
 	return nil

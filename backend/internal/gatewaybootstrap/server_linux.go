@@ -237,7 +237,7 @@ func Run(ctx context.Context, options Options) error {
 			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Second, MaxHeaderBytes: 16384,
 			ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return ctx }}
 		go func() {
-			served <- publicServer.Serve(&boundedListener{Listener: publicListener, slots: make(chan struct{}, int(c.PublicMaxActive))})
+			served <- publicServer.Serve(&boundedListener{Listener: publicListener, slots: make(chan struct{}, publicSocketBudget(c.PublicMaxActive))})
 		}()
 	}
 	go func() { served <- server.Serve(&boundedListener{Listener: listener, slots: make(chan struct{}, 128)}) }()
@@ -634,6 +634,12 @@ func nativeRuntime(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, snapshot)
 }
+
+// Keep transport ownership separate from live inference admission. One idle
+// keepalive per active slot and a finite refusal burst can still reach the
+// handler's positive 503 response. Header/idle deadlines bound that headroom;
+// the private control listener has its own independent 128-socket budget.
+func publicSocketBudget(active int64) int { return 2*int(active) + 128 }
 
 type boundedListener struct {
 	net.Listener

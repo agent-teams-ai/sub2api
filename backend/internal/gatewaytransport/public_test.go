@@ -536,3 +536,49 @@ func TestPublicTerminalAggregateBudgetWithholdsOnSaturationAndReleases(t *testin
 	three.dispose()
 	require.Zero(t, budget.used)
 }
+
+func TestPublicPreclaimAuthorityCapacityIsDistinctFromAuthenticationAndProtocolFailure(t *testing.T) {
+	var status atomic.Int32
+	var providerEntries, callbacks atomic.Int32
+	status.Store(503)
+	authority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		require.Equal(t, "/private/native/v1/execution-authority", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(int(status.Load()))
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer authority.Close()
+	h, _, _, _ := ownerIngressFixture(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { providerEntries.Add(1) }), func(cfg *Config, _ *ownerFixtureRepo) { cfg.CallbackOrigin = authority.URL })
+	public := httptest.NewServer(h.PublicHandler(2))
+	defer public.Close()
+	call := func(expectedStatus int, expectedCode string) {
+		req, err := http.NewRequest(http.MethodPost, public.URL+"/v1/responses", bytes.NewReader(ownerRequest().Payload))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer synthetic-capability-123")
+		req.Header.Set("Content-Type", "application/json")
+		response, err := public.Client().Do(req)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		require.Equal(t, expectedStatus, response.StatusCode)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+		require.Equal(t, expectedCode, body["code"])
+		require.Equal(t, "not_dispatched", body["effect"])
+		require.Zero(t, providerEntries.Load())
+		h.mu.Lock()
+		require.Empty(t, h.entries)
+		h.mu.Unlock()
+	}
+	for _, testcase := range []struct {
+		upstream, status int
+		code             string
+	}{{503, 503, "admission_limited"}, {429, 503, "admission_limited"}, {403, 403, "forbidden"}, {401, 403, "forbidden"}, {500, 502, "upstream_failure"}, {200, 502, "upstream_failure"}} {
+		status.Store(int32(testcase.upstream))
+		call(testcase.status, testcase.code)
+	}
+	require.Equal(t, int32(6), callbacks.Load())
+	authority.Close()
+	call(503, "admission_limited")
+	require.Equal(t, int32(6), callbacks.Load())
+}
