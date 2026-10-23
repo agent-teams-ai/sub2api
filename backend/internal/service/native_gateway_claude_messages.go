@@ -375,6 +375,11 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 	if (response.StatusCode >= 200 && response.StatusCode < 300 || response.StatusCode == http.StatusTooManyRequests) && entry.CaptureLimits != nil {
 		entry.CaptureLimits(ctx, response.Header, received)
 	}
+	// Capture only stages the response headers. Release first drops the SQL
+	// identity fence, then publishes under a fresh birth/principal/revision
+	// check. The owned response body and cancellation remain with the lifetime;
+	// a long SSE response must not retain a database connection.
+	entry.Release()
 	if response.StatusCode != http.StatusOK || gatewayNativeUpstreamMediaCategory(response.Header.Get("Content-Type")) != "sse" || (response.Header.Get("Content-Encoding") != "" && !strings.EqualFold(response.Header.Get("Content-Encoding"), "identity")) {
 		return nil, ErrGatewayNativeEffectUnknown
 	}
