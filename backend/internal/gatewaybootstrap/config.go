@@ -165,7 +165,7 @@ func checkValue(raw []byte, typ reflect.Type, depth int) error {
 			return ErrDenied
 		}
 	case reflect.Pointer:
-		if (typ != reflect.TypeOf((*OAuthConfig)(nil)) && typ != reflect.TypeOf((*ProfileConfig)(nil))) || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if (typ != reflect.TypeOf((*OAuthConfig)(nil)) && typ != reflect.TypeOf((*ProfileConfig)(nil)) && typ != reflect.TypeOf((*GrokConfig)(nil))) || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return ErrDenied
 		}
 		return checkValue(raw, typ.Elem(), depth+1)
