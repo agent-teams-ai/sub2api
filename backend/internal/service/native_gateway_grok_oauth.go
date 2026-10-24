@@ -218,6 +218,49 @@ func (s *GatewayNativeGrokOAuth) ReadConnect(ctx context.Context, scope GatewayN
 	return grokConnectView(in), err
 }
 
+// GatewayNativeGrokCompletionFields reuses the existing lossless OAuth JSON
+// codec for transient Grok-only ingress (including duplicate/surrogate denial).
+func GatewayNativeGrokCompletionFields(raw []byte) (map[string]json.RawMessage, bool) {
+	fields, err := gatewayOAuthJSON(raw)
+	return fields, err == nil
+}
+
+func GatewayNativeGrokAuthorizationCodeValid(code string) bool {
+	return connectCodeValid(code) && !strings.ContainsAny(code, "#?&")
+}
+
+// CompleteOwnerCode retrieves original state only from the scoped sealed intent.
+// Uncertain or completed operations are readback only, never a fresh exchange.
+func (s *GatewayNativeGrokOAuth) CompleteOwnerCode(ctx context.Context, scope GatewayNativeCredentialScope, operation, code string) (GatewayNativeOAuthConnectResult, error) {
+	var empty GatewayNativeOAuthConnectResult
+	if s == nil || !grokScope(ctx, scope, operation) || !GatewayNativeGrokAuthorizationCodeValid(code) {
+		return empty, ErrGatewayNativeIdentity
+	}
+	in, err := s.repository.ReadGatewayGrokConnect(ctx, scope, operation)
+	if err != nil || in.Scope != scope || in.Operation != operation {
+		return empty, ErrGatewayNativeIdentity
+	}
+	switch in.State {
+	case "completed", "exchanging", "erased":
+		return grokConnectView(in), nil
+	case "prepared":
+		if !time.Now().Before(in.Deadline) {
+			return grokConnectView(in), nil
+		}
+	default:
+		return empty, ErrGatewayNativeIdentity
+	}
+	var secret gatewayGrokConnectSecret
+	if s.open(scope, in.Envelope, &secret) != nil || !s.connectSecretValid(secret) || !GatewayNativeOAuthConnectCallbackValid(secret.State, code) {
+		return empty, ErrGatewayNativeIdentity
+	}
+	digest := sha256.Sum256([]byte(secret.State))
+	if hex.EncodeToString(digest[:]) != in.StateHash {
+		return empty, ErrGatewayNativeIdentity
+	}
+	return s.CompleteOwnerCallback(ctx, scope, operation, secret.State, code)
+}
+
 func (s *GatewayNativeGrokOAuth) CompleteOwnerCallback(ctx context.Context, scope GatewayNativeCredentialScope, operation, state, code string) (GatewayNativeOAuthConnectResult, error) {
 	var empty GatewayNativeOAuthConnectResult
 	if s == nil || !grokScope(ctx, scope, operation) || len(state) != 64 || !connectCodeValid(code) || strings.ContainsAny(code, "#?&") {
