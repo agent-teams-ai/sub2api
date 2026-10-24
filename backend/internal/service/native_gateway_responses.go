@@ -484,10 +484,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		return nil, ErrGatewayNativeIdentity
 	}
 	upstreamBody := body
-	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
-		// Internal admission still requires default. MiMo does not document this
-		// provider field: delete only its top-level span after validation, keeping
-		// every unrelated tool/user byte. Other profiles retain the original body.
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayKimiCodeResponsesProfile {
+		// Admission accepts only default. MiMo omits this provider field and Kimi
+		// rejects its default value. Remove only the validated top-level span;
+		// retain every unrelated byte and every other profile's original body.
 		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
 		if err != nil {
 			return nil, ErrGatewayNativeIdentity
