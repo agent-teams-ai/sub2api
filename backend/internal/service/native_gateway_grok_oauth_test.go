@@ -221,3 +221,101 @@ func TestGatewayGrokQuotaLeaseCustodyAndNoRefresh(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 2, r.releases)
 }
+
+// Pasted code recovers PKCE/state from the original sealed intent. It cannot
+// borrow another owner/profile/operation or retry an uncertain exchange.
+func TestGatewayGrokOwnerAuthorizationCode(t *testing.T) {
+	_, _, ctx, scope := connectPureFixture(t)
+	repo := &grokFixtureRepository{}
+	calls := 0
+	verifier := ""
+	transport := grokFixtureHTTP(func(r *http.Request) (*http.Response, error) {
+		calls++
+		require.Equal(t, xai.DefaultTokenURL, r.URL.String())
+		require.NoError(t, r.ParseForm())
+		require.Equal(t, "fixture-plain-code", r.Form.Get("code"))
+		require.Equal(t, verifier, r.Form.Get("code_verifier"))
+		return nil, ErrGatewayNativeIdentity
+	})
+	qualification := GatewayNativeGrokOAuthQualification{ClientID: "qualified-client", RedirectURI: xai.DefaultRedirectURI, DeploymentQualified: true}
+	custody := nativeFixtureCustody(t)
+	s, err := NewGatewayNativeGrokOAuth(repo, custody, transport, qualification)
+	require.NoError(t, err)
+	allow := func(context.Context, GatewayNativeCredentialScope, string) error { return nil }
+	require.NoError(t, s.SetEntryAuthorizers(allow, allow))
+	_, err = s.BeginConnectMethod(ctx, scope, "operation", "browser")
+	require.NoError(t, err)
+	original := repo.row
+	var secret gatewayGrokConnectSecret
+	require.NoError(t, s.open(scope, original.Envelope, &secret))
+	verifier = secret.Verifier
+	for _, tc := range []struct {
+		name      string
+		scope     GatewayNativeCredentialScope
+		operation string
+	}{
+		{"owner", func() GatewayNativeCredentialScope { x := scope; x.Owner = "foreign-owner"; return x }(), "operation"},
+		{"generation", func() GatewayNativeCredentialScope {
+			x := scope
+			x.Generation = "22222222-2222-4222-8222-222222222222"
+			return x
+		}(), "operation"},
+		{"purpose", func() GatewayNativeCredentialScope { x := scope; x.Purpose = GatewayCredentialPurpose; return x }(), "operation"},
+		{"operation", scope, "foreign-operation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.CompleteOwnerCode(ctx, tc.scope, tc.operation, "fixture-plain-code")
+			require.Error(t, err)
+			require.Zero(t, repo.claims)
+			require.Zero(t, calls)
+		})
+	}
+	_, err = s.CompleteOwnerCode(context.Background(), scope, "operation", "fixture-plain-code")
+	require.Error(t, err)
+	for _, code := range []string{"", " code", "code ", "code\n", "code#other", "code?other", "code&other", strings.Repeat("a", 4097), string([]byte{255})} {
+		_, err = s.CompleteOwnerCode(ctx, scope, "operation", code)
+		require.Error(t, err)
+		require.Zero(t, repo.claims)
+		require.Zero(t, calls)
+	}
+	repo.row.StateHash = strings.Repeat("0", 64)
+	_, err = s.CompleteOwnerCode(ctx, scope, "operation", "fixture-plain-code")
+	require.Error(t, err)
+	require.Zero(t, repo.claims)
+	repo.row = original
+	foreign := secret
+	foreign.Kind = "codex-connect/v1"
+	repo.row.Envelope, err = s.seal(scope, foreign)
+	require.NoError(t, err)
+	_, err = s.CompleteOwnerCode(ctx, scope, "operation", "fixture-plain-code")
+	require.Error(t, err)
+	require.Zero(t, repo.claims)
+	require.Zero(t, calls)
+	repo.row = original
+	_, err = s.CompleteOwnerCallback(ctx, scope, "operation", strings.Repeat("0", 64), "fixture-plain-code")
+	require.Error(t, err)
+	require.Zero(t, repo.claims)
+	_, err = s.CompleteOwnerCode(ctx, scope, "operation", "fixture-plain-code")
+	require.Error(t, err)
+	require.Equal(t, 1, repo.claims)
+	require.Equal(t, 1, calls)
+	// The provider outcome is uncertain. Pasting again, including after restart,
+	// is authorized readback only; no second claim or upstream exchange occurs.
+	restarted, err := NewGatewayNativeGrokOAuth(repo, custody, transport, qualification)
+	require.NoError(t, err)
+	require.NoError(t, restarted.SetEntryAuthorizers(allow, allow))
+	out, err := restarted.CompleteOwnerCode(ctx, scope, "operation", "fixture-plain-code")
+	require.NoError(t, err)
+	require.Equal(t, "unknown", out.State)
+	require.Equal(t, 1, repo.claims)
+	require.Equal(t, 1, calls)
+	// A completed journal needs no retained PKCE material to return its existing
+	// owner-scoped result; completing again cannot mint another credential.
+	repo.row.State = "completed"
+	repo.row.Envelope = ""
+	out, err = s.CompleteOwnerCode(ctx, scope, "operation", "fixture-plain-code")
+	require.NoError(t, err)
+	require.Equal(t, "staged", out.Outcome)
+	require.Equal(t, 1, repo.claims)
+	require.Equal(t, 1, calls)
+}

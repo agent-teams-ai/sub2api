@@ -334,9 +334,15 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			var tuple nativeOAuthOwnerTuple
 			valid := false
 			if completion {
-				req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
-				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
-				valid = ok
+				if c.Request.URL.Path == "/private/native/v1/grok/oauth/connect/complete" {
+					req, ok := admin.DecodeGatewayNativeGrokConnectCompletion(data)
+					tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
+					valid = ok
+				} else {
+					req, ok := admin.DecodeGatewayNativeOAuthConnectCompletion(data)
+					tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
+					valid = ok
+				}
 			} else if path == "/private/native/v1/oauth/connect" {
 				var req struct {
 					Operation  string `json:"operation"`
