@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const accountModelsFixture = `{"models":[{"slug":"unseen-future-preview","supported_in_api":false,"visibility":"list","supported_endpoints":["responses"],"input_modalities":["text"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],"default_reasoning_level":"ultra","instructions":"PRIVATE-PROVIDER-PROMPT"}]}`
+const accountModelsFixture = `{"models":[{"slug":"unseen-future-preview","supported_in_api":false,"visibility":"list","supported_endpoints":["responses"],"input_modalities":["text"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"},{"effort":"max"}],"default_reasoning_level":"ultra","instructions":"PRIVATE-PROVIDER-PROMPT"}]}`
 
 // An existing fixed descriptor must admit a previously unknown provider model,
 // while catalogue removal and unsupported effort stop before Responses entry.
@@ -21,15 +21,16 @@ func TestGatewayAccountModelsDynamicDispatch(t *testing.T) {
 	route := f.qualify(t)
 	f.modelsBody = accountModelsFixture
 	payload := []byte(strings.ReplaceAll(string(oauthDispatchPayload()), GatewayCodexOAuthModel, "unseen-future-preview"))
-	payload = append(payload[:len(payload)-1], []byte(`,"reasoning":{"effort":"ultra"}}`)...)
+	payload = append(payload[:len(payload)-1], []byte(`,"reasoning":{"effort":"max"}}`)...)
 	_, entered, err, _ := f.call(t, route, payload)
 	require.NoError(t, err)
 	require.True(t, entered)
 	require.Equal(t, int32(1), f.entries.Load())
 	require.Equal(t, int32(1), f.modelsReads.Load())
 	require.Contains(t, f.lastPayload.Load().(string), `"model":"unseen-future-preview"`)
+	require.Equal(t, strings.Replace(string(payload), `"max_output_tokens":128,`, "", 1), f.lastPayload.Load().(string), "canonical max reaches Responses unchanged")
 	require.Equal(t, GatewayCodexOAuthModel, route.Model)
-	for _, body := range [][]byte{[]byte(strings.ReplaceAll(string(payload), "unseen-future-preview", "unknown-model")), []byte(strings.ReplaceAll(string(payload), `"ultra"`, `"high"`))} {
+	for _, body := range [][]byte{[]byte(strings.ReplaceAll(string(payload), "unseen-future-preview", "unknown-model")), []byte(strings.ReplaceAll(string(payload), `"max"`, `"high"`)), []byte(strings.ReplaceAll(string(payload), `"max"`, `"ultra"`))} {
 		_, entered, err, _ = f.call(t, route, body)
 		require.Error(t, err)
 		require.False(t, entered)
@@ -87,6 +88,8 @@ func TestGatewayAccountModelsReadFencesAndRedaction(t *testing.T) {
 			require.Equal(t, "snapshot", result.Status)
 			require.Equal(t, route.Generation, result.PhysicalGeneration)
 			require.Len(t, *result.Models, 1)
+			require.Equal(t, []string{"low", "max"}, (*result.Models)[0].Reasoning.Allowed)
+			require.Equal(t, "max", (*result.Models)[0].Reasoning.Default)
 			wire, err := json.Marshal(result)
 			require.NoError(t, err)
 			require.NotContains(t, string(wire), "PRIVATE-PROVIDER-PROMPT")
@@ -142,17 +145,91 @@ func TestGatewayAccountModelsUnsupportedProfile(t *testing.T) {
 }
 
 func TestGatewayAccountModelsReasoningCapability(t *testing.T) {
-	models := []GatewayAccountModel{{ModelID: "plain"}, {ModelID: "reasoning", Reasoning: &GatewayAccountModelChoices{Allowed: []string{"low", "ultra"}, Default: "low"}}}
+	models := []GatewayAccountModel{{ModelID: "plain"}, {ModelID: "reasoning", Reasoning: &GatewayAccountModelChoices{Allowed: []string{"low", "max"}, Default: "low"}}}
 	snapshot := GatewayAccountModelsResult{Status: "snapshot", Models: &models}
 	for _, model := range []string{"plain", "reasoning"} {
 		require.True(t, gatewayAccountModelsAllow(snapshot, model, nil))
 		require.True(t, gatewayAccountModelsAllow(snapshot, model, json.RawMessage(`null`)))
 	}
-	require.False(t, gatewayAccountModelsAllow(snapshot, "plain", json.RawMessage(`{}`)))
+	require.True(t, gatewayAccountModelsAllow(snapshot, "plain", json.RawMessage(`{}`)))
+	for _, raw := range []string{`{"effort":"low"}`, `{"effort":null}`, `{"context":"all_turns"}`, `{"unknown":null}`, `[]`, `true`, `""`, `0`} {
+		require.False(t, gatewayAccountModelsAllow(snapshot, "plain", json.RawMessage(raw)), raw)
+	}
 	require.False(t, gatewayAccountModelsAllow(snapshot, "plain", json.RawMessage(`{"summary":"auto"}`)))
 	require.True(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"summary":"auto"}`)))
-	require.True(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":"ultra"}`)))
+	require.True(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":"max"}`)))
+	require.False(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":"ultra"}`)))
 	require.False(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":"high"}`)))
 	require.False(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":null}`)))
 	require.False(t, gatewayAccountModelsAllow(snapshot, "reasoning", json.RawMessage(`{"effort":"low","Effort":"ultra"}`)))
+}
+
+// The legacy anchor fallback must not send noncanonical wire Ultra either.
+func TestGatewayAccountModelsLegacyCanonicalWire(t *testing.T) {
+	f := newOAuthDispatchFixture(t)
+	route := f.qualify(t)
+	payload := oauthDispatchPayload()
+	payload = append(payload[:len(payload)-1], []byte(`,"reasoning":{"effort":"ultra"}}`)...)
+	_, entered, err, _ := f.call(t, route, payload)
+	require.Error(t, err)
+	require.False(t, entered)
+	require.Zero(t, f.entries.Load())
+	payload = []byte(strings.Replace(string(payload), `"ultra"`, `"max"`, 1))
+	_, entered, err, _ = f.call(t, route, payload)
+	require.NoError(t, err)
+	require.True(t, entered)
+	require.Contains(t, f.lastPayload.Load().(string), `"reasoning":{"effort":"max"}`)
+}
+
+func TestGatewayAccountModelsDisabledReasoningDispatch(t *testing.T) {
+	f := newOAuthDispatchFixture(t)
+	route := f.qualify(t)
+	f.modelsBody = `{"models":[{"slug":"no-reasoning","supported_reasoning_levels":[],"default_reasoning_level":null}]}`
+	payload := []byte(strings.Replace(string(oauthDispatchPayload()), GatewayCodexOAuthModel, "no-reasoning", 1))
+	payload = append(payload[:len(payload)-1], []byte(`,"reasoning":{}}`)...)
+	_, entered, err, _ := f.call(t, route, payload)
+	require.NoError(t, err)
+	require.True(t, entered)
+	require.Equal(t, strings.Replace(string(payload), `"max_output_tokens":128,`, "", 1), f.lastPayload.Load().(string), "disabled reasoning object reaches Responses unchanged")
+	for _, reasoning := range []string{`{"summary":"none"}`, `{"context":"all_turns"}`, `{"effort":"low"}`, `{"unknown":true}`, `[]`, `""`} {
+		body := []byte(strings.Replace(string(payload), `"reasoning":{}`, `"reasoning":`+reasoning, 1))
+		_, entered, err, _ = f.call(t, route, body)
+		require.Error(t, err)
+		require.False(t, entered)
+	}
+	require.Equal(t, int32(1), f.entries.Load())
+}
+
+// Unsupported-only metadata is unavailable, never evidence for disabled
+// reasoning. Preserve the existing explicit none/no-effort representation.
+func TestGatewayAccountModelsUnrepresentableReasoning(t *testing.T) {
+	for _, fields := range []string{
+		`"supported_reasoning_levels":["future"],"default_reasoning_level":"future"`,
+		`"supported_reasoning_levels":["future"],"default_reasoning_level":null`,
+		`"supported_reasoning_levels":[],"default_reasoning_level":"future"`,
+		`"supported_reasoning_levels":null,"default_reasoning_level":"future"`,
+		`"default_reasoning_level":"future"`,
+		`"supported_reasoning_levels":[],"default_reasoning_level":"low"`,
+		`"supported_reasoning_levels":[],"default_reasoning_level":{}`,
+		`"supported_reasoning_levels":["none","future"],"default_reasoning_level":"none"`,
+	} {
+		_, err := parseGatewayCodexAccountModels([]byte(`{"models":[{"slug":"future-model",` + fields + `}]}`))
+		require.Error(t, err, fields)
+	}
+	for _, fields := range []string{
+		`"supported_reasoning_levels":[],"default_reasoning_level":null`,
+		`"supported_reasoning_levels":[],"default_reasoning_level":"none"`,
+		`"supported_reasoning_levels":["none"],"default_reasoning_level":"none"`,
+		`"supported_reasoning_levels":null,"default_reasoning_level":null`,
+	} {
+		models, err := parseGatewayCodexAccountModels([]byte(`{"models":[{"slug":"disabled-model",` + fields + `}]}`))
+		require.NoError(t, err, fields)
+		require.Len(t, models, 1)
+		require.Nil(t, models[0].Reasoning)
+	}
+	f := newOAuthDispatchFixture(t)
+	f.qualify(t)
+	f.modelsBody = `{"models":[{"slug":"future-model","supported_reasoning_levels":["future"],"default_reasoning_level":"future"}]}`
+	require.Equal(t, GatewayAccountModelsResult{Status: "unavailable"}, f.dispatch.accountModels(f.ctx, f.store.row, f.store.physical, false))
+	require.Zero(t, f.entries.Load())
 }

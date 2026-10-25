@@ -1164,9 +1164,12 @@ func (*oauthTransportRows) UnknownGatewayNativeOAuthRefresh(context.Context, ser
 }
 
 func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
-	for _, mode := range []string{"valid", "dynamic", "unknown-model", "unsupported-effort", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
+	for _, mode := range []string{"valid", "dynamic", "unknown-model", "unsupported-effort", "raw-ultra", "legacy-raw-ultra", "disabled", "disabled-field", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, refreshes, checks atomic.Int32
+			dynamicCatalog := mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" || mode == "raw-ultra"
+			disabledCatalog := mode == "disabled" || mode == "disabled-field"
+			success := mode == "valid" || mode == "dynamic" || mode == "disabled"
 			key, err := rsa.GenerateKey(rand.Reader, 2048)
 			require.NoError(t, err)
 			subject := uuid.NewString()
@@ -1190,13 +1193,24 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 					require.Equal(t, "auth.openai.com", r.Host)
 					_ = json.NewEncoder(w).Encode(map[string]any{"access_token": nextAccess, "refresh_token": uuid.NewString(), "id_token": signed, "token_type": "Bearer", "expires_in": 3600})
 				case "/backend-api/codex/models":
-					if mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" {
-						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_in_api":false,"visibility":"list","supported_reasoning_levels":["ultra"],"default_reasoning_level":"ultra"}]}`)
+					if dynamicCatalog {
+						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_in_api":false,"visibility":"list","supported_reasoning_levels":["ultra","max"],"default_reasoning_level":"ultra"}]}`)
+					} else if disabledCatalog {
+						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_reasoning_levels":[],"default_reasoning_level":null}]}`)
 					} else {
 						w.WriteHeader(http.StatusServiceUnavailable)
 					}
 				case "/backend-api/codex/responses":
 					entries.Add(1)
+					body, readErr := io.ReadAll(r.Body)
+					require.NoError(t, readErr)
+					if mode == "dynamic" {
+						require.Contains(t, string(body), `"reasoning":{"effort":"max"}`)
+						require.NotContains(t, string(body), `"ultra"`)
+					}
+					if mode == "disabled" {
+						require.Contains(t, string(body), `"reasoning":{}`)
+					}
 					require.Equal(t, "chatgpt.com", r.Host)
 					require.Equal(t, "Bearer "+nextAccess, r.Header.Get("Authorization"))
 					require.Equal(t, providerID, r.Header.Get("ChatGPT-Account-Id"))
@@ -1240,7 +1254,7 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			require.NotNil(t, descriptor.Native)
 			refresh, err := service.NewGatewayNativeOAuthRefresh(rows, custody, verifier, provider)
 			require.NoError(t, err)
-			if mode == "valid" || mode == "dynamic" {
+			if success {
 				out, err := refresh.Refresh(ownerCtx, service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 7, CreatedAt: birth, ExpectedVersion: 1, Operation: uuid.NewString(), Intent: uuid.NewString()})
 				require.NoError(t, err)
 				require.EqualValues(t, 2, out.Version)
@@ -1284,15 +1298,28 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			input.Descriptor = *descriptor.Native
 			input.Admission.ProfileID = service.GatewayCodexOAuthResponsesProfile
 			input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, service.GatewayCodexOAuthModel))
-			if mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" {
-				selected, effort := "unseen-native-model", "ultra"
+			if dynamicCatalog {
+				selected, effort := "unseen-native-model", "max"
 				if mode == "unknown-model" {
 					selected = "not-in-catalog"
 				}
 				if mode == "unsupported-effort" {
 					effort = "high"
 				}
+				if mode == "raw-ultra" {
+					effort = "ultra"
+				}
 				input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"reasoning":{"effort":%q},"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, selected, effort))
+			}
+			if disabledCatalog {
+				reasoning := "{}"
+				if mode == "disabled-field" {
+					reasoning = `{"summary":"none"}`
+				}
+				input.Payload = json.RawMessage(fmt.Sprintf(`{"model":"unseen-native-model","reasoning":%s,"input":"controlled","store":false,"stream":true,"service_tier":"default"}`, reasoning))
+			}
+			if mode == "legacy-raw-ultra" {
+				input.Payload = json.RawMessage(strings.TrimSuffix(string(input.Payload), "}") + `,"reasoning":{"effort":"ultra"}}`)
 			}
 			if mode == "forged-descriptor" {
 				input.Descriptor.CreatedAt = input.Descriptor.CreatedAt.Add(time.Microsecond)
@@ -1300,7 +1327,7 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
 			require.NoError(t, result.err)
 			require.EqualValues(t, 1, admits.Load())
-			if mode == "valid" || mode == "dynamic" {
+			if success {
 				require.EqualValues(t, 1, entries.Load())
 				require.EqualValues(t, 1, refreshes.Load())
 				require.Equal(t, "2", rows.row.GetCredential("credential_version"))
