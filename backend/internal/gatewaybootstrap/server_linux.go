@@ -218,6 +218,11 @@ func Run(ctx context.Context, options Options) error {
 		tcfg.ClaudeOAuth = oauth.claude
 		tcfg.Claude = c.claudeProfile()
 	}
+	if oauth != nil && oauth.models == nil {
+		if composePrivateModels(oauth, oauth.owners) != nil {
+			return ErrDenied
+		}
+	}
 	a.compose(&tcfg)
 	transport, err := gatewaytransport.New(ctx, tcfg)
 	if err != nil || ctx.Err() != nil {
@@ -304,6 +309,11 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 	admin.RegisterGatewayNativeRoutes(router.Group(""), adminSvc, gateway,
 		admin.GatewayNativeProfile{ID: service.GatewayMiMoResponsesProfile, BaseURL: profile.BaseURL, Model: profile.Model}, authorizeCandidate,
 		func(*gin.Context, service.GatewayNativeRoute) error { return ErrDenied }, func(*gin.Context, bool, error) {}, custody, second...)
+	if oauth != nil && oauth.models != nil {
+		if admin.RegisterGatewayAccountModelsRoutes(router.Group(""), oauth.models, authorizeCandidate) != nil {
+			panic("invalid private account models composition")
+		}
+	}
 	if oauth != nil && oauth.limits != nil {
 		if admin.RegisterGatewayAccountLimitsRoutes(router.Group(""), oauth.limits, authorizeCandidate) != nil {
 			panic("invalid private account limits composition")
@@ -527,7 +537,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				return
 			}
 			management.ServeHTTP(w, r)
-		case oauth != nil && (oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/read" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
+		case oauth != nil && (oauth.models != nil && r.URL.Path == "/private/native/v1/account-models/read" || oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/read" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
@@ -721,6 +731,7 @@ type privateOAuth struct {
 	refresh  *service.GatewayNativeOAuthRefresh
 	cleanup  service.GatewayNativeOAuthCleanupAuthorizer
 	limits   *service.GatewayAccountLimitsReader
+	models   *service.GatewayAccountModelsReader
 	claude   *service.GatewayNativeClaudeOAuth
 	grok     *service.GatewayNativeGrokOAuth
 	limitsV2 *service.GatewayAccountLimitsReaderV2
@@ -807,7 +818,11 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 			return nil, ErrDenied
 		}
 	}
-	return &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup, limits: limits}, nil
+	out := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup, limits: limits}
+	if composePrivateModels(out, owners) != nil {
+		return nil, ErrDenied
+	}
+	return out, nil
 }
 
 // privateGatewayServiceConfig keeps provider I/O bounded by the saved request
@@ -875,4 +890,25 @@ func composePrivateClaude(out *privateOAuth, repo service.AccountRepository, db 
 		}
 	}
 	return nil
+}
+
+// The same logical owner+epoch authority fences metadata reads across providers.
+// A deployment without Codex still returns an explicit unsupported union.
+func composePrivateModels(out *privateOAuth, owners NativeOAuthOwnerAuthority) error {
+	if out == nil {
+		return ErrDenied
+	}
+	authority, ok := owners.(NativeAccountLimitsAuthority)
+	if !ok {
+		return nil
+	}
+	var err error
+	out.models, err = service.NewGatewayAccountModelsReader(out.dispatch, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+		consumer, e := service.GatewayNativeConsumer(ctx)
+		if e != nil {
+			return service.GatewayNativeRoute{}, ErrDenied
+		}
+		return authority.AuthorizeNativeAccountLimits(ctx, consumer, in)
+	})
+	return err
 }

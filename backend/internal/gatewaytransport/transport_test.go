@@ -195,6 +195,8 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 				require.JSONEq(t, `{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}}`, string(encodedText))
 				require.Equal(t, "33333333-3333-4333-8333-333333333333", payload["prompt_cache_key"])
 				require.Equal(t, map[string]any{"x-codex-installation-id": "44444444-4444-4444-8444-444444444444"}, payload["client_metadata"])
+			} else if r.Host == "api.kimi.ai" {
+				require.NotContains(t, payload, "service_tier")
 			} else {
 				require.Equal(t, "default", payload["service_tier"])
 			}
@@ -1162,7 +1164,7 @@ func (*oauthTransportRows) UnknownGatewayNativeOAuthRefresh(context.Context, ser
 }
 
 func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
-	for _, mode := range []string{"valid", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
+	for _, mode := range []string{"valid", "dynamic", "unknown-model", "unsupported-effort", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, refreshes, checks atomic.Int32
 			key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -1187,6 +1189,12 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 					refreshes.Add(1)
 					require.Equal(t, "auth.openai.com", r.Host)
 					_ = json.NewEncoder(w).Encode(map[string]any{"access_token": nextAccess, "refresh_token": uuid.NewString(), "id_token": signed, "token_type": "Bearer", "expires_in": 3600})
+				case "/backend-api/codex/models":
+					if mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" {
+						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_in_api":false,"visibility":"list","supported_reasoning_levels":["ultra"],"default_reasoning_level":"ultra"}]}`)
+					} else {
+						w.WriteHeader(http.StatusServiceUnavailable)
+					}
 				case "/backend-api/codex/responses":
 					entries.Add(1)
 					require.Equal(t, "chatgpt.com", r.Host)
@@ -1232,7 +1240,7 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			require.NotNil(t, descriptor.Native)
 			refresh, err := service.NewGatewayNativeOAuthRefresh(rows, custody, verifier, provider)
 			require.NoError(t, err)
-			if mode == "valid" {
+			if mode == "valid" || mode == "dynamic" {
 				out, err := refresh.Refresh(ownerCtx, service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 7, CreatedAt: birth, ExpectedVersion: 1, Operation: uuid.NewString(), Intent: uuid.NewString()})
 				require.NoError(t, err)
 				require.EqualValues(t, 2, out.Version)
@@ -1276,13 +1284,23 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			input.Descriptor = *descriptor.Native
 			input.Admission.ProfileID = service.GatewayCodexOAuthResponsesProfile
 			input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, service.GatewayCodexOAuthModel))
+			if mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" {
+				selected, effort := "unseen-native-model", "ultra"
+				if mode == "unknown-model" {
+					selected = "not-in-catalog"
+				}
+				if mode == "unsupported-effort" {
+					effort = "high"
+				}
+				input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"reasoning":{"effort":%q},"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, selected, effort))
+			}
 			if mode == "forged-descriptor" {
 				input.Descriptor.CreatedAt = input.Descriptor.CreatedAt.Add(time.Microsecond)
 			}
 			result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
 			require.NoError(t, result.err)
 			require.EqualValues(t, 1, admits.Load())
-			if mode == "valid" {
+			if mode == "valid" || mode == "dynamic" {
 				require.EqualValues(t, 1, entries.Load())
 				require.EqualValues(t, 1, refreshes.Load())
 				require.Equal(t, "2", rows.row.GetCredential("credential_version"))
