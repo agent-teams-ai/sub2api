@@ -42,12 +42,21 @@ type GatewayAccountModelsResult struct {
 var gatewayAccountModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 
 func GatewayAccountModelIDValid(id string) bool { return gatewayAccountModelID.MatchString(id) }
-func gatewayModelEffort(e string) bool {
+func gatewayCodexWireEffortValid(e string) bool {
 	switch e {
-	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	case "minimal", "low", "medium", "high", "xhigh", "max":
 		return true
 	}
 	return false
+}
+
+// Pinned Codex 0.147 converts semantic Ultra to Responses wire Max. Apply
+// this only to vendor metadata; submitted request bytes must be canonical.
+func gatewayCodexCatalogWireEffort(e string) string {
+	if e == "ultra" {
+		return "max"
+	}
+	return e
 }
 
 type gatewayModelsEntry struct {
@@ -327,13 +336,21 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 			continue
 		}
 		m := GatewayAccountModel{ModelID: slug, Fast: GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
+		var def string
+		if value := fields["default_reasoning_level"]; value != nil && string(value) != "null" {
+			if json.Unmarshal(value, &def) != nil {
+				return nil, ErrGatewayNativeIdentity
+			}
+			def = gatewayCodexCatalogWireEffort(def)
+		}
+		allowed := []string{}
+		efforts := map[string]bool{}
+		unsupportedLevels := false
 		if value := fields["supported_reasoning_levels"]; value != nil && string(value) != "null" {
 			var levels []json.RawMessage
 			if json.Unmarshal(value, &levels) != nil {
 				return nil, ErrGatewayNativeIdentity
 			}
-			allowed := []string{}
-			efforts := map[string]bool{}
 			for _, level := range levels {
 				var effort string
 				if json.Unmarshal(level, &effort) != nil {
@@ -342,18 +359,28 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 						return nil, ErrGatewayNativeIdentity
 					}
 				}
-				if gatewayModelEffort(effort) && !efforts[effort] {
+				effort = gatewayCodexCatalogWireEffort(effort)
+				if !gatewayCodexWireEffortValid(effort) {
+					// Explicit none represents disabled reasoning. Unknown
+					// advertised levels must never manufacture that meaning.
+					if effort != "none" {
+						unsupportedLevels = true
+					}
+					continue
+				}
+				if !efforts[effort] {
 					allowed = append(allowed, effort)
 					efforts[effort] = true
 				}
 			}
-			if len(allowed) > 0 {
-				var def string
-				if json.Unmarshal(fields["default_reasoning_level"], &def) != nil || !efforts[def] {
-					return nil, ErrGatewayNativeIdentity
-				}
-				m.Reasoning = &GatewayAccountModelChoices{allowed, def}
+		}
+		if len(allowed) > 0 {
+			if !efforts[def] {
+				return nil, ErrGatewayNativeIdentity
 			}
+			m.Reasoning = &GatewayAccountModelChoices{allowed, def}
+		} else if unsupportedLevels || def != "" && def != "none" {
+			return nil, ErrGatewayNativeIdentity
 		}
 		out = append(out, m)
 	}
@@ -372,19 +399,21 @@ func gatewayAccountModelsAllow(result GatewayAccountModelsResult, model string, 
 			if len(reasoning) == 0 || string(reasoning) == "null" {
 				return true
 			}
-			if m.Reasoning == nil {
-				return false
-			}
 			fields, ok := GatewayNativePayloadFields(reasoning, "effort")
 			if !ok {
 				return false
+			}
+			// Pinned CLI sends {} when reasoning is disabled. No requested
+			// field, including summary/context or unknown fields, is allowed.
+			if m.Reasoning == nil {
+				return len(fields) == 0
 			}
 			effortRaw := fields["effort"]
 			if effortRaw == nil {
 				return true
 			}
 			var effort string
-			if json.Unmarshal(effortRaw, &effort) != nil || m.Reasoning == nil {
+			if json.Unmarshal(effortRaw, &effort) != nil || !gatewayCodexWireEffortValid(effort) {
 				return false
 			}
 			for _, allowed := range m.Reasoning.Allowed {
@@ -409,5 +438,5 @@ func gatewayLegacyCodexReasoning(raw json.RawMessage) bool {
 		return true
 	}
 	var effort string
-	return json.Unmarshal(fields["effort"], &effort) == nil && gatewayModelEffort(effort)
+	return json.Unmarshal(fields["effort"], &effort) == nil && gatewayCodexWireEffortValid(effort)
 }
