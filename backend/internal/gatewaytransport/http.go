@@ -94,7 +94,15 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
-	payload, err := qualifyPayloadWithDefaultTier(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
+	payloadModel := input.Descriptor.Model
+	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
+		fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
+		if !valid || json.Unmarshal(fields["model"], &payloadModel) != nil || !service.GatewayAccountModelIDValid(payloadModel) {
+			http.Error(raw, "private native transport denied", http.StatusBadRequest)
+			return
+		}
+	}
+	payload, err := qualifyPayloadWithDefaultTier(input.Payload, payloadModel, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
 	if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
 		http.Error(raw, "private native transport denied", http.StatusBadRequest)
 		return
