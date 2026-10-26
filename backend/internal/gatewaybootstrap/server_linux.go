@@ -765,7 +765,9 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 	if err != nil {
 		return nil, ErrDenied
 	}
-	dispatch, err := service.NewGatewayNativeOAuthDispatch(f4, custody, verifier, nil)
+	versions := service.NewGatewayCodexVersionResolver(nil)
+	service.SetCodexCanonicalUserAgentResolver(versions.CanonicalUserAgent)
+	dispatch, err := service.NewGatewayNativeOAuthDispatch(f4, custody, verifier, nil, versions)
 	if err != nil {
 		return nil, ErrDenied
 	}

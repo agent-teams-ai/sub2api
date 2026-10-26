@@ -115,12 +115,13 @@ type GatewayNativeOAuthDispatch struct {
 	client              *http.Client
 	accountCheckHeaders http.Header
 	models              gatewayModelsCache
+	modelVersions       *GatewayCodexVersionResolver
 }
 
 // Transport injection is trusted composition for loopback TLS fixtures only.
 // Production mounting and live profile qualification are separate gates.
-func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *GatewayNativeCredentialCustody, v *GatewayNativeOAuthVerifier, transport http.RoundTripper) (*GatewayNativeOAuthDispatch, error) {
-	if r == nil || !GatewayNativeCredentialCustodyReady(c) || v == nil {
+func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *GatewayNativeCredentialCustody, v *GatewayNativeOAuthVerifier, transport http.RoundTripper, versions ...*GatewayCodexVersionResolver) (*GatewayNativeOAuthDispatch, error) {
+	if r == nil || !GatewayNativeCredentialCustodyReady(c) || v == nil || len(versions) > 1 {
 		return nil, ErrGatewayNativeIdentity
 	}
 	var headers http.Header
@@ -142,7 +143,11 @@ func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *Ga
 		transport = bounded
 		headers = browser.Headers.Clone()
 	}
-	return &GatewayNativeOAuthDispatch{repository: r, custody: c, verifier: v, accountCheckHeaders: headers, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
+	var modelVersions *GatewayCodexVersionResolver
+	if len(versions) == 1 {
+		modelVersions = versions[0]
+	}
+	return &GatewayNativeOAuthDispatch{modelVersions: modelVersions, repository: r, custody: c, verifier: v, accountCheckHeaders: headers, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }}}, nil
 }
 
