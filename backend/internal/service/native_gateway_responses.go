@@ -484,9 +484,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		return nil, ErrGatewayNativeIdentity
 	}
 	upstreamBody := body
-	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayKimiCodeResponsesProfile {
-		// Admission accepts only default. MiMo omits this provider field and Kimi
-		// rejects its default value. Remove only the validated top-level span;
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayKimiCodeResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayMiniMaxMPlanResponsesProfile {
+		// Admission accepts only default. MiMo omits this provider field; Kimi
+		// rejects default and MiniMax-M3.1-Flash does not support the field.
+		// Remove only the validated top-level span;
 		// retain every unrelated byte and every other profile's original body.
 		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
 		if err != nil {
