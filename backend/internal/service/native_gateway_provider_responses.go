@@ -146,7 +146,7 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 			return deny()
 		}
 	}
-	if _, ok := gatewayOAuthSeconds(fields["max_output_tokens"]); !ok || !gatewayNativeProviderTextInput(fields["input"]) {
+	if _, ok := gatewayOAuthSeconds(fields["max_output_tokens"]); !ok || !gatewayNativeProviderTextInput(profile, fields["input"]) {
 		return deny()
 	}
 	if raw := fields["instructions"]; raw != nil {
@@ -237,7 +237,7 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	return wire, mapping, nil
 }
 
-func gatewayNativeProviderTextInput(raw []byte) bool {
+func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
 		return true
@@ -296,9 +296,28 @@ func gatewayNativeProviderTextInput(raw []byte) bool {
 				return false
 			}
 		case "reasoning":
-			fields, ok = gatewayClaudeObject(raw, "type", "id", "summary", "encrypted_content", "status")
+			keys := []string{"type", "id", "summary", "encrypted_content", "status"}
+			// MiniMax returns clear reasoning content in its Responses output.
+			// Accept that exact text-only shape on subsequent full-history turns;
+			// keep it opaque through the existing client-tool codec.
+			if profile == GatewayMiniMaxMPlanResponsesProfile {
+				keys = append(keys, "content")
+			}
+			fields, ok = gatewayClaudeObject(raw, keys...)
 			if !ok {
 				return false
+			}
+			if content := fields["content"]; content != nil {
+				var parts []json.RawMessage
+				if bytes.Equal(bytes.TrimSpace(content), []byte("null")) || json.Unmarshal(content, &parts) != nil {
+					return false
+				}
+				for _, raw := range parts {
+					part, valid := gatewayClaudeObject(raw, "type", "text")
+					if !valid || string(part["type"]) != `"reasoning_text"` || !gatewayNativeProviderString(part["text"]) {
+						return false
+					}
+				}
 			}
 			if value := fields["encrypted_content"]; value != nil && !gatewayNativeProviderString(value) {
 				return false
