@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -143,8 +145,12 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 	if err != nil || gatewayOAuthPhysicalValid(a, p) != nil || p.QualifiedAt.IsZero() {
 		return unavailable
 	}
+	if s.modelVersions != nil {
+		s.modelVersions.Refresh(ctx, force)
+	}
+	identity := resolveCodexOutboundIdentity("")
 	principal := GatewayAccountLimitsPrincipal(p)
-	key := principal + ":" + strconv.FormatInt(version, 10)
+	key := principal + ":" + strconv.FormatInt(version, 10) + ":" + identity.version
 	cache := &s.models
 	for {
 		cache.Lock()
@@ -181,7 +187,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		pending := make(chan struct{})
 		cache.pending[key] = pending
 		cache.Unlock()
-		out := s.fetchAccountModels(ctx, a, p, version, principal)
+		out := s.fetchAccountModels(ctx, a, p, version, principal, identity)
 		ttl := 5 * time.Second
 		if out.Status == "snapshot" {
 			ttl = 60 * time.Second
@@ -198,7 +204,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		return out
 	}
 }
-func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *Account, p GatewayNativeOAuthPhysical, version int64, principal string) GatewayAccountModelsResult {
+func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *Account, p GatewayNativeOAuthPhysical, version int64, principal string, identity codexOutboundIdentity) GatewayAccountModelsResult {
 	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
 	bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -206,7 +212,7 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 	if err != nil {
 		return unavailable
 	}
-	endpoint := GatewayCodexOAuthBaseURL + "/models?client_version=" + CodexCanonicalClientVersion()
+	endpoint := GatewayCodexOAuthBaseURL + "/models?client_version=" + identity.version
 	request, err := http.NewRequestWithContext(bounded, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return unavailable
@@ -214,7 +220,6 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 	request.Header.Set("Authorization", "Bearer "+bundle.AccessToken)
 	request.Header.Set("ChatGPT-Account-Id", p.ProviderAccount)
 	request.Header.Set("Accept", "application/json")
-	identity := resolveCodexOutboundIdentity("")
 	request.Header.Set("Originator", identity.originator)
 	request.Header.Set("User-Agent", identity.userAgent)
 	request.Header.Set("Version", identity.version)
@@ -234,7 +239,21 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 	if err != nil || len(raw) > 2<<20 {
 		return unavailable
 	}
-	models, err := parseGatewayCodexAccountModels(raw)
+	projection := gatewayCodexCatalogProjection{}
+	models, err := projectGatewayCodexAccountModels(raw, &projection)
+	event := struct {
+		Event         string         `json:"event"`
+		ClientVersion string         `json:"client_version"`
+		RawCount      int            `json:"raw_count"`
+		ReturnedCount int            `json:"returned_count"`
+		Excluded      map[string]int `json:"excluded_counts"`
+	}{"gateway_native_codex_model_catalog", identity.version, projection.raw, len(models), projection.excluded}
+	if err != nil {
+		event.ReturnedCount = 0
+		event.Excluded = map[string]int{"invalid_manifest": 1}
+	}
+	line, _ := json.Marshal(event)
+	_, _ = fmt.Fprintln(os.Stderr, string(line))
 	if err != nil {
 		return unavailable
 	}
@@ -242,7 +261,15 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 	return GatewayAccountModelsResult{Status: "snapshot", PhysicalGeneration: p.Scope.Generation, PrincipalVersion: principal, Source: "codex", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano), Models: &models}
 }
 
+type gatewayCodexCatalogProjection struct {
+	raw      int
+	excluded map[string]int
+}
+
 func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
+	return projectGatewayCodexAccountModels(raw, &gatewayCodexCatalogProjection{})
+}
+func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalogProjection) ([]GatewayAccountModel, error) {
 	root, ok := GatewayNativePayloadFields(raw, "models")
 	if !ok {
 		return nil, ErrGatewayNativeIdentity
@@ -251,10 +278,12 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 	if string(root["models"]) == "null" || json.Unmarshal(root["models"], &entries) != nil || entries == nil || len(entries) > 128 {
 		return nil, ErrGatewayNativeIdentity
 	}
+	projection.raw = len(entries)
+	projection.excluded = map[string]int{}
 	out := []GatewayAccountModel{}
 	seen := map[string]bool{}
 	for _, rawModel := range entries {
-		fields, ok := GatewayNativePayloadFields(rawModel, "slug", "id", "visibility", "supported_in_api", "supported_endpoints", "input_modalities", "supported_reasoning_levels", "default_reasoning_level", "disabled", "available", "status")
+		fields, ok := GatewayNativePayloadFields(rawModel, "slug", "id", "visibility", "supported_in_api", "supported_endpoints", "input_modalities", "output_modalities", "supported_reasoning_levels", "default_reasoning_level", "disabled", "available", "status")
 		if !ok {
 			return nil, ErrGatewayNativeIdentity
 		}
@@ -272,11 +301,16 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 			return nil, ErrGatewayNativeIdentity
 		}
 		seen[slug] = true
-		usable := true
+		exclusion := ""
+		exclude := func(reason string) {
+			if exclusion == "" {
+				exclusion = reason
+			}
+		}
 		// A review token marks a review-only model; preview is an ordinary ID.
 		for _, token := range strings.FieldsFunc(strings.ToLower(slug), func(r rune) bool { return r == '-' || r == '_' || r == '.' || r == ':' || r == '/' }) {
 			if token == "review" {
-				usable = false
+				exclude("review_only")
 			}
 		}
 		// supported_in_api describes API-key access. ChatGPT OAuth includes false.
@@ -293,7 +327,7 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 					return nil, ErrGatewayNativeIdentity
 				}
 				if b != want {
-					usable = false
+					exclude("unavailable")
 				}
 			}
 		}
@@ -302,8 +336,9 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 			if json.Unmarshal(value, &v) != nil {
 				return nil, ErrGatewayNativeIdentity
 			}
-			if v != "list" {
-				usable = false
+			// Visibility controls picker presentation, not account access.
+			if v != "list" && v != "hide" && v != "none" {
+				return nil, ErrGatewayNativeIdentity
 			}
 		}
 		if value := fields["status"]; value != nil {
@@ -312,10 +347,11 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 				return nil, ErrGatewayNativeIdentity
 			}
 			if v != "active" && v != "available" {
-				usable = false
+				exclude("unavailable")
 			}
 		}
-		for name, want := range map[string]string{"supported_endpoints": "responses", "input_modalities": "text"} {
+		for _, capability := range []struct{ name, want string }{{"supported_endpoints", "responses"}, {"input_modalities", "text"}, {"output_modalities", "text"}} {
+			name, want := capability.name, capability.want
 			if value := fields[name]; value != nil {
 				var values []string
 				if json.Unmarshal(value, &values) != nil {
@@ -328,11 +364,12 @@ func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
 					}
 				}
 				if !found {
-					usable = false
+					exclude(name)
 				}
 			}
 		}
-		if !usable {
+		if exclusion != "" {
+			projection.excluded[exclusion]++
 			continue
 		}
 		m := GatewayAccountModel{ModelID: slug, Fast: GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}

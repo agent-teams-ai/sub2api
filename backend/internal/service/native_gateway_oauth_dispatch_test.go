@@ -146,8 +146,8 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 				require.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "))
 			}
 			require.Equal(t, provider, r.Header.Get("ChatGPT-Account-Id"))
-			require.Equal(t, codexCLIUserAgent, r.Header.Get("User-Agent"))
-			require.Equal(t, codexCLIVersion, r.Header.Get("Version"))
+			require.Equal(t, CodexCanonicalUserAgent(), r.Header.Get("User-Agent"))
+			require.Equal(t, CodexCanonicalClientVersion(), r.Header.Get("Version"))
 			require.Empty(t, r.Header.Get("Cookie"))
 			if f.modelsStatus != 0 {
 				w.WriteHeader(f.modelsStatus)
@@ -164,9 +164,9 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 			require.Equal(t, http.MethodPost, r.Method)
 			require.Equal(t, provider, r.Header.Get("ChatGPT-Account-Id"))
 			require.Equal(t, "text/event-stream", r.Header.Get("Accept"))
-			require.Equal(t, codexCLIUserAgent, r.Header.Get("User-Agent"))
+			require.Equal(t, CodexCanonicalUserAgent(), r.Header.Get("User-Agent"))
 			require.Equal(t, "codex-tui", r.Header.Get("originator"))
-			require.Equal(t, codexCLIVersion, r.Header.Get("version"))
+			require.Equal(t, CodexCanonicalClientVersion(), r.Header.Get("version"))
 			require.Empty(t, r.Header.Get("OpenAI-Beta"))
 			for _, header := range []string{"X-Codex-Turn-State", "Cookie", "X-Api-Key", "Origin", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Only"} {
 				require.Empty(t, r.Header.Get(header))
