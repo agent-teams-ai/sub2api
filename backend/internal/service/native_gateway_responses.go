@@ -13,10 +13,13 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -96,6 +99,67 @@ const (
 	gatewayNativeFailureWrite       gatewayNativeResponseFailurePhase = "downstream_write"
 	gatewayNativeFailureFlush       gatewayNativeResponseFailurePhase = "downstream_flush"
 )
+
+// Transport observations contain only fixed protocol state, never peer names,
+// addresses, headers or error strings. Hooks compose with existing request traces.
+// Flags describe callbacks observed at failure time; false never proves zero
+// bytes written, absent provider effects or permission to retry.
+type gatewayNativeTransportObservation struct {
+	connection      atomic.Uint32 // 0: no connection, 1: new, 2: reused
+	requestWritten  atomic.Bool
+	responseStarted atomic.Bool
+}
+
+func (o *gatewayNativeTransportObservation) trace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			state := uint32(1)
+			if info.Reused {
+				state = 2
+			}
+			o.connection.Store(state)
+		},
+		WroteRequest:         func(info httptrace.WroteRequestInfo) { o.requestWritten.Store(info.Err == nil) },
+		GotFirstResponseByte: func() { o.responseStarted.Store(true) },
+	}
+}
+
+func (o *gatewayNativeTransportObservation) connectionKind() string {
+	switch o.connection.Load() {
+	case 1:
+		return "new"
+	case 2:
+		return "reused"
+	default:
+		return "not_obtained"
+	}
+}
+
+func gatewayNativeTransportErrorReason(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, io.EOF):
+		return "eof"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, net.ErrClosed), errors.Is(err, os.ErrClosed), errors.Is(err, io.ErrClosedPipe):
+		return "connection_closed"
+	case errors.Is(err, syscall.EPIPE):
+		return "broken_pipe"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "transport_timeout"
+	}
+	return "other"
+}
 
 type gatewayNativeHTTPErrorDiagnostic struct {
 	category, shape, parameter string
@@ -520,6 +584,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// bounded status and static phases reach the private process stderr channel.
 	// It works without initializing the general logger and leaves readiness on
 	// stdout intact. Never include context fields, headers, bodies or error text.
+	transport := &gatewayNativeTransportObservation{}
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), transport.trace()))
+	var transportError error
 	status := 0
 	providerErrorCategory := ""
 	providerErrorShape, providerErrorParameter := "", ""
@@ -532,17 +599,32 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			phase = gatewayNativeFailureDeadline
 		}
 		event := struct {
-			Event                  string                            `json:"event"`
-			Phase                  gatewayNativeResponseFailurePhase `json:"phase"`
-			HTTPStatus             int                               `json:"http_status,omitempty"`
-			ProviderErrorCategory  string                            `json:"provider_error_category,omitempty"`
-			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
-			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
-			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
-			UpstreamMediaCategory  string                            `json:"upstream_media_category,omitempty"`
-			UpstreamBodyShape      string                            `json:"upstream_body_shape,omitempty"`
-			UpstreamBodyPrefix     string                            `json:"upstream_body_prefix,omitempty"`
+			Event                   string                            `json:"event"`
+			Phase                   gatewayNativeResponseFailurePhase `json:"phase"`
+			HTTPStatus              int                               `json:"http_status,omitempty"`
+			TransportErrorReason    string                            `json:"transport_error_reason,omitempty"`
+			UpstreamConnection      string                            `json:"upstream_connection,omitempty"`
+			UpstreamRequestWritten  *bool                             `json:"upstream_request_written,omitempty"`
+			UpstreamResponseStarted *bool                             `json:"upstream_response_started,omitempty"`
+			NativeEntered           *bool                             `json:"native_entered,omitempty"`
+			ProviderErrorCategory   string                            `json:"provider_error_category,omitempty"`
+			ProviderErrorShape      string                            `json:"provider_error_shape,omitempty"`
+			ProviderErrorParameter  string                            `json:"provider_error_parameter,omitempty"`
+			ReadErrorReason         string                            `json:"read_error_reason,omitempty"`
+			UpstreamMediaCategory   string                            `json:"upstream_media_category,omitempty"`
+			UpstreamBodyShape       string                            `json:"upstream_body_shape,omitempty"`
+			UpstreamBodyPrefix      string                            `json:"upstream_body_prefix,omitempty"`
 		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
+		if phase == gatewayNativeFailureTransport {
+			event.TransportErrorReason = gatewayNativeTransportErrorReason(transportError)
+			event.UpstreamConnection = transport.connectionKind()
+			written, started := transport.requestWritten.Load(), transport.responseStarted.Load()
+			event.UpstreamRequestWritten, event.UpstreamResponseStarted = &written, &started
+			if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+				entered := lifetime.Snapshot().Entered
+				event.NativeEntered = &entered
+			}
+		}
 		if phase == gatewayNativeFailureSSERead {
 			event.ReadErrorReason = readErrorReason
 		}
@@ -572,6 +654,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if err == ErrGatewayNativeIdentity || err == ErrGatewayNativeReplay {
 			return nil, err
 		}
+		transportError = err
 		return nil, fail(gatewayNativeFailureTransport)
 	}
 	if resp == nil || resp.Body == nil {
