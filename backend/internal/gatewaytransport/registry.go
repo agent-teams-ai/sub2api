@@ -412,6 +412,10 @@ func (h *Handler) seal(e *reservation) {
 }
 
 func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (bool, error) {
+	return h.admitWithin(ctx, consumer, e, h.cfg.CallbackTimeout, h.cfg.CallbackTimeout)
+}
+
+func (h *Handler) admitWithin(ctx context.Context, consumer string, e *reservation, queueBudget, activeBudget time.Duration) (bool, error) {
 	h.mu.Lock()
 	if e.callbackStarted {
 		h.mu.Unlock()
@@ -441,13 +445,11 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	if err != nil {
 		return false, errDenied
 	}
-	callbackCtx, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
-	defer cancel()
+	var callbackCtx context.Context
+	var cancel context.CancelFunc
 	if token != "" {
-		select {
-		case h.preclaimCallbacks <- struct{}{}:
-			defer func() { <-h.preclaimCallbacks }()
-		case <-callbackCtx.Done():
+		callbackCtx, cancel, err = h.preclaimRPCContext(ctx, queueBudget, activeBudget)
+		if err != nil {
 			// No POST was attempted. This invocation cannot have claimed SQL.
 			h.mu.Lock()
 			if e.proof == nil && !e.admitted {
@@ -456,7 +458,10 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 			h.mu.Unlock()
 			return false, nil
 		}
+	} else {
+		callbackCtx, cancel = context.WithTimeout(ctx, activeBudget)
 	}
+	defer cancel()
 	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, strings.NewReader(string(body)))
 	if err != nil {
 		return false, errDenied

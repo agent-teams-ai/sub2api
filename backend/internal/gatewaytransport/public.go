@@ -232,22 +232,67 @@ func (h *Handler) writeExecutionReceipt(w http.ResponseWriter, consumer string, 
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// Preclaim queueing owns no callback socket. The original caller (including
+// admission expiry) bounds both stages, but queue time does not consume the
+// independent active RPC budget shared by authority and public claim producers.
+func (h *Handler) preclaimRPCContext(ctx context.Context, queueBudget, activeBudget time.Duration) (context.Context, context.CancelFunc, error) {
+	queueCtx, cancelQueue := context.WithTimeout(ctx, queueBudget)
+	select {
+	case h.preclaimCallbacks <- struct{}{}:
+	case <-queueCtx.Done():
+		err := queueCtx.Err()
+		cancelQueue()
+		return nil, nil, err
+	}
+	// Acquisition and cancellation can become ready together. A permit must
+	// never turn an expired queued producer into a new callback attempt.
+	if err := queueCtx.Err(); err != nil {
+		cancelQueue()
+		<-h.preclaimCallbacks
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		cancelQueue()
+		<-h.preclaimCallbacks
+		return nil, nil, err
+	}
+	cancelQueue()
+	activeCtx, cancelActive := context.WithTimeout(ctx, activeBudget)
+	if err := activeCtx.Err(); err != nil {
+		cancelActive()
+		<-h.preclaimCallbacks
+		return nil, nil, err
+	}
+	var once sync.Once
+	return activeCtx, func() {
+		once.Do(func() {
+			cancelActive()
+			<-h.preclaimCallbacks
+		})
+	}, nil
+}
+
 // Fixed origin, one attempt, no environment proxy/redirect and bounded metadata.
 func (h *Handler) publicPost(ctx context.Context, path string, body, reply any) error {
+	return h.publicPostWithin(ctx, path, body, reply, h.cfg.CallbackTimeout, h.cfg.CallbackTimeout)
+}
+
+func (h *Handler) publicPostWithin(ctx context.Context, path string, body, reply any, queueBudget, activeBudget time.Duration) error {
 	raw, err := json.Marshal(body)
 	if err != nil || int64(len(raw)) > h.cfg.CallbackBytes {
 		return errDenied
 	}
-	bounded, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
-	defer cancel()
+	var bounded context.Context
+	var cancel context.CancelFunc
 	if path == "/private/native/v1/execution-authority" {
-		select {
-		case h.preclaimCallbacks <- struct{}{}:
-			defer func() { <-h.preclaimCallbacks }()
-		case <-bounded.Done():
+		bounded, cancel, err = h.preclaimRPCContext(ctx, queueBudget, activeBudget)
+		if err != nil {
 			return errAuthorityUnavailable
 		}
+	} else {
+		bounded, cancel = context.WithTimeout(ctx, activeBudget)
 	}
+	defer cancel()
 	req, err := http.NewRequestWithContext(bounded, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, bytes.NewReader(raw))
 	if err != nil {
 		return errDenied
