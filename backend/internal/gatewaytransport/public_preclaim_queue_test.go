@@ -334,10 +334,19 @@ func TestPublicPreclaimQueueExpiryAndCallerCancellationNeverPost(t *testing.T) {
 					done <- result
 				}()
 				if mode == "callerCancel" {
+					if producer == "claim" {
+						// Cancel after this invocation enters the admission path,
+						// independently of how quickly its goroutine is scheduled.
+						require.Eventually(t, func() bool {
+							f.h.mu.Lock()
+							defer f.h.mu.Unlock()
+							return e.callbackStarted
+						}, 500*time.Millisecond, time.Millisecond)
+					}
 					select {
 					case <-done:
 						t.Fatal("queued producer returned before caller cancellation")
-					case <-time.After(20 * time.Millisecond):
+					default:
 					}
 					cancel()
 				}
