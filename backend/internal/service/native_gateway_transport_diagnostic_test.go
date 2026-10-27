@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +38,11 @@ func TestGatewayNativeTransportFailureReasonClassification(t *testing.T) {
 		{"refused", syscall.ECONNREFUSED, "connection_refused"},
 		{"typed timeout", &net.DNSError{Name: private, IsTimeout: true}, "transport_timeout"},
 		{"typed nontimeout", &net.DNSError{Name: private}, "other"},
+		{"nested URL timeout", &url.Error{Op: private, URL: "https://private.invalid", Err: fmt.Errorf("%s: %w", private, &net.DNSError{Name: private, IsTimeout: true})}, "transport_timeout"},
+		{"nested operation timeout", &net.OpError{Op: private, Net: private, Err: fmt.Errorf("%s: %w", private, &net.DNSError{Name: private, IsTimeout: true})}, "transport_timeout"},
+		{"joined nontimeout then timeout", errors.Join(&net.DNSError{Name: private}, fmt.Errorf("%s: %w", private, &net.DNSError{Name: private, IsTimeout: true})), "transport_timeout"},
+		{"joined timeout then nontimeout", errors.Join(&net.DNSError{Name: private, IsTimeout: true}, &net.DNSError{Name: private}), "transport_timeout"},
+		{"joined closed before timeout", errors.Join(&net.DNSError{Name: private, IsTimeout: true}, net.ErrClosed), "connection_closed"},
 		{"text counterexample", fmt.Errorf("connection reset unexpected EOF broken pipe: %s", private), "other"},
 		{"nil", nil, "other"},
 	} {

@@ -154,9 +154,28 @@ func gatewayNativeTransportErrorReason(err error) string {
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "connection_refused"
 	}
-	var networkError net.Error
-	if errors.As(err, &networkError) && networkError.Timeout() {
-		return "transport_timeout"
+	// A url.Error is itself a net.Error, but Timeout may be false when an
+	// intervening fmt wrapper hides a deeper typed timeout. Inspect each cause
+	// independently, including joined causes, without inspecting error text.
+	pending := []error{err}
+	for visited := 0; len(pending) > 0 && visited < 32; visited++ {
+		last := len(pending) - 1
+		current := pending[last]
+		pending = pending[:last]
+		if current == nil {
+			continue
+		}
+		if networkError, ok := current.(net.Error); ok && networkError.Timeout() {
+			return "transport_timeout"
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			causes := joined.Unwrap()
+			for i := min(len(causes), 32-len(pending)) - 1; i >= 0; i-- {
+				pending = append(pending, causes[i])
+			}
+		} else if cause := errors.Unwrap(current); cause != nil {
+			pending = append(pending, cause)
+		}
 	}
 	return "other"
 }
