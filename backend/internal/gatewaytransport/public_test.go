@@ -39,18 +39,22 @@ func TestPublicIngressStreamsReplaysEvictsAndPreservesPrivateBoundary(t *testing
 			var input struct {
 				admitRequest
 				ExecutionBearer string `json:"executionBearer"`
+				RequestedModel  string `json:"requestedModel"`
 			}
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
 			require.Equal(t, capability, input.ExecutionBearer)
+			require.Equal(t, "fixture-model", input.RequestedModel)
 			_ = json.NewEncoder(w).Encode(ownerReply(input.admitRequest))
 		case "/private/native/v1/execution-settle":
 			var input struct {
-				ConsumerID string  `json:"consumerId"`
-				Proof      Proof   `json:"proof"`
-				Receipt    Receipt `json:"receipt"`
+				ConsumerID     string  `json:"consumerId"`
+				Proof          Proof   `json:"proof"`
+				Receipt        Receipt `json:"receipt"`
+				RequestedModel string  `json:"requestedModel"`
 			}
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
 			require.Equal(t, "fixture-consumer", input.ConsumerID)
+			require.Equal(t, "fixture-model", input.RequestedModel)
 			require.True(t, closed(input.Receipt.Lifetime))
 			require.True(t, input.Receipt.Lifetime.Completed)
 			settled.Add(1)

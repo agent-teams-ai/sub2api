@@ -107,6 +107,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 		return
 	}
 	nativeMessages := public && r.URL.Path == "/v1/messages"
+	requestedModel := profile.Model
 	payload := []byte(input.Payload)
 	var err error
 	if nativeMessages {
@@ -117,15 +118,14 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 		}
 	} else {
 		requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
-		payloadModel := input.Descriptor.Model
 		if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
 			fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
-			if !valid || json.Unmarshal(fields["model"], &payloadModel) != nil || !service.GatewayAccountModelIDValid(payloadModel) {
+			if !valid || json.Unmarshal(fields["model"], &requestedModel) != nil || !service.GatewayAccountModelIDValid(requestedModel) {
 				writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 				return
 			}
 		}
-		payload, err = qualifyPayloadWithDefaultTier(input.Payload, payloadModel, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
+		payload, err = qualifyPayloadWithDefaultTier(input.Payload, requestedModel, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
 		if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
 			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 			return
@@ -170,6 +170,9 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 	if executionBearer != "" {
 		h.mu.Lock()
 		e.executionBearer = executionBearer
+		// Retain only this validated scalar for public usage attribution. The
+		// first reservation owns it; duplicates returned above cannot replace it.
+		e.requestedModel = requestedModel
 		h.mu.Unlock()
 		defer func() {
 			durable := h.settlePublic(peer.ConsumerID, e)

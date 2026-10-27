@@ -157,6 +157,7 @@ type reservation struct {
 	usage                                           *service.GatewayNativeUsage
 	effect                                          string
 	executionBearer                                 string // public per-execution capability; never serialized
+	requestedModel                                  string // validated public model metadata; payload is never retained
 	statusOnly                                      bool   // authenticated no-dispatch reply; never authorizes SQL closure
 	preclaimRefused                                 bool   // exact private pre-work refusal for this native nonce only
 }
@@ -486,7 +487,8 @@ func (h *Handler) admitWithin(ctx context.Context, consumer string, e *reservati
 		request = struct {
 			admitRequest
 			ExecutionBearer string `json:"executionBearer"`
-		}{input, token}
+			RequestedModel  string `json:"requestedModel"`
+		}{input, token, h.publicRequestedModel(e)}
 	}
 	body, err := json.Marshal(request)
 	if err != nil {

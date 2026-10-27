@@ -322,6 +322,17 @@ func (h *Handler) publicPostWithin(ctx context.Context, path string, body, reply
 	return nil
 }
 
+// Production public reservations capture the qualified request model before
+// admission. Direct fixture reservations retain their canonical descriptor model.
+func (h *Handler) publicRequestedModel(e *reservation) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e.requestedModel != "" {
+		return e.requestedModel
+	}
+	return e.request.Descriptor.Model
+}
+
 // Physical closure and terminal delivery are independent of client disconnect.
 // Failed callbacks retain the original registry evidence for protected cleanup.
 func (h *Handler) settlePublic(consumer string, e *reservation) bool {
@@ -372,10 +383,11 @@ func (h *Handler) settlePublicWithin(consumer string, e *reservation, queueBudge
 		return false
 	}
 	body := struct {
-		ConsumerID string  `json:"consumerId"`
-		Proof      Proof   `json:"proof"`
-		Receipt    Receipt `json:"receipt"`
-	}{consumer, *r.Proof, r}
+		ConsumerID     string  `json:"consumerId"`
+		Proof          Proof   `json:"proof"`
+		Receipt        Receipt `json:"receipt"`
+		RequestedModel string  `json:"requestedModel"`
+	}{consumer, *r.Proof, r, h.publicRequestedModel(e)}
 	var reply struct {
 		OK bool `json:"ok"`
 	}

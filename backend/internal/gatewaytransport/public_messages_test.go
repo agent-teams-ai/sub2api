@@ -86,14 +86,20 @@ func TestPublicNativeMessagesPreserveProtocolAndExecutionAuthority(t *testing.T)
 			_ = json.NewEncoder(w).Encode(publicAuthorizationReply{"fixture-consumer", input.RequestRef, original.Worker, original.Admission, original.Descriptor})
 		case "/private/native/v1/public-admit":
 			admits.Add(1)
-			var input admitRequest
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
-			_ = json.NewEncoder(w).Encode(ownerReply(input))
-		case "/private/native/v1/execution-settle":
 			var input struct {
-				Receipt Receipt `json:"receipt"`
+				admitRequest
+				RequestedModel string `json:"requestedModel"`
 			}
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+			require.Equal(t, service.GatewayClaudeOAuthModel, input.RequestedModel)
+			_ = json.NewEncoder(w).Encode(ownerReply(input.admitRequest))
+		case "/private/native/v1/execution-settle":
+			var input struct {
+				Receipt        Receipt `json:"receipt"`
+				RequestedModel string  `json:"requestedModel"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+			require.Equal(t, service.GatewayClaudeOAuthModel, input.RequestedModel)
 			require.True(t, closed(input.Receipt.Lifetime))
 			require.True(t, input.Receipt.Lifetime.Completed)
 			require.NotNil(t, input.Receipt.NativeUsage)
