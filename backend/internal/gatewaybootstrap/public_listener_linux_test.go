@@ -3,7 +3,6 @@
 package gatewaybootstrap
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -67,7 +66,7 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	slots := make(chan struct{}, publicSocketBudget(active))
-	server := &http.Server{Handler: transport.PublicHandler(active), ReadHeaderTimeout: time.Second, IdleTimeout: time.Second}
+	server := newPublicHTTPServer(context.Background(), transport.PublicHandler(active))
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(&boundedListener{Listener: listener, slots: slots}) }()
 	defer func() {
@@ -86,17 +85,9 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 		conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
 		require.NoError(t, err)
 		sockets = append(sockets, conn)
-		require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
-		_, err = io.WriteString(conn, "GET /unsupported HTTP/1.1\r\nHost: localhost\r\n\r\n")
+		// Partial headers own a socket without reaching public admission.
+		_, err = io.WriteString(conn, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\n")
 		require.NoError(t, err)
-		response, err := http.ReadResponse(bufio.NewReader(conn), nil)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusNotFound, response.StatusCode)
-		require.False(t, response.Close, "idle connection remains a live keepalive socket")
-		_, err = io.Copy(io.Discard, response.Body)
-		require.NoError(t, err)
-		require.NoError(t, response.Body.Close())
-		require.NoError(t, conn.SetDeadline(time.Time{}))
 	}
 	for i := 0; i < active; i++ {
 		conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
@@ -106,7 +97,7 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 		require.NoError(t, err)
 	}
 	require.Eventually(t, func() bool { return metadata.Load() == active }, 2*time.Second, time.Millisecond)
-	require.Equal(t, 2*active, len(slots), "held requests and idle keepalives own separate sockets")
+	require.Equal(t, 2*active, len(slots), "held requests and incomplete headers own separate sockets")
 	httpTransport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxConnsPerHost: burst}
 	defer httpTransport.CloseIdleConnections()
 	httpClient := &http.Client{Transport: httpTransport, Timeout: 2 * time.Second}
@@ -165,5 +156,5 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("public shutdown exceeded its bound")
 	}
-	require.Eventually(t, func() bool { return len(slots) == 0 }, time.Second, time.Millisecond, "shutdown releases idle and held socket ownership")
+	require.Eventually(t, func() bool { return len(slots) == 0 }, time.Second, time.Millisecond, "shutdown releases incomplete and held socket ownership")
 }

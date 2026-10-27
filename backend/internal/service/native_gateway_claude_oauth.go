@@ -299,7 +299,7 @@ func (s *GatewayNativeClaudeOAuth) exchange(ctx context.Context, body map[string
 	if err != nil || res == nil || res.Body == nil {
 		return empty, ErrGatewayNativeIdentity
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	response, err := io.ReadAll(io.LimitReader(res.Body, 65537))
 	defer clear(response)
 	if err != nil || len(response) > 65536 || res.StatusCode != http.StatusOK || res.Request == nil || res.Request.URL.String() != oauth.TokenURL {

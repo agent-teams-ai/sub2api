@@ -184,7 +184,7 @@ func TestStandardResponsesDefaultsPreserveBytesAndDenyDuplicateAuthority(t *test
 	normalized, err := standardResponsesDefaults(raw)
 	require.NoError(t, err)
 	require.Equal(t, string(raw[:len(raw)-3])+`,"store":false,"service_tier":"default"} `+"\n", string(normalized))
-	_, err = qualifyPayload(normalized, "fixture-model", 100, 1000)
+	_, err = qualifyPayloadWithDefaultTier(normalized, "fixture-model", 100, 1000, true)
 	require.NoError(t, err)
 	for _, raw := range []string{
 		`{"model":"fixture-model","stream":true,"store":false,"\u0073tore":true}`,
@@ -198,7 +198,7 @@ func TestStandardResponsesDefaultsPreserveBytesAndDenyDuplicateAuthority(t *test
 	for _, raw := range []string{`{"model":"fixture-model","stream":true,"store":true}`, `{"model":"fixture-model","stream":true,"service_tier":"priority"}`} {
 		normalized, err := standardResponsesDefaults([]byte(raw))
 		require.NoError(t, err)
-		_, err = qualifyPayload(normalized, "fixture-model", 100, 1000)
+		_, err = qualifyPayloadWithDefaultTier(normalized, "fixture-model", 100, 1000, true)
 		require.Error(t, err)
 	}
 }

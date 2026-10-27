@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
@@ -32,6 +33,9 @@ import (
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile {
+		return GatewayGrokOAuthBaseURL + "/v1/responses", nil
+	}
 	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
 		return GatewayCodexOAuthBaseURL + "/responses", nil
 	}
@@ -480,10 +484,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		return nil, ErrGatewayNativeIdentity
 	}
 	upstreamBody := body
-	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
-		// Internal admission still requires default. MiMo does not document this
-		// provider field: delete only its top-level span after validation, keeping
-		// every unrelated tool/user byte. Other profiles retain the original body.
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayKimiCodeResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayMiniMaxMPlanResponsesProfile {
+		// Admission accepts only default. MiMo omits this provider field; Kimi
+		// rejects default and MiniMax-M3.1-Flash does not support the field.
+		// Remove only the validated top-level span;
+		// retain every unrelated byte and every other profile's original body.
 		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
 		if err != nil {
 			return nil, ErrGatewayNativeIdentity
@@ -499,6 +504,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if GatewayNativeCodingPlanProfileIDValid(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		request.Header.Set("User-Agent", "ReviewRouter/native-account-gateway")
+	}
 	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
 		request.Header.Set("x-openai-internal-codex-responses-lite", "true")
 	}
@@ -572,6 +580,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// Passive quota evidence from this already admitted response only.
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusTooManyRequests {
 		s.captureGatewayAccountLimits(ctx, resp.Header)
+		captureGatewayGrokPassiveLimits(ctx, resp.Header)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
@@ -660,9 +669,20 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// Include original LF/CRLF bytes in each token for bounds and forwarding.
 	scanner.Split(gatewayNativeRawSSELine)
 	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
+	var toolRestorer *apicompat.ResponsesClientToolStreamRestorer
+	if gatewayNativeProviderProfile(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		if mapping, ok := grokResponsesClientToolMapping(c); ok {
+			toolRestorer = apicompat.NewResponsesClientToolStreamRestorer(mapping)
+		}
+	}
 	var event bytes.Buffer
 	var data []string
 	total := 0
+	outputLimit := int64(gatewayNativeResponseLimit)
+	if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+		outputLimit = lifetime.outputBytes
+	}
+	var delivered int64
 	for scanner.Scan() {
 		raw := scanner.Bytes()
 		total += len(raw)
@@ -694,7 +714,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if !utf8.Valid(event.Bytes()) {
 			return nil, fail(gatewayNativeFailureFrame)
 		}
+		if a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile && gatewayNativeGrokPingFrame(event.Bytes()) {
+			event.Reset()
+			data = nil
+			continue
+		}
 		completed := false
+		var restoredFrames []byte
 		if len(data) > 0 {
 			// SSE joins all data fields in an event before JSON interpretation.
 			payload := []byte(strings.Join(data, "\n"))
@@ -728,6 +754,18 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				completed = true
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
+			if toolRestorer != nil {
+				payloads, changed, restoreErr := toolRestorer.RestoreEvent(payload)
+				if restoreErr != nil {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				if changed {
+					restoredFrames, restoreErr = gatewayNativeGrokRestoredFrames(event.Bytes(), payloads)
+					if restoreErr != nil {
+						return nil, fail(gatewayNativeFailureFrameLimit)
+					}
+				}
+			}
 			if awaitingCodexFrame {
 				inProgressFrame := (kind == "response.created" || kind == "response.in_progress") && status == "in_progress"
 				if !inProgressFrame && !completed {
@@ -743,9 +781,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			// same event buffer remains bounded; these bytes alone prove nothing.
 			continue
 		}
-		if n, err := c.Writer.Write(event.Bytes()); err != nil || n != event.Len() {
+		forwardFrame := event.Bytes()
+		if restoredFrames != nil {
+			forwardFrame = restoredFrames
+		}
+		// The admitted output cap covers the emitted protocol, including events
+		// expanded by tool restoration, not only bytes read from the provider.
+		if int64(len(forwardFrame)) > outputLimit-delivered {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
+		if n, err := c.Writer.Write(forwardFrame); err != nil || n != len(forwardFrame) {
 			return nil, fail(gatewayNativeFailureWrite)
 		}
+		delivered += int64(len(forwardFrame))
 		if gatewayNativeFlush(c.Writer) != nil {
 			return nil, fail(gatewayNativeFailureFlush)
 		}

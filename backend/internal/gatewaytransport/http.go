@@ -116,12 +116,27 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			return
 		}
 	} else {
-		payload, err = qualifyPayload(input.Payload, input.Descriptor.Model, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound)
+		requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
+		payloadModel := input.Descriptor.Model
+		if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
+			fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
+			if !valid || json.Unmarshal(fields["model"], &payloadModel) != nil || !service.GatewayAccountModelIDValid(payloadModel) {
+				writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
+				return
+			}
+		}
+		payload, err = qualifyPayloadWithDefaultTier(input.Payload, payloadModel, input.Admission.Limits.Tokens, profile.ProviderTokenUpperBound, requireTier)
 		if err != nil || int64(len(payload)) > input.Admission.Limits.RequestBytes {
 			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 			return
 		}
 		if profile.Profile == service.GatewayClaudeOAuthMessagesProfile && service.ValidateGatewayNativeClaudeResponsesBounded(payload, input.Admission.Limits.RequestBytes) != nil {
+			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
+			return
+		}
+	}
+	if service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) || profile.Profile == service.GatewayGrokOAuthResponsesProfile {
+		if service.ValidateGatewayNativeProviderResponsesBounded(profile.Profile, payload, input.Admission.Limits.RequestBytes) != nil {
 			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 			return
 		}
@@ -197,6 +212,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 	})
 	ctx = service.WithGatewayNativeLifetime(ctx, e.life)
 	ctx = service.WithGatewayNativeProviderReadIdle(ctx, h.cfg.ProviderReadIdle)
+	ctx = service.WithGatewayProviderLimitsWriter(ctx, h.cfg.ProviderLimits)
 	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
 		ctx, err = h.cfg.OAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
 		if err != nil {
@@ -210,6 +226,19 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 	if profile.Profile == service.GatewayClaudeOAuthMessagesProfile {
 		ctx, err = h.cfg.ClaudeOAuth.BindApproved(ctx, input.Descriptor, input.Admission.AccountRef, input.Admission.AuthorizationEpoch, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
 		if err != nil {
+			h.finishNoEntry(e)
+			h.seal(e)
+			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))
+			h.writeExecutionReceipt(raw, peer.ConsumerID, e, public)
+			return
+		}
+	}
+	if profile.Profile == service.GatewayGrokOAuthResponsesProfile {
+		scope, operation, resolveErr := h.cfg.GrokOAuth.ResolveApproved(ctx, input.Descriptor, input.Admission.AccountRef)
+		if resolveErr == nil {
+			ctx, resolveErr = service.WithGatewayNativeGrokDispatch(ctx, h.cfg.GrokOAuth, scope, operation, input.Admission.Limits.RequestBytes, input.Admission.Limits.Tokens)
+		}
+		if resolveErr != nil {
 			h.finishNoEntry(e)
 			h.seal(e)
 			_ = controller.SetWriteDeadline(time.Now().Add(h.cfg.IOTimeout))

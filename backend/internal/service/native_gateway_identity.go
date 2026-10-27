@@ -33,7 +33,8 @@ func GatewayOpenRouterModelValid(model string) bool {
 // Finite identities only; endpoints/models remain trusted composition fields.
 func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
 	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
-		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model)
+		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model) ||
+		GatewayNativeCodingPlanProfileValid(profile, baseURL, model)
 }
 
 var ErrGatewayNativeIdentity = errors.New("gateway native identity rejected")
@@ -118,7 +119,10 @@ func HasGatewayNativeIdentity(a *Account) bool {
 	_, claudeGeneration := a.Extra["gateway_claude_generation_v1"]
 	_, claudeProfile := a.Extra["gateway_claude_profile_v1"]
 	_, claudeCustody := a.Extra["gateway_claude_scope_v1"]
-	return generation || profile || custody || claudeGeneration || claudeProfile || claudeCustody
+	_, grokGeneration := a.Extra["gateway_grok_generation_v1"]
+	_, grokProfile := a.Extra["gateway_grok_profile_v1"]
+	_, grokCustody := a.Extra["gateway_grok_scope_v1"]
+	return generation || profile || custody || claudeGeneration || claudeProfile || claudeCustody || grokGeneration || grokProfile || grokCustody
 }
 
 func validateGatewayNativeShape(a *Account) error {
@@ -137,7 +141,7 @@ func validateGatewayNativeShape(a *Account) error {
 	if profile == GatewayLegacyBridgeProfile {
 		mode, passthrough = "force_chat_completions", false
 	}
-	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile) ||
+	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && !GatewayNativeCodingPlanProfileIDValid(profile)) ||
 		a.Extra["openai_responses_mode"] != mode ||
 		a.Extra["openai_passthrough"] != passthrough ||
 		a.Extra["native_api_key_cancel_on_disconnect"] != true ||
@@ -267,6 +271,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 			defer lifetime.finish()
 		}
 	}
+	if ctx != nil && route.Profile == GatewayGrokOAuthResponsesProfile {
+		return s.forwardGatewayGrokRoute(ctx, c, route, body)
+	}
 	if ctx != nil && route.Profile == GatewayClaudeOAuthMessagesProfile {
 		return s.forwardGatewayClaudeRoute(ctx, c, route, body)
 	}
@@ -279,6 +286,15 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		(gjson.GetBytes(body, "service_tier").Exists() && gjson.GetBytes(body, "service_tier").String() != "default") ||
 		(gjson.GetBytes(body, "store").Exists() && gjson.GetBytes(body, "store").Bool()) {
 		return nil, false, ErrGatewayNativeIdentity
+	}
+	if GatewayNativeCodingPlanProfileIDValid(route.Profile) {
+		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
+		if prepareErr != nil {
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		body = prepared
+		setGrokResponsesClientToolMapping(c, mapping)
+		defer clearGrokResponsesClientToolMapping(c)
 	}
 	if _, ok := s.accountRepo.(GatewayNativeAccountLocker); !ok {
 		return nil, false, ErrGatewayNativeIdentity
@@ -313,7 +329,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	// Native Responses is the first qualification path. The separately selected
 	// historical bridge is never an automatic fallback after any dispatch.
 	var result *OpenAIForwardResult
-	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile {
+	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile || GatewayNativeCodingPlanProfileIDValid(route.Profile) {
 		result, err = s.forwardGatewayNativeResponses(ctx, c, a, body)
 	} else {
 		result, err = s.forwardResponsesViaRawChatCompletions(ctx, c, a, body)
@@ -344,6 +360,9 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 			return noop, ErrGatewayNativeIdentity
 		}
 		return noop, nil
+	}
+	if state.route.Profile == GatewayGrokOAuthResponsesProfile {
+		return s.checkGatewayGrokDispatch(request, a, state)
 	}
 	if state.route.Profile == GatewayCodexOAuthResponsesProfile {
 		return s.checkGatewayOAuthDispatch(request, a, state)

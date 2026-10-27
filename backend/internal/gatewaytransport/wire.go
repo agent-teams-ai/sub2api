@@ -149,7 +149,7 @@ func (a Admission) valid(now time.Time) bool {
 	return err == nil && t.After(now) && identifier.MatchString(a.ExecutionRef) &&
 		identifier.MatchString(a.IssuerEpoch) && identifier.MatchString(a.AccountRef) &&
 		identifier.MatchString(a.InvocationRef) && identifier.MatchString(a.AttemptRef) && identifier.MatchString(a.SubjectRef) &&
-		(a.ProfileID == service.GatewayMiMoResponsesProfile || a.ProfileID == service.GatewayOpenRouterResponsesProfile || a.ProfileID == service.GatewayCodexOAuthResponsesProfile || a.ProfileID == service.GatewayClaudeOAuthMessagesProfile) &&
+		(a.ProfileID == service.GatewayMiMoResponsesProfile || a.ProfileID == service.GatewayOpenRouterResponsesProfile || a.ProfileID == service.GatewayCodexOAuthResponsesProfile || a.ProfileID == service.GatewayClaudeOAuthMessagesProfile || service.GatewayNativeCodingPlanProfileIDValid(a.ProfileID) || a.ProfileID == service.GatewayGrokOAuthResponsesProfile) &&
 		a.AuthorizationEpoch >= 0 && a.AuthorizationEpoch <= maxSafeInteger &&
 		a.PolicyRevision >= 0 && a.PolicyRevision <= maxSafeInteger && a.BindingRevision >= 0 && a.BindingRevision <= maxSafeInteger &&
 		l.Requests >= 1 && l.Requests <= 10000 && l.Concurrency >= 1 && l.Concurrency <= 128 && l.Concurrency <= l.Requests &&
@@ -266,7 +266,9 @@ func strictValue(data []byte, typ reflect.Type, depth int) error {
 
 // Preserve every non-cap byte, including custom tools and user input. The
 // original cap token must be a canonical positive integer before clamping.
-func qualifyPayload(raw []byte, model string, approved, upper int64) ([]byte, error) {
+// Only the new source-qualified provider slices allow the default tier to be
+// absent. The existing profiles keep their established required-field contract.
+func qualifyPayloadWithDefaultTier(raw []byte, model string, approved, upper int64, requireTier bool) ([]byte, error) {
 	if _, ok := service.GatewayNativePayloadFields(raw, "model", "store", "stream", "service_tier", "previous_response_id", "max_output_tokens"); !ok {
 		return nil, errDenied
 	}
@@ -334,7 +336,7 @@ func qualifyPayload(raw []byte, model string, approved, upper int64) ([]byte, er
 			}
 		}
 	}
-	if !seen["model"] || !seen["store"] || !seen["stream"] || !seen["service_tier"] {
+	if !seen["model"] || !seen["store"] || !seen["stream"] || requireTier && !seen["service_tier"] {
 		return nil, errDenied
 	}
 	encoded, _ := json.Marshal(capValue)

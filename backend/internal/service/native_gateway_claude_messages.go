@@ -367,7 +367,7 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 	start := time.Now()
 	response, err := client.Do(request)
 	if response != nil && response.Body != nil {
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 	}
 	if err != nil || response == nil || response.Body == nil {
 		return nil, ErrGatewayNativeEffectUnknown
@@ -416,7 +416,7 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 		if total > gatewayNativeResponseLimit || frame.Len()+len(raw) > gatewayNativeSSEFrameLimit {
 			return nil, ErrGatewayNativeEffectUnknown
 		}
-		frame.Write(raw)
+		_, _ = frame.Write(raw)
 		line := bytes.TrimSuffix(bytes.TrimSuffix(raw, []byte{'\n'}), []byte{'\r'})
 		if len(line) > 0 {
 			if line[0] == ':' {
