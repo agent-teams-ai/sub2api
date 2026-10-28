@@ -512,11 +512,17 @@ func TestGatewayNativeResponsesLiteHeaderIsProfileScoped(t *testing.T) {
 			if tc.profile == GatewayOpenRouterResponsesProfile {
 				account.Credentials["base_url"] = GatewayOpenRouterBaseURL
 				account.Extra[GatewayModelExtraKey] = GatewayOpenRouterModel
-				payload = []byte(strings.Replace(string(payload), "mimo-test", GatewayOpenRouterModel, 1))
+				// additional_tools is MiMo's Responses Lite extension. The header
+				// isolation check uses a valid plain-text request for OpenRouter.
+				payload = []byte(`{"model":"` + GatewayOpenRouterModel + `","input":"preserved text","stream":false}`)
 			}
 			route, err := GatewayNativeDescriptor(account)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
+			if tc.profile == GatewayOpenRouterResponsesProfile {
+				modelsBody := `{"data":[` + openRouterModelRow(GatewayOpenRouterModel, true) + `]}`
+				require.NoError(t, svc.SetGatewayOpenRouterModels(openRouterModelsFixture(t, &modelsBody)))
+			}
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(string(payload)))

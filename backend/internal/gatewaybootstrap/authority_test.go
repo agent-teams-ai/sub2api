@@ -384,7 +384,7 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		decoded.openRouterProfile().Profile != service.GatewayOpenRouterResponsesProfile || decoded.openRouterProfile().Tokens != 50 {
 		t.Fatal("second profile replaced the MiMo tuple or its own limits")
 	}
-	for _, model := range []string{"openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "unapproved-model"} {
+	for _, model := range []string{"openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "future-vendor/new-anchor:free", "unapproved-model"} {
 		candidate := c
 		second := *c.OpenRouter
 		second.Model = model

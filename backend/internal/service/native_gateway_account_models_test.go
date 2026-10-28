@@ -58,7 +58,7 @@ func TestGatewayAccountModelsReadFencesAndRedaction(t *testing.T) {
 			f.modelsBody = accountModelsFixture
 			in := GatewayAccountModelsInput{GatewayAccountLimitsInput: GatewayAccountLimitsInput{f.scope.Owner, f.scope.Account, route.Profile, 7}}
 			calls := 0
-			reader, err := NewGatewayAccountModelsReader(f.dispatch, func(_ context.Context, input GatewayAccountLimitsInput) (GatewayNativeRoute, error) {
+			reader, err := NewGatewayAccountModelsReader(f.dispatch, nil, func(_ context.Context, input GatewayAccountLimitsInput) (GatewayNativeRoute, error) {
 				calls++
 				if input.OwnerRef != f.scope.Owner || input.ExpectedAuthorizationEpoch != 7 {
 					return GatewayNativeRoute{}, ErrGatewayNativeIdentity
@@ -136,7 +136,7 @@ func TestGatewayAccountModelsMalformedUnavailableAndExpiry(t *testing.T) {
 }
 
 func TestGatewayAccountModelsUnsupportedProfile(t *testing.T) {
-	reader, err := NewGatewayAccountModelsReader(nil, func(context.Context, GatewayAccountLimitsInput) (GatewayNativeRoute, error) {
+	reader, err := NewGatewayAccountModelsReader(nil, nil, func(context.Context, GatewayAccountLimitsInput) (GatewayNativeRoute, error) {
 		return GatewayNativeRoute{Profile: GatewayClaudeOAuthMessagesProfile}, nil
 	})
 	require.NoError(t, err)

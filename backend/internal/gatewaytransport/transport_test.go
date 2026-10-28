@@ -176,8 +176,14 @@ func (r *ownerFixtureRepo) LockGatewayNativeAccount(_ context.Context, id int64)
 // presets. Cross-tuples and each profile's own caps deny before callback/entry.
 func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	var entries, admits atomic.Int32
+	const dynamicOpenRouterModel = "unseen-vendor/new-model:free"
 	var driftAfterAdmit atomic.Bool
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/models" {
+			require.Empty(t, r.Header.Get("Authorization"))
+			_, _ = io.WriteString(w, `{"data":[{"id":"`+dynamicOpenRouterModel+`","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools"]}]}`)
+			return
+		}
 		entries.Add(1)
 		var payload map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
@@ -195,7 +201,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 				require.JSONEq(t, `{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}}`, string(encodedText))
 				require.Equal(t, "33333333-3333-4333-8333-333333333333", payload["prompt_cache_key"])
 				require.Equal(t, map[string]any{"x-codex-installation-id": "44444444-4444-4444-8444-444444444444"}, payload["client_metadata"])
-			} else if r.Host == "api.kimi.ai" {
+			} else if r.Host == "api.kimi.ai" || r.Host == "api.minimax.io" {
 				require.NotContains(t, payload, "service_tier")
 			} else {
 				require.Equal(t, "default", payload["service_tier"])
@@ -212,7 +218,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 
 		} else if r.Host == "openrouter.ai" {
 			require.Equal(t, "/api/v1/responses", r.URL.Path)
-			require.Equal(t, service.GatewayOpenRouterModel, payload["model"])
+			require.Equal(t, dynamicOpenRouterModel, payload["model"])
 			require.Equal(t, float64(40), payload["max_output_tokens"])
 		} else {
 			require.Equal(t, "mimo.fixture.invalid", r.Host)
@@ -272,6 +278,9 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			input.Admission.AccountRef = fmt.Sprintf("profile-account-%d", i)
 		}
 		input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"preserved","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, profile.Model))
+		if i == 1 {
+			input.Payload = json.RawMessage(strings.Replace(string(input.Payload), profile.Model, dynamicOpenRouterModel, 1))
+		}
 		if i >= 2 {
 			input.Payload = json.RawMessage(strings.Replace(string(input.Payload), `,"service_tier":"default"`, `,"reasoning":null,"text":{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}},"prompt_cache_key":"33333333-3333-4333-8333-333333333333","client_metadata":{"x-codex-installation-id":"44444444-4444-4444-8444-444444444444"}`, 1))
 		}
@@ -285,6 +294,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: &http.Client{Transport: local}})
 	require.NoError(t, err)
 	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(local)))
 	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		admits.Add(1)
 		var input admitRequest
@@ -326,7 +336,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		func(r *Request) { r.Descriptor.BaseURL = primary.BaseURL },
 		func(r *Request) { r.Descriptor.Model = primary.Model },
 		func(r *Request) {
-			r.Payload = json.RawMessage(strings.Replace(string(r.Payload), service.GatewayOpenRouterModel, primary.Model, 1))
+			r.Payload = json.RawMessage(strings.Replace(string(r.Payload), dynamicOpenRouterModel, primary.Model, 1))
 		},
 		func(r *Request) {
 			r.Payload = json.RawMessage(strings.TrimSuffix(string(r.Payload), "}") + `,"max_output_tokens":81}`)
