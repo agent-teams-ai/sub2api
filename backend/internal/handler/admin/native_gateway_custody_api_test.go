@@ -31,7 +31,7 @@ import (
 )
 
 // Controlled persistence exercises the real management/service HTTP boundaries.
-// Existing SQL triggers reject OpenRouter: migrated SQL remains NOT_QUALIFIED.
+// SQL guard qualification is covered separately by migrated PostgreSQL tests.
 type finiteCatalogRows struct {
 	service.AdminAccountRepository
 	mu   sync.Mutex

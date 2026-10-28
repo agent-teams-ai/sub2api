@@ -61,6 +61,16 @@ birth anchor of a credential candidate. Model syntax alone does not qualify a
 candidate: create and activation require that exact anchor in a fresh native
 OpenRouter catalogue observation before the candidate write.
 
+Apply additive migration `258_gateway_openrouter_dynamic_models.sql` through
+the stock migration loader before using dynamic anchors. It replaces only the
+OpenRouter model clause in the existing protected account trigger: a bounded
+ASCII identifier containing `/` and excluding `://` replaces the old two-model
+list. The fixed origin, inert creation, immutable birth and scope, encrypted
+credential shape, exact erasure, group exclusion and retained tombstones remain
+unchanged. SQL validates descriptor syntax; the native catalogue still owns
+model membership. Migrations are embedded, so the qualified binary must include
+this migration.
+
 Normal review selections come from the complete account-scoped
 `/private/native/v1/account-models/read` snapshot, independently of the birth
 anchor. The existing owner/account/profile/authorization-epoch selector is
