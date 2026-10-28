@@ -28,7 +28,7 @@ type GatewayAccountModelChoices struct {
 type GatewayAccountModel struct {
 	ModelID   string                      `json:"modelId"`
 	Reasoning *GatewayAccountModelChoices `json:"reasoning"`
-	Fast      GatewayAccountModelChoices  `json:"fast"`
+	Fast      *GatewayAccountModelChoices `json:"fast"`
 	Tools     GatewayAccountModelChoices  `json:"tools"`
 }
 type GatewayAccountModelsResult struct {
@@ -72,15 +72,16 @@ type gatewayModelsCache struct {
 }
 
 type GatewayAccountModelsReader struct {
-	dispatch  *GatewayNativeOAuthDispatch
-	authorize GatewayAccountLimitsAuthorizer
+	dispatch   *GatewayNativeOAuthDispatch
+	openRouter *OpenAIGatewayService
+	authorize  GatewayAccountLimitsAuthorizer
 }
 
-func NewGatewayAccountModelsReader(d *GatewayNativeOAuthDispatch, a GatewayAccountLimitsAuthorizer) (*GatewayAccountModelsReader, error) {
+func NewGatewayAccountModelsReader(d *GatewayNativeOAuthDispatch, openRouter *OpenAIGatewayService, a GatewayAccountLimitsAuthorizer) (*GatewayAccountModelsReader, error) {
 	if a == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
-	return &GatewayAccountModelsReader{d, a}, nil
+	return &GatewayAccountModelsReader{d, openRouter, a}, nil
 }
 func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccountModelsInput) GatewayAccountModelsResult {
 	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
@@ -90,6 +91,9 @@ func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccount
 	before, err := s.authorize(ctx, in.GatewayAccountLimitsInput)
 	if err != nil || ctx.Err() != nil {
 		return unavailable
+	}
+	if in.ProfileID == GatewayOpenRouterResponsesProfile {
+		return s.openRouter.readGatewayOpenRouterAccountModels(ctx, in, before, s.authorize)
 	}
 	if in.ProfileID != GatewayCodexOAuthResponsesProfile {
 		return GatewayAccountModelsResult{Status: "unsupported"}
@@ -151,7 +155,14 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 	identity := resolveCodexOutboundIdentity("")
 	principal := GatewayAccountLimitsPrincipal(p)
 	key := principal + ":" + strconv.FormatInt(version, 10) + ":" + identity.version
-	cache := &s.models
+	return s.models.read(ctx, key, principal+":", force, func() GatewayAccountModelsResult {
+		return s.fetchAccountModels(ctx, a, p, version, principal, identity)
+	})
+}
+
+// One bounded per-principal snapshot/single-flight mechanism serves both sources.
+func (cache *gatewayModelsCache) read(ctx context.Context, key, obsoletePrefix string, force bool, fetch func() GatewayAccountModelsResult) GatewayAccountModelsResult {
+	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
 	for {
 		cache.Lock()
 		if cache.entries == nil {
@@ -174,7 +185,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		}
 		// Drop obsolete revisions of this physical principal on every new fetch.
 		for old, entry := range cache.entries {
-			if strings.HasPrefix(old, principal+":") || !time.Now().Before(entry.expires) {
+			if (obsoletePrefix != "" && strings.HasPrefix(old, obsoletePrefix)) || !time.Now().Before(entry.expires) {
 				delete(cache.entries, old)
 			}
 		}
@@ -187,7 +198,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		pending := make(chan struct{})
 		cache.pending[key] = pending
 		cache.Unlock()
-		out := s.fetchAccountModels(ctx, a, p, version, principal, identity)
+		out := fetch()
 		ttl := 5 * time.Second
 		if out.Status == "snapshot" {
 			ttl = 60 * time.Second
@@ -372,7 +383,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 			projection.excluded[exclusion]++
 			continue
 		}
-		m := GatewayAccountModel{ModelID: slug, Fast: GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
+		m := GatewayAccountModel{ModelID: slug, Fast: &GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
 		var def string
 		if value := fields["default_reasoning_level"]; value != nil && string(value) != "null" {
 			if json.Unmarshal(value, &def) != nil {

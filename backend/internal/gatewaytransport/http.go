@@ -95,9 +95,10 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 	}
 	requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
 	payloadModel := input.Descriptor.Model
-	if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
+	if profile.Profile == service.GatewayCodexOAuthResponsesProfile || profile.Profile == service.GatewayOpenRouterResponsesProfile {
 		fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
-		if !valid || json.Unmarshal(fields["model"], &payloadModel) != nil || !service.GatewayAccountModelIDValid(payloadModel) {
+		if !valid || json.Unmarshal(fields["model"], &payloadModel) != nil || !service.GatewayAccountModelIDValid(payloadModel) ||
+			profile.Profile == service.GatewayOpenRouterResponsesProfile && !service.GatewayOpenRouterModelValid(payloadModel) {
 			http.Error(raw, "private native transport denied", http.StatusBadRequest)
 			return
 		}

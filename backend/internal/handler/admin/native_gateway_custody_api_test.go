@@ -79,7 +79,18 @@ func (r *finiteCatalogRows) LockGatewayNativeAccount(_ context.Context, id int64
 
 func TestFiniteAPIKeyCatalogHTTPCreateReadMutation(t *testing.T) {
 	var entries, admissions atomic.Int32
+	var catalogueAvailable atomic.Bool
+	catalogueAvailable.Store(true)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/models" {
+			require.Empty(t, r.Header.Get("Authorization"))
+			if !catalogueAvailable.Load() {
+				_, _ = io.WriteString(w, `{"data":[]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":[{"id":"future-vendor/enrollment-anchor:free","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools"]}]}`)
+			return
+		}
 		entries.Add(1)
 		if r.Host == "openrouter.ai" {
 			require.Equal(t, "/api/v1/responses", r.URL.Path)
@@ -104,8 +115,9 @@ func TestFiniteAPIKeyCatalogHTTPCreateReadMutation(t *testing.T) {
 	repo := &finiteCatalogRows{rows: map[int64]*service.Account{}}
 	admin := nativeReviewAdmin(repo, nil)
 	gateway := nativeReviewGateway(repo, nil, &nativeReviewRealHTTP{client: &http.Client{Transport: local}})
+	require.NoError(t, gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(local)))
 	primary := GatewayNativeProfile{service.GatewayMiMoResponsesProfile, "https://mimo.fixture.invalid/v1", "fixture-model"}
-	secondary := GatewayNativeProfile{service.GatewayOpenRouterResponsesProfile, service.GatewayOpenRouterBaseURL, service.GatewayOpenRouterModel}
+	secondary := GatewayNativeProfile{service.GatewayOpenRouterResponsesProfile, service.GatewayOpenRouterBaseURL, "future-vendor/enrollment-anchor:free"}
 	token := "Bearer " + nativeReviewSyntheticKey(t)
 	authorize := func(c *gin.Context) {
 		if c.GetHeader("Authorization") != token {
@@ -127,6 +139,12 @@ func TestFiniteAPIKeyCatalogHTTPCreateReadMutation(t *testing.T) {
 		gatewayNativeCreate{"55555555-5555-4555-8555-555555555555", "caller-profile", "fixture", nativeReviewSyntheticKey(t), "fixture-owner", "fixture-account"})
 	require.Equal(t, http.StatusBadRequest, status)
 	require.Empty(t, repo.rows)
+	catalogueAvailable.Store(false)
+	status, _ = custodyAPIRequest(t, server.Client(), http.MethodPost, base+"/candidates", token,
+		gatewayNativeCreate{"66666666-6666-4666-8666-666666666666", secondary.ID, "unqualified", nativeReviewSyntheticKey(t), "fixture-owner", secondary.ID})
+	require.Equal(t, http.StatusConflict, status)
+	require.Empty(t, repo.rows, "a syntactically valid but absent anchor must not create a credential candidate")
+	catalogueAvailable.Store(true)
 	var candidates []GatewayNativeCandidate
 	for i, profile := range []GatewayNativeProfile{primary, secondary} {
 		generation := []string{"33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"}[i]

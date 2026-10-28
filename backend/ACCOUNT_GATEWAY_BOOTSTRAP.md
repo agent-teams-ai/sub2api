@@ -52,6 +52,50 @@ seconds, with no retries, redirects or environment proxy. TLS verification is
 normal. Explicit fixture transports/certificate trust belong only to outer Go
 composition; FD configuration has no insecure-TLS switch.
 
+## OpenRouter model discovery
+
+The optional `openRouter` profile uses the fixed
+`openrouter-openai-responses-apikey-v1` identity and
+`https://openrouter.ai/api/v1` origin. Its configured model remains the immutable
+birth anchor of a credential candidate. Model syntax alone does not qualify a
+candidate: create and activation require that exact anchor in a fresh native
+OpenRouter catalogue observation before the candidate write.
+
+Normal review selections come from the complete account-scoped
+`/private/native/v1/account-models/read` snapshot, independently of the birth
+anchor. The existing owner/account/profile/authorization-epoch selector is
+unchanged. Native authorization is checked before and after metadata I/O, and
+the fresh encrypted credential row must still match its original physical
+generation and scope. `principalVersion` binds the cache to that scope and
+encrypted credential revision; the cache contains multiple model choices and
+never a process-global selected model.
+
+The native adapter only sends unauthenticated GET requests to
+`https://openrouter.ai/api/v1/models`. It follows no redirects and accepts no
+caller endpoint, provider headers, credentials or proxy settings. Requests have
+a three-second bound. The parser bounds the upstream body at 16 MiB, rejects
+duplicate/unsafe model identities, projects at most 2048 rows and caps normalized
+metadata at 2 MiB. Only models with positive text input and output metadata are
+projected. Function tools require positive `tools` metadata. Fast mode and
+reasoning effort remain absent when their accepted controls are not advertised;
+parameter names alone do not prove supported effort values.
+
+Snapshots use `source: "openrouter"`, retain the existing timestamp/generation
+fields and expire after one minute. Codex retains its separate source,
+qualification and limits. Both sources use the same bounded snapshot and
+single-flight cache mechanism. An authoritative empty snapshot denies every
+selection. A failed observation may retain only the already qualified birth
+anchor, with conservative absent reasoning/tools; it cannot introduce a new
+model. Unknown, unsupported and expired observations do not grant membership.
+
+The private transport retains the frozen descriptor and exact claim/closure
+protocol. Requested OpenRouter model membership and tool/setting capabilities
+are checked before forwarding and again at the locked credential Authorization
+boundary. Existing client custom tools use the pure function-tool codec; no
+provider retry, model substitution or fallback transport is introduced. Live
+provider and deployment qualification remain separate from controlled HTTP
+fixture evidence.
+
 All config members are exact decoded names: unknown/duplicate/case aliases,
 noncanonical integer tokens, invalid UTF-8/lossy surrogates, excessive depth or
 bytes deny with a fixed error. Server configuration never enters argv/env,
