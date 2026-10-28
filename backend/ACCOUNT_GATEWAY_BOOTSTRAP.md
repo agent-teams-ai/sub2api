@@ -89,6 +89,13 @@ metadata at 2 MiB. Only models with positive text input and output metadata are
 projected. Function tools require positive `tools` metadata. Fast mode and
 reasoning effort remain absent when their accepted controls are not advertised;
 parameter names alone do not prove supported effort values.
+When `reasoning.supported_efforts` and `reasoning.default_effort` explicitly
+advertise compatible wire controls, the parser preserves the supported subset
+and its advertised default. Missing or invalid defaults do not grant a setting.
+The shared native wire values are `minimal`, `low`, `medium`, `high`, `xhigh`
+and `max`; OpenRouter metadata never maps `none` to `minimal` or `ultra` to `max`.
+Submitted reasoning contains only an effort admitted by that model's current
+snapshot, and the same check runs again at final credential entry.
 
 Snapshots use `source: "openrouter"`, retain the existing timestamp/generation
 fields and expire after one minute. Codex retains its separate source,

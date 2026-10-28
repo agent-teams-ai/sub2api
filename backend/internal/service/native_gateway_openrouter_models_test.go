@@ -32,6 +32,10 @@ func openRouterModelRow(id string, tools bool) string {
 	return fmt.Sprintf(`{"id":%q,"architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":%s,"description":"PRIVATE-DESCRIPTION"}`, id, parameters)
 }
 
+func openRouterReasoningModelRow(id string) string {
+	return strings.TrimSuffix(openRouterModelRow(id, true), "}") + `,"reasoning":{"supported_efforts":["high","medium"],"default_effort":"medium"}}`
+}
+
 func openRouterModelsFixture(t *testing.T, raw *string) *GatewayOpenRouterModels {
 	t.Helper()
 	return NewGatewayOpenRouterModels(openRouterModelsRoundTrip(func(request *http.Request) (*http.Response, error) {
@@ -84,6 +88,39 @@ func TestGatewayOpenRouterModelsMalformedAndUnsupported(t *testing.T) {
 	models, err := parseGatewayOpenRouterModels([]byte(`{"data":[` + strings.Replace(row, `"output_modalities":["text"]`, `"output_modalities":["image"]`, 1) + `]}`))
 	require.NoError(t, err)
 	require.Empty(t, models)
+}
+
+func TestGatewayOpenRouterModelsExplicitReasoningAdmission(t *testing.T) {
+	row := openRouterReasoningModelRow("future/model")
+	models, err := parseGatewayOpenRouterModels([]byte(`{"data":[` + row + `]}`))
+	require.NoError(t, err)
+	require.Equal(t, &GatewayAccountModelChoices{Allowed: []string{"high", "medium"}, Default: "medium"}, models[0].Reasoning)
+	require.Nil(t, models[0].Fast)
+	result := GatewayAccountModelsResult{Status: "snapshot", Source: "openrouter", ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano), Models: &models}
+	for _, fixture := range []struct {
+		reasoning string
+		allowed   bool
+	}{
+		{``, true}, {`,"reasoning":{}`, true}, {`,"reasoning":{"effort":"high"}`, true}, {`,"reasoning":{"effort":"medium"}`, true},
+		{`,"reasoning":{"effort":"low"}`, false}, {`,"reasoning":{"effort":"ultra"}`, false}, {`,"reasoning":{"effort":"none"}`, false},
+		{`,"reasoning":{"effort":"high","summary":"auto"}`, false}, {`,"reasoning":{"effort":"high","Effort":"low"}`, false},
+	} {
+		body := []byte(`{"model":"future/model","input":"text"` + fixture.reasoning + `}`)
+		require.Equal(t, fixture.allowed, gatewayOpenRouterModelsAllow(result, "birth/anchor", "future/model", body), fixture.reasoning)
+	}
+	for _, invalid := range []string{
+		strings.Replace(row, `"default_effort":"medium"`, `"default_effort":"low"`, 1),
+		strings.Replace(row, `"supported_efforts":`, `"supported_efforts":[],"supported_efforts":`, 1),
+		strings.Replace(row, `"default_effort":`, `"Default_Effort":"high","default_effort":`, 1),
+	} {
+		models, err := parseGatewayOpenRouterModels([]byte(`{"data":[` + invalid + `]}`))
+		require.NoError(t, err)
+		require.Nil(t, models[0].Reasoning, "invalid effort metadata cannot grant a control")
+	}
+	models[0].Reasoning = nil
+	body := []byte(`{"model":"future/model","input":"text","reasoning":{"effort":"high"}}`)
+	require.False(t, gatewayOpenRouterModelsAllow(result, "birth/anchor", "future/model", body), "a withdrawn control must stop before provider entry")
+	require.False(t, gatewayOpenRouterModelsAllow(GatewayAccountModelsResult{Status: "unavailable"}, "future/model", "future/model", body), "an unavailable observation cannot authorize a reasoning control")
 }
 
 func TestGatewayOpenRouterModelsSourcePolicyAndCache(t *testing.T) {
@@ -176,7 +213,7 @@ func TestGatewayOpenRouterModelsDynamicRealHTTPDispatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var entries, reads atomic.Int32
 	model := "unseen-vendor/new-model:free"
-	raw := `{"data":[` + openRouterModelRow(model, true) + `]}`
+	raw := `{"data":[` + openRouterReasoningModelRow(model) + `]}`
 	var sent atomic.Value
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/api/v1/models" {
@@ -216,7 +253,7 @@ func TestGatewayOpenRouterModelsDynamicRealHTTPDispatch(t *testing.T) {
 		_, entered, err := gateway.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)
 		return entered, err
 	}
-	payload := []byte(fmt.Sprintf(`{"model":%q,"input":"text","store":false,"tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, model))
+	payload := []byte(fmt.Sprintf(`{"model":%q,"input":"text","store":false,"reasoning":{"effort":"high"},"tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, model))
 	entered, err := call(payload)
 	require.NoError(t, err)
 	require.True(t, entered)
@@ -224,6 +261,7 @@ func TestGatewayOpenRouterModelsDynamicRealHTTPDispatch(t *testing.T) {
 	require.EqualValues(t, 1, reads.Load())
 	require.Contains(t, sent.Load().(string), `"model":"unseen-vendor/new-model:free"`)
 	require.Contains(t, sent.Load().(string), `"type":"function"`, "existing custom tools use the function codec")
+	require.Contains(t, sent.Load().(string), `"reasoning":{"effort":"high"}`, "only the explicitly advertised wire effort reaches the provider")
 	require.Equal(t, "birth/anchor", route.Model)
 	fresh := snapshotGatewayNativeAccount(account)
 	scope, err := GatewayNativeCredentialScopeForAccount(account)
@@ -237,7 +275,7 @@ func TestGatewayOpenRouterModelsDynamicRealHTTPDispatch(t *testing.T) {
 	repo.fresh = nil
 	for _, invalid := range []string{
 		strings.Replace(string(payload), model, "not-discovered/model", 1),
-		strings.TrimSuffix(string(payload), "}") + `,"reasoning":{"effort":"high"}}`,
+		strings.Replace(string(payload), `"effort":"high"`, `"effort":"low"`, 1),
 		strings.TrimSuffix(string(payload), "}") + `,"models":["not-discovered/model"]}`,
 		strings.TrimSuffix(string(payload), "}") + `,"route":"fallback"}`,
 		strings.TrimSuffix(string(payload), "}") + `,"plugins":[{"id":"web"}]}`,

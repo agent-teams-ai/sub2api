@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/gatewaymodelcatalog"
 )
 
 // Model selection is mutable account capability; Route.Model remains the
@@ -21,10 +23,7 @@ type GatewayAccountModelsInput struct {
 	GatewayAccountLimitsInput
 	ForceRefresh bool `json:"forceRefresh,omitempty"`
 }
-type GatewayAccountModelChoices struct {
-	Allowed []string `json:"allowed"`
-	Default string   `json:"default"`
-}
+type GatewayAccountModelChoices = gatewaymodelcatalog.Choices
 type GatewayAccountModel struct {
 	ModelID   string                      `json:"modelId"`
 	Reasoning *GatewayAccountModelChoices `json:"reasoning"`
@@ -44,13 +43,6 @@ type GatewayAccountModelsResult struct {
 var gatewayAccountModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 
 func GatewayAccountModelIDValid(id string) bool { return gatewayAccountModelID.MatchString(id) }
-func gatewayCodexWireEffortValid(e string) bool {
-	switch e {
-	case "minimal", "low", "medium", "high", "xhigh", "max":
-		return true
-	}
-	return false
-}
 
 // Pinned Codex 0.147 converts semantic Ultra to Responses wire Max. Apply
 // this only to vendor metadata; submitted request bytes must be canonical.
@@ -408,7 +400,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 					}
 				}
 				effort = gatewayCodexCatalogWireEffort(effort)
-				if !gatewayCodexWireEffortValid(effort) {
+				if !gatewaymodelcatalog.WireEffortValid(effort) {
 					// Explicit none represents disabled reasoning. Unknown
 					// advertised levels must never manufacture that meaning.
 					if effort != "none" {
@@ -461,7 +453,7 @@ func gatewayAccountModelsAllow(result GatewayAccountModelsResult, model string, 
 				return true
 			}
 			var effort string
-			if json.Unmarshal(effortRaw, &effort) != nil || !gatewayCodexWireEffortValid(effort) {
+			if json.Unmarshal(effortRaw, &effort) != nil || !gatewaymodelcatalog.WireEffortValid(effort) {
 				return false
 			}
 			for _, allowed := range m.Reasoning.Allowed {
@@ -486,5 +478,5 @@ func gatewayLegacyCodexReasoning(raw json.RawMessage) bool {
 		return true
 	}
 	var effort string
-	return json.Unmarshal(fields["effort"], &effort) == nil && gatewayCodexWireEffortValid(effort)
+	return json.Unmarshal(fields["effort"], &effort) == nil && gatewaymodelcatalog.WireEffortValid(effort)
 }

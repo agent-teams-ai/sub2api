@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/gatewaymodelcatalog"
 )
 
 const gatewayOpenRouterModelsURL = GatewayOpenRouterBaseURL + "/models"
@@ -100,7 +102,7 @@ func parseGatewayOpenRouterModels(raw []byte) ([]GatewayAccountModel, error) {
 	models := []GatewayAccountModel{}
 	seen := map[string]bool{}
 	for _, row := range rows {
-		fields, ok := GatewayNativePayloadFields(row, "id", "architecture", "supported_parameters")
+		fields, ok := GatewayNativePayloadFields(row, "id", "architecture", "supported_parameters", "reasoning")
 		var id string
 		if !ok || json.Unmarshal(fields["id"], &id) != nil || !GatewayOpenRouterModelValid(id) || seen[id] {
 			return nil, ErrGatewayNativeIdentity
@@ -119,9 +121,11 @@ func parseGatewayOpenRouterModels(raw []byte) ([]GatewayAccountModel, error) {
 		if slices.Contains(parameters, "tools") {
 			tools = GatewayAccountModelChoices{Allowed: []string{"none", "function"}, Default: "function"}
 		}
-		// supported_parameters names a control, not its accepted effort values.
-		// Unknown reasoning/fast settings remain absent rather than invented.
-		models = append(models, GatewayAccountModel{ModelID: id, Tools: tools})
+		model := GatewayAccountModel{ModelID: id, Tools: tools}
+		if metadata, ok := GatewayNativePayloadFields(fields["reasoning"], "supported_efforts", "default_effort"); ok {
+			model.Reasoning = gatewaymodelcatalog.OpenRouterReasoning(parameters, metadata)
+		}
+		models = append(models, model)
 	}
 	wire, err := json.Marshal(models)
 	if err != nil || len(wire) > 2<<20 {
@@ -227,11 +231,8 @@ func gatewayOpenRouterModelsAllow(result GatewayAccountModelsResult, anchor, mod
 		if candidate.ModelID != model {
 			continue
 		}
-		if reasoning := fields["reasoning"]; len(reasoning) > 0 && string(reasoning) != "null" {
-			object, valid := GatewayNativePayloadFields(reasoning)
-			if !valid || len(object) != 0 {
-				return false
-			}
+		if !gatewayOpenRouterReasoningAllows(candidate.Reasoning, fields["reasoning"]) {
+			return false
 		}
 		var tools []json.RawMessage
 		if raw := fields["tools"]; len(raw) > 0 && string(raw) != "null" && json.Unmarshal(raw, &tools) != nil {
@@ -254,6 +255,22 @@ func gatewayOpenRouterModelsAllow(result GatewayAccountModelsResult, anchor, mod
 		return true
 	}
 	return false
+}
+
+func gatewayOpenRouterReasoningAllows(choices *GatewayAccountModelChoices, raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return true
+	}
+	fields, ok := gatewayClaudeObject(raw, "effort")
+	if !ok {
+		return false
+	}
+	if fields["effort"] == nil {
+		return true
+	}
+	var effort string
+	return choices != nil && json.Unmarshal(fields["effort"], &effort) == nil &&
+		gatewaymodelcatalog.WireEffortValid(effort) && slices.Contains(choices.Allowed, effort)
 }
 
 // OpenRouter exposes alternate-model routing and server-side tools outside the
