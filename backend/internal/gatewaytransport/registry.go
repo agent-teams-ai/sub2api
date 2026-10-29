@@ -156,6 +156,10 @@ type reservation struct {
 	status                                          *requestStatus
 	usage                                           *service.GatewayNativeUsage
 	effect                                          string
+	executionBearer                                 string // public per-execution capability; never serialized
+	requestedModel                                  string // validated public model metadata; payload is never retained
+	statusOnly                                      bool   // authenticated no-dispatch reply; never authorizes SQL closure
+	preclaimRefused                                 bool   // exact private pre-work refusal for this native nonce only
 }
 
 type Receipt struct {
@@ -174,14 +178,17 @@ type Receipt struct {
 }
 
 type Handler struct {
-	cfg        Config
-	mu         sync.Mutex
-	entries    map[transportKey]*reservation
-	requests   map[requestKey]transportKey
-	stopping   bool
-	callback   *http.Client
-	executions chan struct{}
-	controls   chan struct{}
+	cfg               Config
+	mu                sync.Mutex
+	entries           map[transportKey]*reservation
+	requests          map[requestKey]transportKey
+	stopping          bool
+	callback          *http.Client
+	executions        chan struct{}
+	controls          chan struct{}
+	terminalCallbacks chan struct{}
+	preclaimCallbacks chan struct{}
+	terminalBuffers   *publicTerminalBudget
 }
 
 // Local HTTP work bounds, not account occupancy or memory qualification. The
@@ -284,7 +291,7 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 16384,
 		DialContext: (&net.Dialer{Timeout: cfg.CallbackTimeout}).DialContext, TLSHandshakeTimeout: cfg.CallbackTimeout, ResponseHeaderTimeout: cfg.CallbackTimeout}
 	return &Handler{cfg: cfg, entries: make(map[transportKey]*reservation), requests: make(map[requestKey]transportKey),
-		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
+		executions: make(chan struct{}, privateExecutionHandlers), controls: make(chan struct{}, privateControlHandlers), terminalCallbacks: make(chan struct{}, 4), preclaimCallbacks: make(chan struct{}, 4), terminalBuffers: &publicTerminalBudget{maximum: 64 << 20}, callback: &http.Client{Transport: transport, Timeout: cfg.CallbackTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
@@ -334,7 +341,8 @@ func (h *Handler) OpenRouterProfile() (QualifiedProfile, bool) {
 
 // Reserve before callback/claim. The secondary request identity prevents a new
 // generation or nonce from rearming a duplicate while any evidence is retained.
-// Only durably acknowledged CLOSED receipts are eligible for bounded eviction.
+// Durably acknowledged closure or an authenticated status-only attempt can
+// retire local CLOSED evidence. An ambiguous callback never earns disposal.
 func (h *Handler) reserve(consumer string, input Request, ctx context.Context, cancel context.CancelFunc, interrupt func()) (*reservation, bool, error) {
 	key := requestKey{consumer, input.Admission.ExecutionRef, input.RequestRef}
 	digest := sha256.Sum256(input.Payload)
@@ -356,7 +364,7 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	}
 	if len(h.entries) >= h.cfg.MaxEntries {
 		for k, e := range h.entries {
-			if e.acknowledged && closed(e.life.Snapshot()) {
+			if (e.acknowledged || e.statusOnly) && closed(e.life.Snapshot()) {
 				delete(h.entries, k)
 				delete(h.requests, k.requestKey)
 				break
@@ -366,7 +374,11 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	if len(h.entries) >= h.cfg.MaxEntries {
 		return nil, false, errDenied
 	}
-	nonce, err := uuid.NewRandom()
+	nonce, bound := boundReservationNonce(consumer, h.cfg.Enrollment.OriginRef, h.cfg.Enrollment.EngineIncarnation, input.Admission.ExecutionRef, input.RequestRef)
+	var err error
+	if !bound {
+		nonce, err = uuid.NewRandom()
+	}
 	if err != nil {
 		return nil, false, errDenied
 	}
@@ -381,6 +393,21 @@ func (h *Handler) reserve(consumer string, input Request, ctx context.Context, c
 	h.entries[full] = e
 	h.requests[key] = full
 	return e, true, nil
+}
+
+// A v2 reservation nonce is bound to the full original request identity.
+// SQL independently recognizes this derivation before retiring request detail;
+// legacy non-UUID fixture/execution identifiers retain their v4 evidence.
+func boundReservationNonce(consumer, origin, incarnation, execution, request string) (uuid.UUID, bool) {
+	incarnation, execution = strings.ToLower(incarnation), strings.ToLower(execution)
+	if !canonicalUUID.MatchString(incarnation) || !canonicalUUID.MatchString(execution) {
+		return uuid.Nil, false
+	}
+	digest := sha256.Sum256([]byte(strings.Join([]string{"account-gateway/native-reservation/v2", consumer, origin, incarnation, execution, request}, "\x00")))
+	digest[6] = digest[6]&0x0f | 0x80
+	digest[8] = digest[8]&0x3f | 0x80
+	nonce, err := uuid.FromBytes(digest[:16])
+	return nonce, err == nil
 }
 
 func closed(s service.GatewayNativeLifetimeSnapshot) bool {
@@ -433,6 +460,10 @@ func (h *Handler) seal(e *reservation) {
 }
 
 func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (bool, error) {
+	return h.admitWithin(ctx, consumer, e, h.cfg.CallbackTimeout, h.cfg.CallbackTimeout)
+}
+
+func (h *Handler) admitWithin(ctx context.Context, consumer string, e *reservation, queueBudget, activeBudget time.Duration) (bool, error) {
 	h.mu.Lock()
 	if e.callbackStarted {
 		h.mu.Unlock()
@@ -445,19 +476,55 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	e.callbackStarted = true
 	h.mu.Unlock()
 	input := admitRequest{consumer, e.request.RequestRef, e.request.Worker, e.request.Admission, e.request.Descriptor, e.native}
-	body, err := json.Marshal(input)
+	path := "/private/native/v1/admit"
+	var request any = input
+	h.mu.Lock()
+	token := e.executionBearer
+	e.executionBearer = ""
+	h.mu.Unlock()
+	if token != "" {
+		path = "/private/native/v1/public-admit"
+		request = struct {
+			admitRequest
+			ExecutionBearer string `json:"executionBearer"`
+			RequestedModel  string `json:"requestedModel"`
+		}{input, token, h.publicRequestedModel(e)}
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return false, errDenied
 	}
-	callbackCtx, cancel := context.WithTimeout(ctx, h.cfg.CallbackTimeout)
+	var callbackCtx context.Context
+	var cancel context.CancelFunc
+	if token != "" {
+		callbackCtx, cancel, err = h.preclaimRPCContext(ctx, queueBudget, activeBudget)
+		if err != nil {
+			// No POST was attempted. This invocation cannot have claimed SQL.
+			h.mu.Lock()
+			if e.proof == nil && !e.admitted {
+				e.preclaimRefused, e.statusOnly = true, true
+			}
+			h.mu.Unlock()
+			return false, nil
+		}
+	} else {
+		callbackCtx, cancel = context.WithTimeout(ctx, activeBudget)
+	}
 	defer cancel()
-	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+"/private/native/v1/admit", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, strings.TrimSuffix(h.cfg.CallbackOrigin, "/")+path, strings.NewReader(string(body)))
 	if err != nil {
 		return false, errDenied
 	}
 	req.Header.Set("Authorization", "Bearer "+h.cfg.CallbackCredential)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		// Issued here from the reservation, never copied from public headers.
+		req.Header.Set("X-Gateway-Reservation-Nonce", e.native.RequestNonce)
+		// Preserve Content-Encoding for strict refusal validation rather than
+		// allowing Transport's automatic gzip decode to erase that evidence.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
 	// There is one POST, no redirect, no automatic retry and no caller URL.
 	resp, err := h.callback.Do(req)
 	if err != nil {
@@ -465,6 +532,28 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 	}
 	// Callback body cleanup is best effort; it does not attest provider closure.
 	defer func() { _ = resp.Body.Close() }()
+	if token != "" && resp.StatusCode == http.StatusServiceUnavailable && len(resp.Header.Values("Content-Type")) == 1 && len(resp.Header.Values("Content-Encoding")) == 0 && resp.Header.Get("Content-Type") == "application/json" {
+		limit := min(h.cfg.CallbackBytes, 1024)
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		var refusal struct {
+			Kind         string `json:"kind"`
+			Claim        string `json:"claim"`
+			RequestNonce string `json:"requestNonce"`
+		}
+		if readErr == nil && int64(len(data)) <= limit && strictJSON(data, &refusal) == nil &&
+			refusal.Kind == "account-gateway/public-admit-capacity/v1" && refusal.Claim == "not_started" && refusal.RequestNonce == e.native.RequestNonce {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if e.admitted || e.proof != nil {
+				return false, errDenied
+			}
+			// This callback never claimed. Do not synthesize or alter any SQL
+			// request effect, including an earlier attempt with the same ref.
+			e.preclaimRefused, e.statusOnly = true, true
+			return false, nil
+		}
+		return false, errDenied
+	}
 	if resp.StatusCode != http.StatusOK || strings.Split(resp.Header.Get("Content-Type"), ";")[0] != "application/json" {
 		return false, errDenied
 	}
@@ -490,18 +579,38 @@ func (h *Handler) admit(ctx context.Context, consumer string, e *reservation) (b
 		if reply.NativeDescriptor != nil || reply.LeaseExpiresAt != "" {
 			return false, errDenied
 		}
+		// This authenticated SQL response grants no new claim/occupancy. Only
+		// this local NoForward attempt may later be discarded; the original
+		// durable request effect is never changed or described as non-entry.
+		h.mu.Lock()
+		e.statusOnly = true
+		h.mu.Unlock()
 		return false, nil
 	}
 	d := reply.Dispatch
 	p := d.Closure
 	lease, err := parseInstant(reply.LeaseExpiresAt)
 	deadline, _ := parseInstant(e.request.Admission.ExpiresAt)
-	if err != nil || !lease.After(time.Now()) || !deadline.After(time.Now()) || !p.valid() ||
+	if err != nil || !p.valid() ||
 		reply.Status.Effect != "dispatch_started" || reply.NativeDescriptor == nil || !service.SameGatewayNativeDescriptor(*reply.NativeDescriptor, e.request.Descriptor) ||
 		d.ExecutionRef != e.request.Admission.ExecutionRef || d.RequestRef != e.request.RequestRef || d.Limits != e.request.Admission.Limits || d.Deadline != e.request.Admission.ExpiresAt ||
 		d.Descriptor.Generation != e.native.Generation || d.Descriptor.NativePhysicalIdentity != e.native.Generation || d.Descriptor.Profile != e.request.Admission.ProfileID ||
-		p.ExecutionRef != d.ExecutionRef || p.RequestRef != d.RequestRef || p.Worker != e.request.Worker || p.Native != e.native ||
-		h.cfg.VerifyDispatch(callbackCtx, consumer, p, lease) != nil || callbackCtx.Err() != nil {
+		p.ExecutionRef != d.ExecutionRef || p.RequestRef != d.RequestRef || p.Worker != e.request.Worker || p.Native != e.native {
+		return false, errDenied
+	}
+	h.mu.Lock()
+	// Scope-matched claim evidence is retained before dynamic verification.
+	// A later callback failure, lease expiry or cancellation denies entry, but
+	// cannot erase the committed claim needed for independent no-entry settlement.
+	if e.proof != nil && *e.proof != p {
+		h.mu.Unlock()
+		return false, errDenied
+	}
+	if e.proof == nil {
+		e.proof = &p
+	}
+	h.mu.Unlock()
+	if !lease.After(time.Now()) || !deadline.After(time.Now()) || h.cfg.VerifyDispatch(callbackCtx, consumer, p, lease) != nil || callbackCtx.Err() != nil {
 		return false, errDenied
 	}
 	h.mu.Lock()
