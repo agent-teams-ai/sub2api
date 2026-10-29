@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/gatewaymodelcatalog"
 )
 
 // Model selection is mutable account capability; Route.Model remains the
@@ -21,14 +23,11 @@ type GatewayAccountModelsInput struct {
 	GatewayAccountLimitsInput
 	ForceRefresh bool `json:"forceRefresh,omitempty"`
 }
-type GatewayAccountModelChoices struct {
-	Allowed []string `json:"allowed"`
-	Default string   `json:"default"`
-}
+type GatewayAccountModelChoices = gatewaymodelcatalog.Choices
 type GatewayAccountModel struct {
 	ModelID   string                      `json:"modelId"`
 	Reasoning *GatewayAccountModelChoices `json:"reasoning"`
-	Fast      GatewayAccountModelChoices  `json:"fast"`
+	Fast      *GatewayAccountModelChoices `json:"fast"`
 	Tools     GatewayAccountModelChoices  `json:"tools"`
 }
 type GatewayAccountModelsResult struct {
@@ -44,13 +43,6 @@ type GatewayAccountModelsResult struct {
 var gatewayAccountModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 
 func GatewayAccountModelIDValid(id string) bool { return gatewayAccountModelID.MatchString(id) }
-func gatewayCodexWireEffortValid(e string) bool {
-	switch e {
-	case "minimal", "low", "medium", "high", "xhigh", "max":
-		return true
-	}
-	return false
-}
 
 // Pinned Codex 0.147 converts semantic Ultra to Responses wire Max. Apply
 // this only to vendor metadata; submitted request bytes must be canonical.
@@ -72,15 +64,16 @@ type gatewayModelsCache struct {
 }
 
 type GatewayAccountModelsReader struct {
-	dispatch  *GatewayNativeOAuthDispatch
-	authorize GatewayAccountLimitsAuthorizer
+	dispatch   *GatewayNativeOAuthDispatch
+	openRouter *OpenAIGatewayService
+	authorize  GatewayAccountLimitsAuthorizer
 }
 
-func NewGatewayAccountModelsReader(d *GatewayNativeOAuthDispatch, a GatewayAccountLimitsAuthorizer) (*GatewayAccountModelsReader, error) {
+func NewGatewayAccountModelsReader(d *GatewayNativeOAuthDispatch, openRouter *OpenAIGatewayService, a GatewayAccountLimitsAuthorizer) (*GatewayAccountModelsReader, error) {
 	if a == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
-	return &GatewayAccountModelsReader{d, a}, nil
+	return &GatewayAccountModelsReader{d, openRouter, a}, nil
 }
 func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccountModelsInput) GatewayAccountModelsResult {
 	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
@@ -90,6 +83,9 @@ func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccount
 	before, err := s.authorize(ctx, in.GatewayAccountLimitsInput)
 	if err != nil || ctx.Err() != nil {
 		return unavailable
+	}
+	if in.ProfileID == GatewayOpenRouterResponsesProfile {
+		return s.openRouter.readGatewayOpenRouterAccountModels(ctx, in, before, s.authorize)
 	}
 	if in.ProfileID != GatewayCodexOAuthResponsesProfile {
 		return GatewayAccountModelsResult{Status: "unsupported"}
@@ -151,7 +147,14 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 	identity := resolveCodexOutboundIdentity("")
 	principal := GatewayAccountLimitsPrincipal(p)
 	key := principal + ":" + strconv.FormatInt(version, 10) + ":" + identity.version
-	cache := &s.models
+	return s.models.read(ctx, key, principal+":", force, func() GatewayAccountModelsResult {
+		return s.fetchAccountModels(ctx, a, p, version, principal, identity)
+	})
+}
+
+// One bounded per-principal snapshot/single-flight mechanism serves both sources.
+func (cache *gatewayModelsCache) read(ctx context.Context, key, obsoletePrefix string, force bool, fetch func() GatewayAccountModelsResult) GatewayAccountModelsResult {
+	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
 	for {
 		cache.Lock()
 		if cache.entries == nil {
@@ -174,7 +177,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		}
 		// Drop obsolete revisions of this physical principal on every new fetch.
 		for old, entry := range cache.entries {
-			if strings.HasPrefix(old, principal+":") || !time.Now().Before(entry.expires) {
+			if (obsoletePrefix != "" && strings.HasPrefix(old, obsoletePrefix)) || !time.Now().Before(entry.expires) {
 				delete(cache.entries, old)
 			}
 		}
@@ -187,7 +190,7 @@ func (s *GatewayNativeOAuthDispatch) accountModels(ctx context.Context, a *Accou
 		pending := make(chan struct{})
 		cache.pending[key] = pending
 		cache.Unlock()
-		out := s.fetchAccountModels(ctx, a, p, version, principal, identity)
+		out := fetch()
 		ttl := 5 * time.Second
 		if out.Status == "snapshot" {
 			ttl = 60 * time.Second
@@ -372,7 +375,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 			projection.excluded[exclusion]++
 			continue
 		}
-		m := GatewayAccountModel{ModelID: slug, Fast: GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
+		m := GatewayAccountModel{ModelID: slug, Fast: &GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
 		var def string
 		if value := fields["default_reasoning_level"]; value != nil && string(value) != "null" {
 			if json.Unmarshal(value, &def) != nil {
@@ -397,7 +400,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 					}
 				}
 				effort = gatewayCodexCatalogWireEffort(effort)
-				if !gatewayCodexWireEffortValid(effort) {
+				if !gatewaymodelcatalog.WireEffortValid(effort) {
 					// Explicit none represents disabled reasoning. Unknown
 					// advertised levels must never manufacture that meaning.
 					if effort != "none" {
@@ -450,7 +453,7 @@ func gatewayAccountModelsAllow(result GatewayAccountModelsResult, model string, 
 				return true
 			}
 			var effort string
-			if json.Unmarshal(effortRaw, &effort) != nil || !gatewayCodexWireEffortValid(effort) {
+			if json.Unmarshal(effortRaw, &effort) != nil || !gatewaymodelcatalog.WireEffortValid(effort) {
 				return false
 			}
 			for _, allowed := range m.Reasoning.Allowed {
@@ -475,5 +478,5 @@ func gatewayLegacyCodexReasoning(raw json.RawMessage) bool {
 		return true
 	}
 	var effort string
-	return json.Unmarshal(fields["effort"], &effort) == nil && gatewayCodexWireEffortValid(effort)
+	return json.Unmarshal(fields["effort"], &effort) == nil && gatewaymodelcatalog.WireEffortValid(effort)
 }

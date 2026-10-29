@@ -628,6 +628,12 @@ func (w *compositionHTTPWriter) SetReadDeadline(deadline time.Time) error {
 	return err
 }
 
+type bootstrapModelsFixture func(*http.Request) (*http.Response, error)
+
+func (f bootstrapModelsFixture) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 // One real HTTP composition: three distinct protected tuples, the MiMo ACK,
 // exact admission limits/caps and candidate create/read with optional OAuth.
 // The authority returns non-dispatch readback; no provider/login/PG call occurs.
@@ -732,6 +738,15 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		t.Fatal(err)
 	}
 	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err := gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(bootstrapModelsFixture(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != service.GatewayOpenRouterBaseURL+"/models" || request.Method != http.MethodGet || request.Header.Get("Authorization") != "" {
+			return nil, ErrDenied
+		}
+		body := `{"data":[{"id":"openai/gpt-5.4-mini","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools"]}]}`
+		return &http.Response{StatusCode: http.StatusOK, Request: request, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}))); err != nil {
+		t.Fatal(err)
+	}
 	adminSvc := service.NewAdminService(nil, nil, nil, rows, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	auth := authorize(c.Peers)
 	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,

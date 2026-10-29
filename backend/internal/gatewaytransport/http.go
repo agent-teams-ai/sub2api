@@ -118,9 +118,10 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 		}
 	} else {
 		requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
-		if profile.Profile == service.GatewayCodexOAuthResponsesProfile {
+		if profile.Profile == service.GatewayCodexOAuthResponsesProfile || profile.Profile == service.GatewayOpenRouterResponsesProfile {
 			fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
-			if !valid || json.Unmarshal(fields["model"], &requestedModel) != nil || !service.GatewayAccountModelIDValid(requestedModel) {
+			if !valid || json.Unmarshal(fields["model"], &requestedModel) != nil || !service.GatewayAccountModelIDValid(requestedModel) ||
+				profile.Profile == service.GatewayOpenRouterResponsesProfile && !service.GatewayOpenRouterModelValid(requestedModel) {
 				writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 				return
 			}

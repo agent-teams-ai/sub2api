@@ -184,6 +184,10 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"code": "invalid_native_candidate"})
 			return
 		}
+		if selected.ID == service.GatewayOpenRouterResponsesProfile && gateway.QualifyGatewayOpenRouterModel(c.Request.Context(), scope, envelope, selected.Model) != nil {
+			fail(c)
+			return
+		}
 		// The facade MUST journal operation+generation before its ONE create attempt.
 		// No stock idempotency coordinator: it retains vendor responses and permits
 		// expired/retryable reclaim. The DB unique generation is the final one-row guard.
@@ -237,9 +241,26 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			return
 		}
 		if req.State == "active" {
-			if _, err := gateway.ResolveGatewayCandidate(c.Request.Context(), c.Param("generation")); err != nil {
+			candidate, err := gateway.ResolveGatewayCandidate(c.Request.Context(), c.Param("generation"))
+			if err != nil {
 				fail(c)
 				return
+			}
+			if d.Profile == service.GatewayOpenRouterResponsesProfile {
+				scope, scopeErr := service.GatewayNativeCredentialScopeForAccount(candidate)
+				if scopeErr != nil || gateway.QualifyGatewayOpenRouterModel(c.Request.Context(), scope, candidate.GetCredential("api_key"), d.Model) != nil {
+					fail(c)
+					return
+				}
+				fresh, found := read(c, c.Param("generation"))
+				if !found {
+					return
+				}
+				freshScope, freshScopeErr := service.GatewayNativeCredentialScopeForAccount(fresh)
+				if freshScopeErr != nil || freshScope != scope || fresh.GetCredential("api_key") != candidate.GetCredential("api_key") {
+					fail(c)
+					return
+				}
 			}
 		}
 		nativeStatus := req.State

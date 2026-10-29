@@ -236,13 +236,15 @@ func TestGatewayNativeMiMoWireDefaultTier(t *testing.T) {
 }
 
 func TestGatewayNativeOpenRouterWireDefaultTierUnchanged(t *testing.T) {
-	payload := []byte(`{"model":"` + GatewayOpenRouterModel + `","service_tier":"default", "input":[{"n":9007199254740993,"v":1.2300}],"stream":false}`)
+	payload := []byte(`{"model":"` + GatewayOpenRouterModel + `","service_tier":"default", "input":"preserved text","tools":[{"type":"function","name":"echo","parameters":{"type":"object","properties":{"n":{"type":"number","default":9007199254740993},"v":{"type":"number","default":1.2300}}}}],"stream":false}`)
 	transport := &nativeDiagnosticHTTP{response: &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"completed","output":[]}`)), Header: http.Header{}}}
 	account := nativeReviewStreamAccount(t, GatewayOpenRouterBaseURL, GatewayOpenRouterResponsesProfile)
 	account.Extra[GatewayModelExtraKey] = GatewayOpenRouterModel
 	route, err := GatewayNativeDescriptor(account)
 	require.NoError(t, err)
 	svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
+	modelsBody := `{"data":[` + openRouterModelRow(GatewayOpenRouterModel, true) + `]}`
+	require.NoError(t, svc.SetGatewayOpenRouterModels(openRouterModelsFixture(t, &modelsBody)))
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(payload))
 	_, entered, err := svc.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, payload)

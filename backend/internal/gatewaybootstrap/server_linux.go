@@ -36,11 +36,12 @@ import (
 )
 
 // Options are explicit fixture transport/trust injection at outer composition.
-// Production main passes the zero value. Neither field is decoded from FD 6.
+// Production main passes the zero value. These fields are never decoded from FD 6.
 type Options struct {
-	Upstream            service.HTTPUpstream
-	AuthorityTransport  *http.Transport
-	OAuthOwnerAuthority NativeOAuthOwnerAuthority
+	Upstream                  service.HTTPUpstream
+	OpenRouterModelsTransport http.RoundTripper
+	AuthorityTransport        *http.Transport
+	OAuthOwnerAuthority       NativeOAuthOwnerAuthority
 }
 
 func verifyInherited(fd int, kind uint32, access int) error {
@@ -166,6 +167,9 @@ func Run(ctx context.Context, options Options) error {
 		return ErrDenied
 	}
 	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, svcCfg, nil, nil, nil, nil, nil, lifetimeUpstream, nil, nil, nil, nil, nil, nil, nil, nil)
+	if c.OpenRouter != nil && gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(options.OpenRouterModelsTransport)) != nil {
+		return ErrDenied
+	}
 	adminRepo, ok := repo.(service.AdminAccountRepository)
 	if !ok {
 		return ErrDenied
@@ -182,7 +186,7 @@ func Run(ctx context.Context, options Options) error {
 		Profile:    c.qualifiedProfile(), CodingPlans: c.codingPlanProfiles(), Grok: c.grokProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
 		IOTimeout: 30 * time.Second, ProviderReadIdle: 30 * time.Second, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
 	var oauth *privateOAuth
-	if c.OAuth != nil || c.Claude != nil || c.Grok != nil || len(c.CodingPlans) > 0 {
+	if c.OAuth != nil || c.Claude != nil || c.Grok != nil || len(c.CodingPlans) > 0 || c.OpenRouter != nil {
 		owners := options.OAuthOwnerAuthority
 		if owners == nil {
 			owners = a
@@ -218,8 +222,8 @@ func Run(ctx context.Context, options Options) error {
 		tcfg.ClaudeOAuth = oauth.claude
 		tcfg.Claude = c.claudeProfile()
 	}
-	if oauth != nil && oauth.models == nil {
-		if composePrivateModels(oauth, oauth.owners) != nil {
+	if oauth != nil {
+		if composePrivateModels(oauth, oauth.owners, gateway) != nil {
 			return ErrDenied
 		}
 	}
@@ -324,7 +328,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
-		c.Request = c.Request.WithContext(ctx)
+		c.Request = c.Request.WithContext(service.WithGatewayNativeCustody(ctx, custody))
 		c.Next()
 	}
 	secondary, hasOpenRouter := transport.OpenRouterProfile()
@@ -856,9 +860,6 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 		}
 	}
 	out := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup, limits: limits}
-	if composePrivateModels(out, owners) != nil {
-		return nil, ErrDenied
-	}
 	return out, nil
 }
 
@@ -930,8 +931,8 @@ func composePrivateClaude(out *privateOAuth, repo service.AccountRepository, db 
 }
 
 // The same logical owner+epoch authority fences metadata reads across providers.
-// A deployment without Codex still returns an explicit unsupported union.
-func composePrivateModels(out *privateOAuth, owners NativeOAuthOwnerAuthority) error {
+// Profiles without a supported catalogue retain the explicit unsupported union.
+func composePrivateModels(out *privateOAuth, owners NativeOAuthOwnerAuthority, gateway *service.OpenAIGatewayService) error {
 	if out == nil {
 		return ErrDenied
 	}
@@ -940,7 +941,7 @@ func composePrivateModels(out *privateOAuth, owners NativeOAuthOwnerAuthority) e
 		return nil
 	}
 	var err error
-	out.models, err = service.NewGatewayAccountModelsReader(out.dispatch, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+	out.models, err = service.NewGatewayAccountModelsReader(out.dispatch, gateway, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
 		consumer, e := service.GatewayNativeConsumer(ctx)
 		if e != nil {
 			return service.GatewayNativeRoute{}, ErrDenied
