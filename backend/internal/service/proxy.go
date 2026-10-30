@@ -54,14 +54,7 @@ func (p *Proxy) URL() string {
 
 // proxyURLForLog preserves the proxy endpoint without credentials or URL suffixes.
 func proxyURLForLog(raw string) string {
-	_, parsed, err := proxyurl.Parse(raw)
-	if err != nil {
-		return "[invalid proxy URL]"
-	}
-	if parsed == nil {
-		return ""
-	}
-	return parsed.Scheme + "://" + parsed.Host
+	return proxyurl.ForLog(raw)
 }
 
 type ProxyWithAccountCount struct {

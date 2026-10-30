@@ -30,8 +30,12 @@ func TestCoderOpenAIWSClientDialer_ProxyHTTPClientInvalidURL(t *testing.T) {
 	impl, ok := dialer.(*coderOpenAIWSClientDialer)
 	require.True(t, ok)
 
-	_, err := impl.proxyHTTPClient("://bad")
-	require.Error(t, err)
+	for _, raw := range []string{"://bad", "http://proxy-user-marker:proxy-password-marker@%:8080"} {
+		_, err := impl.proxyHTTPClient(raw)
+		require.EqualError(t, err, "invalid proxy url")
+		require.NotContains(t, err.Error(), "proxy-user-marker")
+		require.NotContains(t, err.Error(), "proxy-password-marker")
+	}
 }
 
 func TestCoderOpenAIWSClientDialer_TransportMetricsSnapshot(t *testing.T) {

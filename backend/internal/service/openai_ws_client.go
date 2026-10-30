@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -176,7 +175,7 @@ func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string) (*http.Client,
 	}
 	parsedProxyURL, err := url.Parse(normalizedProxy)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy url: %w", err)
+		return nil, errors.New("invalid proxy url")
 	}
 	now := time.Now().UnixNano()
 
