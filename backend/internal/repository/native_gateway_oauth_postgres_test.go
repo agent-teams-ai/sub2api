@@ -300,8 +300,9 @@ func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.Gatew
 	hook := &oauthRedisCommandHook{}
 	client.AddHook(hook)
 	cache := NewGeminiTokenCache(client)
+	ordinaryTokenKey := oauthTokenKeyPrefix + service.OpenAITokenCacheKey(row)
 	defer func() {
-		require.NoError(t, client.Del(ctx, oauthTokenKeyPrefix+service.OpenAITokenCacheKey(row)).Err())
+		require.NoError(t, client.Del(ctx, ordinaryTokenKey, schedulerAccountMetaRevisionKey).Err())
 	}()
 	require.NoError(t, cache.SetAccessToken(ctx, service.OpenAITokenCacheKey(row), "ordinary-fixture-cache-hit", time.Hour))
 	hook.calls.Store(0)
@@ -330,12 +331,17 @@ func oauthPGRedisGuards(t *testing.T, row *service.Account, bundle service.Gatew
 	require.Zero(t, hook.calls.Load(), "managed paths must make zero ordinary token-cache commands")
 	keys, err := client.Keys(ctx, "*").Result()
 	require.NoError(t, err)
-	require.Len(t, keys, 1)
-	dump, err := client.Dump(ctx, keys[0]).Result()
+	require.ElementsMatch(t, []string{ordinaryTokenKey, schedulerAccountMetaRevisionKey}, keys)
+	revision, err := client.Get(ctx, schedulerAccountMetaRevisionKey).Result()
 	require.NoError(t, err)
+	require.Regexp(t, "^[0-9a-f]{32}$", revision)
 	secrets := append([]string{bundle.AccessToken, bundle.RefreshToken, bundle.IDToken, "synthetic-f1-metadata"}, sentinels...)
-	for _, secret := range secrets {
-		require.NotContains(t, dump, secret)
+	for _, key := range keys {
+		dump, err := client.Dump(ctx, key).Result()
+		require.NoError(t, err)
+		for _, secret := range secrets {
+			require.NotContains(t, dump, secret)
+		}
 	}
 }
 
@@ -669,10 +675,10 @@ func TestGatewayNativeOAuthPostgresFencedRefresh(t *testing.T) {
 	require.Zero(t, calls.Load())
 	// Joining by account ID alone must not misclassify a mismatched existing
 	// qualification as absent and grant the pending-enrollment branch.
-	qualifiedOwnerUpdate := `UPDATE gateway_oauth_profile_qualifications SET owner_ref=$1 WHERE account_id=$2`
-	setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, "foreign-qualified-owner")
+	qualifiedGenerationUpdate := `UPDATE gateway_oauth_profile_qualifications SET generation=$1 WHERE account_id=$2`
+	setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedGenerationUpdate, uuid.NewString())
 	func() {
-		defer setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedOwnerUpdate, scope.Owner)
+		defer setFixtureIdentity("gateway_oauth_profile_qualifications", qualifiedGenerationUpdate, scope.Generation)
 		_, err = resolver.ResolveGatewayNativeOAuthRefresh(principal, scope, connectOperation)
 		require.ErrorIs(t, err, service.ErrGatewayNativeIdentity)
 	}()

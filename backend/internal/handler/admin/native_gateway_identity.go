@@ -42,6 +42,12 @@ type gatewayNativeDispatchRequest struct {
 	Descriptor service.GatewayNativeRoute `json:"descriptor"`
 	Payload    json.RawMessage            `json:"payload"`
 }
+type gatewayNativeRetainedCustodyInput struct {
+	Contract   string                     `json:"contract"`
+	OwnerRef   string                     `json:"owner_ref"`
+	AccountRef string                     `json:"account_ref"`
+	Descriptor service.GatewayNativeRoute `json:"descriptor"`
+}
 
 // "inactive" is a private wire alias for native StatusDisabled.
 func gatewayNativeWireState(status string) string {
@@ -77,23 +83,22 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	admit func(*gin.Context, service.GatewayNativeRoute) error,
 	settle func(*gin.Context, bool, error), custody *service.GatewayNativeCredentialCustody, openRouter ...GatewayNativeProfile) {
 	if group == nil || admin == nil || gateway == nil || authorize == nil || admit == nil || settle == nil || custody == nil ||
-		!gatewayNativeProfileValid(profile) || len(openRouter) > 1 || len(openRouter) == 1 &&
-		(openRouter[0].ID != service.GatewayOpenRouterResponsesProfile || profile.ID == openRouter[0].ID || !gatewayNativeProfileValid(openRouter[0])) {
+		!gatewayNativeProfileValid(profile) || len(openRouter) > 4 {
 		panic("invalid private native gateway composition")
 	}
-	// Capture at most one optional preset. No request owns a URL/model or catalog.
-	var second GatewayNativeProfile
-	if len(openRouter) == 1 {
-		second = openRouter[0]
+	// Every additional profile is a closed, separately qualified server preset.
+	// The variadic API preserves the existing OpenRouter composition unchanged.
+	profiles := map[string]GatewayNativeProfile{profile.ID: profile}
+	for _, candidate := range openRouter {
+		if _, exists := profiles[candidate.ID]; exists || !gatewayNativeProfileValid(candidate) ||
+			(candidate.ID != service.GatewayOpenRouterResponsesProfile && !service.GatewayNativeCodingPlanProfileIDValid(candidate.ID)) {
+			panic("invalid private native gateway composition")
+		}
+		profiles[candidate.ID] = candidate
 	}
 	selectProfile := func(id string) (GatewayNativeProfile, bool) {
-		if id == profile.ID {
-			return profile, true
-		}
-		if second.ID != "" && id == second.ID {
-			return second, true
-		}
-		return GatewayNativeProfile{}, false
+		selected, ok := profiles[id]
+		return selected, ok
 	}
 	validDescriptor := func(d service.GatewayNativeRoute) bool {
 		selected, ok := selectProfile(d.Profile)
@@ -138,6 +143,29 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			emit(c, a)
 		}
 	})
+	routes.GET("/candidates/:generation/custody", func(c *gin.Context) {
+		var req gatewayNativeRetainedCustodyInput
+		if decodeNativeRetainedCustody(c, &req) != nil || req.Contract != service.GatewayNativeRetainedCustodyContract ||
+			req.Descriptor.Generation != c.Param("generation") || !validDescriptor(req.Descriptor) ||
+			!service.GatewayNativeCredentialRefValid(req.OwnerRef) || !service.GatewayNativeCredentialRefValid(req.AccountRef) {
+			fail(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.OwnerRef, Account: req.AccountRef,
+			Generation: req.Descriptor.Generation, Purpose: service.GatewayCredentialPurpose}
+		out, err := gateway.ReadGatewayNativeRetainedAPIKeyCustody(c.Request.Context(), scope, req.Descriptor)
+		if err != nil {
+			fail(c)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, out)
+	})
 	routes.POST("/candidates", func(c *gin.Context) {
 		var req gatewayNativeCreate
 		decodeErr := nativeGatewayDecode(c, &req)
@@ -154,6 +182,10 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		req.APIKey = ""
 		if err != nil || sealErr != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"code": "invalid_native_candidate"})
+			return
+		}
+		if selected.ID == service.GatewayOpenRouterResponsesProfile && gateway.QualifyGatewayOpenRouterModel(c.Request.Context(), scope, envelope, selected.Model) != nil {
+			fail(c)
 			return
 		}
 		// The facade MUST journal operation+generation before its ONE create attempt.
@@ -209,9 +241,26 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 			return
 		}
 		if req.State == "active" {
-			if _, err := gateway.ResolveGatewayCandidate(c.Request.Context(), c.Param("generation")); err != nil {
+			candidate, err := gateway.ResolveGatewayCandidate(c.Request.Context(), c.Param("generation"))
+			if err != nil {
 				fail(c)
 				return
+			}
+			if d.Profile == service.GatewayOpenRouterResponsesProfile {
+				scope, scopeErr := service.GatewayNativeCredentialScopeForAccount(candidate)
+				if scopeErr != nil || gateway.QualifyGatewayOpenRouterModel(c.Request.Context(), scope, candidate.GetCredential("api_key"), d.Model) != nil {
+					fail(c)
+					return
+				}
+				fresh, found := read(c, c.Param("generation"))
+				if !found {
+					return
+				}
+				freshScope, freshScopeErr := service.GatewayNativeCredentialScopeForAccount(fresh)
+				if freshScopeErr != nil || freshScope != scope || fresh.GetCredential("api_key") != candidate.GetCredential("api_key") {
+					fail(c)
+					return
+				}
 			}
 		}
 		nativeStatus := req.State
@@ -324,7 +373,7 @@ func nativeGatewayCanonicalIngress(body []byte) bool {
 		token, err = decoder.Token()
 		return fields, err == nil && token == json.Delim('}')
 	}
-	fields, ok := check(body, []string{"generation", "profile", "name", "api_key", "owner_ref", "account_ref", "descriptor", "state", "payload"})
+	fields, ok := check(body, []string{"generation", "profile", "name", "api_key", "owner_ref", "account_ref", "descriptor", "state", "payload", "contract", "operation"})
 	if !ok {
 		return false
 	}

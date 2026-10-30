@@ -36,15 +36,16 @@ type GatewayNativeOAuthRefreshFence interface {
 }
 
 type GatewayNativeOAuthPhysical struct {
-	Scope           GatewayNativeCredentialScope
-	Operation       string
-	Route           GatewayNativeRoute
-	Issuer          string
-	Subject         string
-	ProviderAccount string
-	QualifiedAt     time.Time
-	proof           *gatewayOAuthQualificationProof
-	RefreshFence    GatewayNativeOAuthRefreshFence
+	CredentialRevision int64
+	Scope              GatewayNativeCredentialScope
+	Operation          string
+	Route              GatewayNativeRoute
+	Issuer             string
+	Subject            string
+	ProviderAccount    string
+	QualifiedAt        time.Time
+	proof              *gatewayOAuthQualificationProof
+	RefreshFence       GatewayNativeOAuthRefreshFence
 }
 
 type GatewayNativeOAuthDispatchRepository interface {
@@ -113,12 +114,14 @@ type GatewayNativeOAuthDispatch struct {
 	verifier            *GatewayNativeOAuthVerifier
 	client              *http.Client
 	accountCheckHeaders http.Header
+	models              gatewayModelsCache
+	modelVersions       *GatewayCodexVersionResolver
 }
 
 // Transport injection is trusted composition for loopback TLS fixtures only.
 // Production mounting and live profile qualification are separate gates.
-func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *GatewayNativeCredentialCustody, v *GatewayNativeOAuthVerifier, transport http.RoundTripper) (*GatewayNativeOAuthDispatch, error) {
-	if r == nil || !GatewayNativeCredentialCustodyReady(c) || v == nil {
+func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *GatewayNativeCredentialCustody, v *GatewayNativeOAuthVerifier, transport http.RoundTripper, versions ...*GatewayCodexVersionResolver) (*GatewayNativeOAuthDispatch, error) {
+	if r == nil || !GatewayNativeCredentialCustodyReady(c) || v == nil || len(versions) > 1 {
 		return nil, ErrGatewayNativeIdentity
 	}
 	var headers http.Header
@@ -140,7 +143,11 @@ func NewGatewayNativeOAuthDispatch(r GatewayNativeOAuthDispatchRepository, c *Ga
 		transport = bounded
 		headers = browser.Headers.Clone()
 	}
-	return &GatewayNativeOAuthDispatch{repository: r, custody: c, verifier: v, accountCheckHeaders: headers, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
+	var modelVersions *GatewayCodexVersionResolver
+	if len(versions) == 1 {
+		modelVersions = versions[0]
+	}
+	return &GatewayNativeOAuthDispatch{modelVersions: modelVersions, repository: r, custody: c, verifier: v, accountCheckHeaders: headers, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }}}, nil
 }
 
@@ -439,10 +446,10 @@ func (s *OpenAIGatewayService) forwardGatewayOAuthRoute(ctx context.Context, c *
 	if !ok || !ownedTransport || c == nil || c.Request == nil || life == nil || !life.matchesScope(binding.scope) || !GatewayNativeOAuthScopeAuthorized(ctx, binding.scope) || int64(len(body)) > binding.requestBytes {
 		return nil, false, ErrGatewayNativeIdentity
 	}
-	fields, ok := GatewayNativePayloadFields(body, "model", "store", "stream", "service_tier", "previous_response_id", "max_output_tokens")
+	fields, ok := GatewayNativePayloadFields(body, "model", "store", "stream", "service_tier", "previous_response_id", "max_output_tokens", "reasoning")
 	var model, tier string
 	var stream, store bool
-	if !ok || json.Unmarshal(fields["model"], &model) != nil || model != GatewayCodexOAuthModel || model != route.Model ||
+	if !ok || json.Unmarshal(fields["model"], &model) != nil || !GatewayAccountModelIDValid(model) ||
 		string(fields["stream"]) != "true" || json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
 		string(fields["store"]) != "false" || json.Unmarshal(fields["store"], &store) != nil || store ||
 		json.Unmarshal(fields["service_tier"], &tier) != nil || tier != "default" || fields["previous_response_id"] != nil {
@@ -468,6 +475,9 @@ func (s *OpenAIGatewayService) forwardGatewayOAuthRoute(ctx context.Context, c *
 	}
 	a = snapshotGatewayNativeAccount(a)
 	release()
+	if !gatewayAccountModelsAllow(binding.dispatch.accountModels(ctx, a, p, false), model, fields["reasoning"]) {
+		return nil, false, ErrGatewayNativeIdentity
+	}
 	state := &gatewayNativeDispatch{route: route, account: a, scope: binding.scope, custody: binding.dispatch.custody, oauth: &p}
 	ctx = WithHTTPUpstreamRedirectsDisabled(context.WithValue(ctx, gatewayNativeContextKey{}, state))
 	request := c.Request.Clone(ctx)
@@ -516,6 +526,21 @@ func (s *OpenAIGatewayService) checkGatewayOAuthDispatch(request *http.Request, 
 	identity, err := binding.dispatch.verifier.Verify(bounded, bundle.IDToken)
 	issuer, subject := identity.Principal()
 	if err != nil || issuer != p.Issuer || subject != p.Subject {
+		return deny()
+	}
+	var payload []byte
+	if request.GetBody == nil {
+		return deny()
+	}
+	reader, readErr := request.GetBody()
+	if readErr != nil {
+		return deny()
+	}
+	payload, readErr = io.ReadAll(io.LimitReader(reader, binding.requestBytes+1))
+	_ = reader.Close()
+	fields, valid := GatewayNativePayloadFields(payload, "model", "reasoning")
+	var model string
+	if readErr != nil || int64(len(payload)) > binding.requestBytes || !valid || json.Unmarshal(fields["model"], &model) != nil || !gatewayAccountModelsAllow(binding.dispatch.accountModels(request.Context(), fresh, p, false), model, fields["reasoning"]) {
 		return deny()
 	}
 	if p.RefreshFence == nil || p.RefreshFence.Check(request.Context()) != nil {

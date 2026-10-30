@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -27,13 +28,16 @@ const GatewayOpenRouterModel = "openai/gpt-5.4-mini"
 const GatewayOpenRouterNanoModel = "openai/gpt-5.4-nano"
 
 func GatewayOpenRouterModelValid(model string) bool {
-	return model == GatewayOpenRouterModel || model == GatewayOpenRouterNanoModel
+	// This validates descriptor syntax only. Candidate qualification and every
+	// requested model are separately admitted by the fixed provider catalogue.
+	return GatewayAccountModelIDValid(model) && strings.Contains(model, "/") && !strings.Contains(model, "://")
 }
 
 // Finite identities only; endpoints/models remain trusted composition fields.
 func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
 	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
-		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model)
+		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model) ||
+		GatewayNativeCodingPlanProfileValid(profile, baseURL, model)
 }
 
 var ErrGatewayNativeIdentity = errors.New("gateway native identity rejected")
@@ -100,12 +104,13 @@ func (s *OpenAIGatewayService) EraseGatewayCandidate(ctx context.Context, route 
 }
 
 type gatewayNativeDispatch struct {
-	route   GatewayNativeRoute
-	account *Account
-	scope   GatewayNativeCredentialScope
-	custody *GatewayNativeCredentialCustody
-	oauth   *GatewayNativeOAuthPhysical
-	entered atomic.Bool
+	route          GatewayNativeRoute
+	account        *Account
+	scope          GatewayNativeCredentialScope
+	custody        *GatewayNativeCredentialCustody
+	oauth          *GatewayNativeOAuthPhysical
+	entered        atomic.Bool
+	requestedModel string
 }
 
 func HasGatewayNativeIdentity(a *Account) bool {
@@ -115,7 +120,13 @@ func HasGatewayNativeIdentity(a *Account) bool {
 	_, generation := a.Extra[GatewayGenerationExtraKey]
 	_, profile := a.Extra[GatewayProfileExtraKey]
 	_, custody := a.Extra[GatewayCredentialScopeExtraKey]
-	return generation || profile || custody
+	_, claudeGeneration := a.Extra["gateway_claude_generation_v1"]
+	_, claudeProfile := a.Extra["gateway_claude_profile_v1"]
+	_, claudeCustody := a.Extra["gateway_claude_scope_v1"]
+	_, grokGeneration := a.Extra["gateway_grok_generation_v1"]
+	_, grokProfile := a.Extra["gateway_grok_profile_v1"]
+	_, grokCustody := a.Extra["gateway_grok_scope_v1"]
+	return generation || profile || custody || claudeGeneration || claudeProfile || claudeCustody || grokGeneration || grokProfile || grokCustody
 }
 
 func validateGatewayNativeShape(a *Account) error {
@@ -134,7 +145,7 @@ func validateGatewayNativeShape(a *Account) error {
 	if profile == GatewayLegacyBridgeProfile {
 		mode, passthrough = "force_chat_completions", false
 	}
-	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile) ||
+	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && !GatewayNativeCodingPlanProfileIDValid(profile)) ||
 		a.Extra["openai_responses_mode"] != mode ||
 		a.Extra["openai_passthrough"] != passthrough ||
 		a.Extra["native_api_key_cancel_on_disconnect"] != true ||
@@ -264,15 +275,43 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 			defer lifetime.finish()
 		}
 	}
+	if ctx != nil && route.Profile == GatewayGrokOAuthResponsesProfile {
+		return s.forwardGatewayGrokRoute(ctx, c, route, body)
+	}
+	if ctx != nil && route.Profile == GatewayClaudeOAuthMessagesProfile {
+		return s.forwardGatewayClaudeRoute(ctx, c, route, body)
+	}
 	if ctx != nil && route.Profile == GatewayCodexOAuthResponsesProfile {
 		return s.forwardGatewayOAuthRoute(ctx, c, route, body)
 	}
 	if ctx == nil || c == nil || c.Request == nil || s.accountRepo == nil || len(body) > 4<<20 || !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() || !gatewayNativeUnambiguousPolicyFields(body) ||
-		gjson.GetBytes(body, "model").String() != route.Model || !GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) ||
+		(route.Profile != GatewayOpenRouterResponsesProfile && gjson.GetBytes(body, "model").String() != route.Model) || !GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) ||
 		gjson.GetBytes(body, "previous_response_id").String() != "" ||
 		(gjson.GetBytes(body, "service_tier").Exists() && gjson.GetBytes(body, "service_tier").String() != "default") ||
 		(gjson.GetBytes(body, "store").Exists() && gjson.GetBytes(body, "store").Bool()) {
 		return nil, false, ErrGatewayNativeIdentity
+	}
+	if route.Profile == GatewayOpenRouterResponsesProfile {
+		fields, valid := gatewayOpenRouterResponsesFields(body)
+		if !valid || !gatewayNativeProviderTextInput(route.Profile, fields["input"]) || fields["tools"] != nil && !gatewayNativeProviderTools(fields["tools"]) {
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		prepared, mapping, prepareErr := adaptResponsesClientToolsForFunctionUpstream(body, "OpenRouter")
+		if prepareErr != nil || len(prepared) > 4<<20 {
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		body = prepared
+		setGrokResponsesClientToolMapping(c, mapping)
+		defer clearGrokResponsesClientToolMapping(c)
+	}
+	if GatewayNativeCodingPlanProfileIDValid(route.Profile) {
+		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
+		if prepareErr != nil {
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		body = prepared
+		setGrokResponsesClientToolMapping(c, mapping)
+		defer clearGrokResponsesClientToolMapping(c)
 	}
 	if _, ok := s.accountRepo.(GatewayNativeAccountLocker); !ok {
 		return nil, false, ErrGatewayNativeIdentity
@@ -298,6 +337,12 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	}
 	a = snapshotGatewayNativeAccount(a)
 	state := &gatewayNativeDispatch{route: route, account: a, scope: scope, custody: custody}
+	if route.Profile == GatewayOpenRouterResponsesProfile {
+		state.requestedModel = gjson.GetBytes(body, "model").String()
+		if s.gatewayOpenRouterModels == nil || !gatewayOpenRouterModelsAllow(s.gatewayOpenRouterModels.read(ctx, gatewayOpenRouterModelsPrincipal(scope, a.GetCredential("api_key")), false), route.Model, state.requestedModel, body) {
+			return nil, false, ErrGatewayNativeIdentity
+		}
+	}
 	ctx = WithHTTPUpstreamRedirectsDisabled(context.WithValue(ctx, gatewayNativeContextKey{}, state))
 	// Restrict this private seam to a Responses request; never pass public route
 	// path suffixes or authentication and affinity headers into upstream routing.
@@ -307,7 +352,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	// Native Responses is the first qualification path. The separately selected
 	// historical bridge is never an automatic fallback after any dispatch.
 	var result *OpenAIForwardResult
-	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile {
+	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile || GatewayNativeCodingPlanProfileIDValid(route.Profile) {
 		result, err = s.forwardGatewayNativeResponses(ctx, c, a, body)
 	} else {
 		result, err = s.forwardResponsesViaRawChatCompletions(ctx, c, a, body)
@@ -339,6 +384,9 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		}
 		return noop, nil
 	}
+	if state.route.Profile == GatewayGrokOAuthResponsesProfile {
+		return s.checkGatewayGrokDispatch(request, a, state)
+	}
 	if state.route.Profile == GatewayCodexOAuthResponsesProfile {
 		return s.checkGatewayOAuthDispatch(request, a, state)
 	}
@@ -354,6 +402,25 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 	if !ok {
 		return noop, ErrGatewayNativeIdentity
 	}
+	// Observe membership before taking the credential row lock. The same
+	// encrypted row and unexpired snapshot are checked again at entry below.
+	var catalogue GatewayAccountModelsResult
+	var payload []byte
+	if state.route.Profile == GatewayOpenRouterResponsesProfile {
+		if s.gatewayOpenRouterModels == nil || request.GetBody == nil {
+			return noop, ErrGatewayNativeIdentity
+		}
+		reader, readErr := request.GetBody()
+		if readErr != nil {
+			return noop, ErrGatewayNativeIdentity
+		}
+		payload, readErr = io.ReadAll(io.LimitReader(reader, (4<<20)+1))
+		_ = reader.Close()
+		if readErr != nil || len(payload) > 4<<20 || gjson.GetBytes(payload, "model").String() != state.requestedModel {
+			return noop, ErrGatewayNativeIdentity
+		}
+		catalogue = s.gatewayOpenRouterModels.read(request.Context(), gatewayOpenRouterModelsPrincipal(state.scope, a.GetCredential("api_key")), false)
+	}
 	fresh, release, err := locker.LockGatewayNativeAccount(request.Context(), state.route.AccountID)
 	if err != nil {
 		return noop, ErrGatewayNativeIdentity
@@ -368,6 +435,10 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 	scope, err := GatewayNativeCredentialScopeForAccount(fresh)
 	consumer, consumerErr := GatewayNativeConsumer(request.Context())
 	if err != nil || consumerErr != nil || scope != state.scope || scope.Consumer != consumer || state.custody == nil {
+		release()
+		return noop, ErrGatewayNativeIdentity
+	}
+	if state.route.Profile == GatewayOpenRouterResponsesProfile && !gatewayOpenRouterModelsAllow(catalogue, state.route.Model, state.requestedModel, payload) {
 		release()
 		return noop, ErrGatewayNativeIdentity
 	}

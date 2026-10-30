@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: backend/go.sum
       - name: Native boundary and ordinary regressions
         working-directory: backend
@@ -88,6 +88,32 @@ jobs:
           go test -tags unit ./internal/repository -run '^TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-oauth-reconnect-pg.log"
           test "$(grep -c '^--- PASS: TestGatewayNativeOAuthReconnectPostgresClaimsAndBackfill ' "$RUNNER_TEMP/native-oauth-reconnect-pg.log")" -eq 1
           ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-oauth-reconnect-pg.log"
+
+      - name: Claude OAuth lifecycle, passive quota and protected Messages transport
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_CLAUDE_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_claude_test_ci?sslmode=disable
+          GATEWAY_NATIVE_CLAUDE_STREAM_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_claude_stream_test_ci?sslmode=disable
+        run: |
+          set -o pipefail
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_claude_test_ci
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_claude_stream_test_ci
+          go test -tags unit ./internal/service ./internal/gatewaytransport -run '^(TestGateway(Native)?Claude|TestClaudePrivateHTTP)' -count=1 -v | tee "$RUNNER_TEMP/native-claude-boundary.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-claude-boundary.log"
+          for critical in \
+            TestGatewayClaudePassiveHeaderTruthAndInertRead \
+            TestGatewayClaudeOAuthSourceIdentityAndCustody \
+            TestGatewayClaudeCustodyContainedFromOrdinaryAccounts \
+            TestGatewayNativeClaudeResponsesDispatchLifecycle \
+            TestGatewayNativeClaudeResponsesRejectsLossyInput \
+            TestGatewayNativeClaudeOAuthAttributionPreservesCanonicalIntent \
+            TestClaudePrivateHTTPRejectsLossyPayloadBeforeAdmission; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-claude-boundary.log")" -eq 1
+          done
+          go test -tags unit ./internal/repository -run '^TestGatewayNativeClaudePostgres(LifecycleAndPassiveLimits|StreamsReleaseSQLAtHeaders)$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-claude-pg.log"
+          test "$(grep -c '^--- PASS: TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits ' "$RUNNER_TEMP/native-claude-pg.log")" -eq 1
+          test "$(grep -c '^--- PASS: TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders ' "$RUNNER_TEMP/native-claude-pg.log")" -eq 1
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-claude-pg.log"
 
       - name: Encrypted native custody and actual backup restore
         working-directory: backend

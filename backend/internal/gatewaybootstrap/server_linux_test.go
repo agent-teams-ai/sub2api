@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -627,6 +628,12 @@ func (w *compositionHTTPWriter) SetReadDeadline(deadline time.Time) error {
 	return err
 }
 
+type bootstrapModelsFixture func(*http.Request) (*http.Response, error)
+
+func (f bootstrapModelsFixture) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 // One real HTTP composition: three distinct protected tuples, the MiMo ACK,
 // exact admission limits/caps and candidate create/read with optional OAuth.
 // The authority returns non-dispatch readback; no provider/login/PG call occurs.
@@ -731,6 +738,15 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 		t.Fatal(err)
 	}
 	gateway := service.NewOpenAIGatewayService(rows, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err := gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(bootstrapModelsFixture(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != service.GatewayOpenRouterBaseURL+"/models" || request.Method != http.MethodGet || request.Header.Get("Authorization") != "" {
+			return nil, ErrDenied
+		}
+		body := `{"data":[{"id":"openai/gpt-5.4-mini","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools"]}]}`
+		return &http.Response{StatusCode: http.StatusOK, Request: request, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}))); err != nil {
+		t.Fatal(err)
+	}
 	adminSvc := service.NewAdminService(nil, nil, nil, rows, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	auth := authorize(c.Peers)
 	cfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, OAuth: dispatch, Authorize: auth,
@@ -932,9 +948,13 @@ func TestAdditiveThreeProfilesHTTPComposition(t *testing.T) {
 	}
 }
 
-type oauthMountOwner struct{ live bool }
+type oauthMountOwner struct {
+	live  bool
+	calls atomic.Int32
+}
 
 func (s *oauthMountOwner) AuthorizeNativeOAuthOwner(_ context.Context, consumer, operation, account, generation string) (string, error) {
+	s.calls.Add(1)
 	if !s.live || consumer != "fixture-consumer" {
 		return "", ErrDenied
 	}
@@ -1076,6 +1096,41 @@ func TestOAuthOwnerSelectorsHTTPBeforePhysicalCreation(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 		data, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, data
+	}
+	// A live legacy owner authority is insufficient for retained-custody reads.
+	// This body passes the production decoder, so denial must occur at the new
+	// purpose-specific capability boundary before legacy owner or native effects.
+	legacyOwner := &oauthMountOwner{live: true}
+	legacyServer := httptest.NewServer(privateHandler(c.Profile, &oauthMountAdmin{}, gateway, custody, transport, auth,
+		&privateOAuth{connect: connect, dispatch: dispatch, owners: legacyOwner}))
+	defer legacyServer.Close()
+	custodyBody := admin.GatewayNativeOAuthRetainedCustodyInput{
+		Contract: service.GatewayNativeRetainedCustodyContract, Operation: first.Operation,
+		Owner: first.OwnerRef, Account: first.AccountRef, Generation: first.Generation,
+		Descriptor: service.GatewayNativeRoute{AccountID: 42, Generation: first.Generation,
+			CreatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Profile: service.GatewayCodexOAuthResponsesProfile,
+			BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel},
+	}
+	custodyRaw, err := json.Marshal(custodyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, valid := admin.DecodeGatewayNativeOAuthRetainedCustody(custodyRaw); !valid {
+		t.Fatal("custody regression requires valid request")
+	}
+	request, err := http.NewRequest(http.MethodPost, legacyServer.URL+"/private/native/v1/oauth/connect/custody", bytes.NewReader(custodyRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.Peers[0].Credential)
+	response, err := legacyServer.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden || legacyOwner.calls.Load() != 0 || lookups.Load() != 0 || tokenEntries.Load() != 0 {
+		t.Fatal("legacy owner capability admitted custody or caused effects", response.StatusCode, legacyOwner.calls.Load(), lookups.Load(), tokenEntries.Load())
 	}
 	if code, _ := post("", first, false); code != 403 || lookups.Load() != 0 {
 		t.Fatal("owner callback ran before consumer authentication")
@@ -1309,6 +1364,24 @@ func TestProtectedOAuthMountCanonicalCallbackAndLiveOwner(t *testing.T) {
 	if status != 200 {
 		t.Fatal("opt-in connect absent", status, string(raw))
 	}
+	// Begin alone accepts an optional method; existing browser callers retain
+	// their default and poll requires the original owner tuple without a method.
+	explicitBrowser := strings.TrimSuffix(input, "}") + `,"method":"browser"}`
+	if explicitStatus, _ := post(path, explicitBrowser, "management"); explicitStatus != 200 {
+		t.Fatal("explicit browser method rejected", explicitStatus)
+	}
+	invalidMethod := strings.Replace(explicitBrowser, `"browser"`, `"unknown"`, 1)
+	if invalidStatus, _ := post(path, invalidMethod, "management"); invalidStatus != 400 {
+		t.Fatal("unknown connect method accepted", invalidStatus)
+	}
+	if invalidStatus, _ := post(path+"/poll", explicitBrowser, "management"); invalidStatus != 400 {
+		t.Fatal("poll accepted expanded method selector", invalidStatus)
+	}
+	for _, role := range []string{"execution", "cleanup", "missing"} {
+		if pollStatus, _ := post(path+"/poll", input, role); pollStatus != 403 {
+			t.Fatal("poll bypassed management authorization", pollStatus)
+		}
+	}
 	var begun service.GatewayNativeOAuthConnectResult
 	if json.Unmarshal(raw, &begun) != nil || begun.Operation != "original-mount-operation" {
 		t.Fatal("operation changed")
@@ -1476,6 +1549,67 @@ func TestNativeNaturalGCConsistency(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := nativeNaturalGCConsistent(before, tc.after, tc.total, tc.automatic, tc.forced); got != tc.want {
 				t.Fatalf("live consistency=%v want%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Exercise the same bootstrap configuration and concrete transport as production.
+// Restoring the old five-second header override makes the delayed case fail.
+func TestPrivateGatewayNonStreamingHeadersUseSavedDeadline(t *testing.T) {
+	for _, check := range []struct {
+		name         string
+		deadline     time.Duration
+		wantDeadline bool
+	}{
+		{name: "headers_after_five_seconds", deadline: 10 * time.Second},
+		{name: "short_saved_deadline", deadline: 100 * time.Millisecond, wantDeadline: true},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				select {
+				case <-time.After(5500 * time.Millisecond):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"completed"}`)
+				case <-r.Context().Done():
+				}
+			}))
+			defer upstream.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), check.deadline)
+			defer cancel()
+			req, err := http.NewRequestWithContext(service.WithHTTPUpstreamProfile(ctx, service.HTTPUpstreamProfileOpenAI), http.MethodPost, upstream.URL, strings.NewReader(`{"stream":false}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			begin := time.Now()
+			resp, err := repository.NewHTTPUpstream(privateGatewayServiceConfig()).Do(req, "", 1, 0)
+			select {
+			case <-started:
+			default:
+				t.Fatal("request did not reach provider fixture")
+			}
+			if check.wantDeadline {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("saved deadline did not cancel request: %T", err)
+				}
+				if time.Since(begin) >= time.Second {
+					t.Fatal("saved deadline cancellation was delayed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("non-streaming response headers rejected before saved deadline: %T", err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("close non-streaming response body: %v", err)
+				}
+			}()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"status":"completed"}` {
+				t.Fatal("non-streaming response not preserved")
 			}
 		})
 	}

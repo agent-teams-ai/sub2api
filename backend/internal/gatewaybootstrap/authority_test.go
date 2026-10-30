@@ -328,14 +328,11 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 	}
 	gatewayOwnerFixtureCredential := base64.RawURLEncoding.EncodeToString(gatewayOwnerFixtureCredentialRaw)
 	var calls atomic.Int32
-	var refreshCall atomic.Bool
+	var purpose atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		var got oauthOwnerBody
-		expectedPath := "/private/native/v1/oauth-owner-authority"
-		if refreshCall.Load() {
-			expectedPath = "/private/native/v1/oauth-refresh-authority"
-		}
+		expectedPath := []string{"/private/native/v1/oauth-owner-authority", "/private/native/v1/oauth-refresh-authority", "/private/native/v1/oauth-custody-authority"}[purpose.Load()]
 		body, readErr := io.ReadAll(r.Body)
 		if r.Method != http.MethodPost || r.URL.Path != expectedPath ||
 			r.Header.Get("Authorization") != "Bearer "+gatewayOwnerFixtureCredential || (readErr != nil || decodeStrict(body, &got) != nil) ||
@@ -362,8 +359,8 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.client.CloseIdleConnections()
-	for index, authorize := range []func(context.Context, string, string, string, string) (string, error){a.AuthorizeNativeOAuthOwner, a.AuthorizeNativeOAuthRefreshOwner} {
-		refreshCall.Store(index == 1)
+	for index, authorize := range []func(context.Context, string, string, string, string) (string, error){a.AuthorizeNativeOAuthOwner, a.AuthorizeNativeOAuthRefreshOwner, a.AuthorizeNativeOAuthCustodyOwner} {
+		purpose.Store(int32(index))
 		for _, op := range []string{"valid", "ack-only", "owner-alias", "private-field", "oversize"} {
 			owner, err := authorize(context.Background(), "fixture-consumer", op, "fixture-account", "33333333-3333-4333-8333-333333333333")
 			if op == "valid" && (err != nil || owner != "workspace/owned") || op != "valid" && (err == nil || owner != "") {
@@ -371,7 +368,7 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 			}
 		}
 	}
-	if calls.Load() != 10 {
+	if calls.Load() != 15 {
 		t.Fatal("owner lookup retried")
 	}
 
@@ -387,7 +384,7 @@ func TestOAuthOwnerReplyAndFiniteConfig(t *testing.T) {
 		decoded.openRouterProfile().Profile != service.GatewayOpenRouterResponsesProfile || decoded.openRouterProfile().Tokens != 50 {
 		t.Fatal("second profile replaced the MiMo tuple or its own limits")
 	}
-	for _, model := range []string{"openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "unapproved-model"} {
+	for _, model := range []string{"openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "future-vendor/new-anchor:free", "unapproved-model"} {
 		candidate := c
 		second := *c.OpenRouter
 		second.Model = model

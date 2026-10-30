@@ -96,6 +96,10 @@ type oauthDispatchFixture struct {
 	jwksDelay         time.Duration
 	lastAuthorization atomic.Value
 	lastPayload       atomic.Value
+	limitHeaders      http.Header
+	modelsBody        string
+	modelsStatus      int
+	modelsReads       atomic.Int32
 	lastContext       context.Context
 }
 
@@ -132,15 +136,37 @@ func newOAuthDispatchFixture(t *testing.T) *oauthDispatchFixture {
 			}
 			w.WriteHeader(f.accountStatus)
 			_, _ = io.WriteString(w, f.accountCheck)
+		case "/backend-api/codex/models":
+			f.modelsReads.Add(1)
+			require.Equal(t, http.MethodGet, r.Method)
+			require.Equal(t, CodexCanonicalClientVersion(), r.URL.Query().Get("client_version"))
+			if f.modelsBody != "" {
+				require.Equal(t, "Bearer "+f.bundle.AccessToken, r.Header.Get("Authorization"))
+			} else {
+				require.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "))
+			}
+			require.Equal(t, provider, r.Header.Get("ChatGPT-Account-Id"))
+			require.Equal(t, CodexCanonicalUserAgent(), r.Header.Get("User-Agent"))
+			require.Equal(t, CodexCanonicalClientVersion(), r.Header.Get("Version"))
+			require.Empty(t, r.Header.Get("Cookie"))
+			if f.modelsStatus != 0 {
+				w.WriteHeader(f.modelsStatus)
+			} else if f.modelsBody == "" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			_, _ = io.WriteString(w, f.modelsBody)
 		case "/backend-api/codex/responses":
+			for key, values := range f.limitHeaders {
+				w.Header()[key] = values
+			}
 			f.entries.Add(1)
 			require.Equal(t, "chatgpt.com", r.Host)
 			require.Equal(t, http.MethodPost, r.Method)
 			require.Equal(t, provider, r.Header.Get("ChatGPT-Account-Id"))
 			require.Equal(t, "text/event-stream", r.Header.Get("Accept"))
-			require.Equal(t, codexCLIUserAgent, r.Header.Get("User-Agent"))
+			require.Equal(t, CodexCanonicalUserAgent(), r.Header.Get("User-Agent"))
 			require.Equal(t, "codex-tui", r.Header.Get("originator"))
-			require.Equal(t, codexCLIVersion, r.Header.Get("version"))
+			require.Equal(t, CodexCanonicalClientVersion(), r.Header.Get("version"))
 			require.Empty(t, r.Header.Get("OpenAI-Beta"))
 			for _, header := range []string{"X-Codex-Turn-State", "Cookie", "X-Api-Key", "Origin", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Only"} {
 				require.Empty(t, r.Header.Get(header))
@@ -534,4 +560,11 @@ func TestGatewayOAuthDescriptorIdenticalAccountAliases(t *testing.T) {
 	require.EqualValues(t, 1, f.checks.Load())
 	require.Equal(t, 1, f.store.qualifications)
 	require.Zero(t, f.entries.Load())
+}
+
+func (r *oauthDispatchStore) ResolveGatewayNativeOAuthCanonical(ctx context.Context, route GatewayNativeRoute, account string) (GatewayNativeCredentialScope, string, error) {
+	if r.reject || !GatewayNativeOAuthScopeAuthorized(ctx, r.physical.Scope) || account != r.physical.Scope.Account || !SameGatewayNativeDescriptor(route, r.physical.Route) {
+		return GatewayNativeCredentialScope{}, "", ErrGatewayNativeIdentity
+	}
+	return r.physical.Scope, r.physical.Operation, nil
 }

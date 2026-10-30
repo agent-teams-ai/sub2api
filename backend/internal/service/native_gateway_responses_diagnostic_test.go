@@ -230,7 +230,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 	const cappedJSON = `{"status":"completed","output":[]}`
 	cases := []struct {
 		name, contentType, wire, phase, category, encoding, shape, parameter string
-		readReason, mediaCategory, bodyShape, bodyPrefix                     string
+		readReason, mediaCategory, bodyShape, bodyPrefix, transportReason    string
 		idle, deadline                                                       time.Duration
 		outputCap                                                            int64
 		status                                                               int
@@ -311,7 +311,8 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "http401", status: 401, phase: "http_status", unread: true, wire: sentinel},
 		{name: "http429", status: 429, phase: "http_status", unread: true, wire: sentinel},
 		{name: "out of range status", status: 999, phase: "http_status", unread: true, wire: sentinel},
-		{name: "transport", phase: "transport", transportErr: errors.New(sentinel)},
+		{name: "transport", phase: "transport", transportErr: errors.New(sentinel), transportReason: "other"},
+		{name: "transport entered wrapped EOF", phase: "transport", transportErr: fmt.Errorf("%s: %w", sentinel, io.EOF), transportReason: "eof", outputCap: 4096},
 		{name: "missing response", phase: "invalid_response"},
 		{name: "body read", status: 200, phase: "body_read", readErr: errors.New(sentinel)},
 		// Red if scanner overflow keeps the generic read phase, or read failures
@@ -420,7 +421,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			if transport.response != nil {
 				require.Positive(t, body.closes, "physical response body must still close")
 			}
-			if tc.outputCap != 0 {
+			if tc.outputCap != 0 && transport.response != nil {
 				require.Equal(t, 1, body.closes, "cap boundary keeps physical closure exactly once")
 				require.LessOrEqual(t, int64(body.bytesRead), tc.outputCap+1, "owned body keeps its one-byte cap probe")
 			}
@@ -485,8 +486,24 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			} else {
 				require.NotContains(t, event, "read_error_reason")
 			}
+			transportFields := []string{"transport_error_reason", "upstream_connection", "upstream_request_written", "upstream_response_started", "native_entered"}
+			if tc.phase == "transport" {
+				require.Equal(t, tc.transportReason, event["transport_error_reason"])
+				require.Equal(t, "not_obtained", event["upstream_connection"])
+				require.Equal(t, false, event["upstream_request_written"])
+				require.Equal(t, false, event["upstream_response_started"])
+				if tc.outputCap != 0 {
+					require.Equal(t, true, event["native_entered"])
+				} else {
+					require.NotContains(t, event, "native_entered")
+				}
+			} else {
+				for _, field := range transportFields {
+					require.NotContains(t, event, field, "transport metadata belongs only to transport failures")
+				}
+			}
 			for field := range event {
-				require.Contains(t, []string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape", "upstream_body_prefix"}, field)
+				require.Contains(t, append([]string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape", "upstream_body_prefix"}, transportFields...), field)
 			}
 			for _, private := range []string{sentinel, "gateway native output limit", "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
 				require.NotContains(t, string(logs), private)
@@ -512,11 +529,17 @@ func TestGatewayNativeResponsesLiteHeaderIsProfileScoped(t *testing.T) {
 			if tc.profile == GatewayOpenRouterResponsesProfile {
 				account.Credentials["base_url"] = GatewayOpenRouterBaseURL
 				account.Extra[GatewayModelExtraKey] = GatewayOpenRouterModel
-				payload = []byte(strings.Replace(string(payload), "mimo-test", GatewayOpenRouterModel, 1))
+				// additional_tools is MiMo's Responses Lite extension. The header
+				// isolation check uses a valid plain-text request for OpenRouter.
+				payload = []byte(`{"model":"` + GatewayOpenRouterModel + `","input":"preserved text","stream":false}`)
 			}
 			route, err := GatewayNativeDescriptor(account)
 			require.NoError(t, err)
 			svc := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}, httpUpstream: transport, cfg: rawChatCompletionsTestConfig()}
+			if tc.profile == GatewayOpenRouterResponsesProfile {
+				modelsBody := `{"data":[` + openRouterModelRow(GatewayOpenRouterModel, true) + `]}`
+				require.NoError(t, svc.SetGatewayOpenRouterModels(openRouterModelsFixture(t, &modelsBody)))
+			}
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", strings.NewReader(string(payload)))

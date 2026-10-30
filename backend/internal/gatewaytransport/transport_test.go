@@ -176,14 +176,49 @@ func (r *ownerFixtureRepo) LockGatewayNativeAccount(_ context.Context, id int64)
 // presets. Cross-tuples and each profile's own caps deny before callback/entry.
 func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	var entries, admits atomic.Int32
+	const dynamicOpenRouterModel = "unseen-vendor/new-model:free"
 	var driftAfterAdmit atomic.Bool
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/models" {
+			require.Empty(t, r.Header.Get("Authorization"))
+			_, _ = io.WriteString(w, `{"data":[{"id":"`+dynamicOpenRouterModel+`","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools"]}]}`)
+			return
+		}
 		entries.Add(1)
 		var payload map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
-		if r.Host == "openrouter.ai" {
+		if r.Host == "api.kimi.ai" || r.Host == "api.z.ai" || r.Host == "api.minimax.io" {
+			paths := map[string]string{"api.kimi.ai": "/coding/v1/responses", "api.z.ai": "/api/v1/responses", "api.minimax.io": "/v1/responses"}
+			models := map[string]string{"api.kimi.ai": "k3-256k", "api.z.ai": "glm-5.3-flash", "api.minimax.io": "MiniMax-M3.1-Flash"}
+			require.Equal(t, paths[r.Host], r.URL.Path)
+			require.Equal(t, models[r.Host], payload["model"])
+			require.Equal(t, float64(40), payload["max_output_tokens"])
+			if _, firstTurn := payload["input"].(string); firstTurn {
+				require.NotContains(t, payload, "service_tier")
+				require.NotContains(t, payload, "reasoning")
+				encodedText, err := json.Marshal(payload["text"])
+				require.NoError(t, err)
+				require.JSONEq(t, `{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}}`, string(encodedText))
+				require.Equal(t, "33333333-3333-4333-8333-333333333333", payload["prompt_cache_key"])
+				require.Equal(t, map[string]any{"x-codex-installation-id": "44444444-4444-4444-8444-444444444444"}, payload["client_metadata"])
+			} else if r.Host == "api.kimi.ai" || r.Host == "api.minimax.io" {
+				require.NotContains(t, payload, "service_tier")
+			} else {
+				require.Equal(t, "default", payload["service_tier"])
+			}
+			tools, ok := payload["tools"].([]any)
+			require.True(t, ok)
+			require.NotEmpty(t, tools)
+			require.Equal(t, "function", tools[0].(map[string]any)["type"], "custom tools must use the qualified function upstream codec")
+			if input, ok := payload["input"].([]any); ok {
+				require.Equal(t, "function_call", input[0].(map[string]any)["type"])
+				require.Equal(t, "function_call_output", input[1].(map[string]any)["type"])
+				require.Equal(t, "preserved result", input[1].(map[string]any)["output"])
+			}
+
+		} else if r.Host == "openrouter.ai" {
 			require.Equal(t, "/api/v1/responses", r.URL.Path)
-			require.Equal(t, service.GatewayOpenRouterModel, payload["model"])
+			require.Equal(t, dynamicOpenRouterModel, payload["model"])
 			require.Equal(t, float64(40), payload["max_output_tokens"])
 		} else {
 			require.Equal(t, "mimo.fixture.invalid", r.Host)
@@ -203,7 +238,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	local.Proxy = nil
 	local.TLSClientConfig.ServerName = "example.com"
 	local.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address != "mimo.fixture.invalid:443" && address != "openrouter.ai:443" {
+		if address != "mimo.fixture.invalid:443" && address != "openrouter.ai:443" && address != "api.kimi.ai:443" && address != "api.z.ai:443" && address != "api.minimax.io:443" {
 			return nil, errDenied
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, provider.Listener.Addr().String())
@@ -213,9 +248,21 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	require.NoError(t, err)
 	primary := QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, BaseURL: "https://mimo.fixture.invalid/v1", Model: "fixture-model", QualificationRef: "mimo-fixture-qualified", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200}
 	secondary := QualifiedProfile{Profile: service.GatewayOpenRouterResponsesProfile, BaseURL: service.GatewayOpenRouterBaseURL, Model: service.GatewayOpenRouterModel, QualificationRef: "openrouter-fixture-qualified", RequestBytes: 2048, OutputBytes: 2048, Tokens: 40, ProviderTokenUpperBound: 80}
+	plans := []QualifiedProfile{
+		{Profile: service.GatewayKimiCodeResponsesProfile, BaseURL: service.GatewayKimiCodeResponsesBaseURL, Model: service.GatewayKimiCodeResponsesModel},
+		{Profile: service.GatewayGLMCodingResponsesProfile, BaseURL: service.GatewayGLMCodingResponsesBaseURL, Model: service.GatewayGLMCodingResponsesModel},
+		{Profile: service.GatewayMiniMaxMPlanResponsesProfile, BaseURL: service.GatewayMiniMaxMPlanResponsesBaseURL, Model: service.GatewayMiniMaxMPlanResponsesModel},
+	}
+	for i := range plans {
+		plans[i].QualificationRef = "controlled-source-v1"
+		plans[i].RequestBytes = 4096
+		plans[i].OutputBytes = 4096
+		plans[i].Tokens = 40
+		plans[i].ProviderTokenUpperBound = 80
+	}
 	repo := &ownerFixtureRepo{rows: map[int64]*service.Account{}}
 	inputs := make([]Request, 0, 2)
-	for i, profile := range []QualifiedProfile{primary, secondary} {
+	for i, profile := range append([]QualifiedProfile{primary, secondary}, plans...) {
 		input := ownerRequest()
 		input.RequestRef = fmt.Sprintf("profile-request-%d", i)
 		input.Admission.ExecutionRef = fmt.Sprintf("profile-execution-%d", i)
@@ -226,11 +273,17 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		input.Admission.Limits.Tokens = profile.Tokens
 		input.Descriptor.AccountID += int64(i)
 		input.Descriptor.Profile, input.Descriptor.BaseURL, input.Descriptor.Model = profile.Profile, profile.BaseURL, profile.Model
-		if i == 1 {
-			input.Descriptor.Generation = "77777777-7777-4777-8777-777777777777"
-			input.Admission.AccountRef = "openrouter-account"
+		if i > 0 {
+			input.Descriptor.Generation = fmt.Sprintf("77777777-7777-4777-8777-%012d", i)
+			input.Admission.AccountRef = fmt.Sprintf("profile-account-%d", i)
 		}
 		input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"preserved","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, profile.Model))
+		if i == 1 {
+			input.Payload = json.RawMessage(strings.Replace(string(input.Payload), profile.Model, dynamicOpenRouterModel, 1))
+		}
+		if i >= 2 {
+			input.Payload = json.RawMessage(strings.Replace(string(input.Payload), `,"service_tier":"default"`, `,"reasoning":null,"text":{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":{"type":"object","properties":{"findings":{"type":"array"},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}}},"prompt_cache_key":"33333333-3333-4333-8333-333333333333","client_metadata":{"x-codex-installation-id":"44444444-4444-4444-8444-444444444444"}`, 1))
+		}
 		scope := service.GatewayNativeCredentialScope{Consumer: "fixture-consumer", Owner: "fixture-owner", Account: input.Admission.AccountRef, Generation: input.Descriptor.Generation, Purpose: service.GatewayCredentialPurpose}
 		envelope, err := custody.Seal(scope, fixtureProviderKey)
 		require.NoError(t, err)
@@ -241,6 +294,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	u, err := service.NewGatewayNativeLifetimeUpstream(&ownerFixtureHTTP{client: &http.Client{Transport: local}})
 	require.NoError(t, err)
 	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, &config.Config{}, nil, nil, nil, nil, nil, u, nil, nil, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, gateway.SetGatewayOpenRouterModels(service.NewGatewayOpenRouterModels(local)))
 	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		admits.Add(1)
 		var input admitRequest
@@ -256,8 +310,8 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(ownerReply(input))
 	}))
 	defer callback.Close()
-	cfg := Config{Gateway: gateway, Custody: custody, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, primary.QualificationRef}, Profile: primary, OpenRouter: &secondary,
-		MaxEntries: 4, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken,
+	cfg := Config{Gateway: gateway, Custody: custody, Enrollment: Enrollment{"fixture-origin", ownerIncarnation, primary.QualificationRef}, Profile: primary, OpenRouter: &secondary, CodingPlans: plans,
+		MaxEntries: 12, EnvelopeBytes: 8192, CallbackBytes: 65536, CallbackOrigin: callback.URL, CallbackCredential: fixtureCallbackToken,
 		CallbackTimeout: time.Second, IOTimeout: 5 * time.Second, ProviderReadIdle: time.Second, CleanupTimeout: time.Second,
 		Authorize: func(r *http.Request) (Peer, error) {
 			if r.Header.Get("Authorization") == "Bearer "+fixtureExecutionToken {
@@ -284,13 +338,16 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	defer server.Close()
 	// Mutating the composition input cannot turn an enrolled tuple into another.
 	secondary.Model = "caller-model"
+	plans[0].BaseURL = "https://caller.invalid"
+	projected := h.CodingPlanProfiles()
+	projected[0].Model = "caller-model"
 	for _, mutate := range []func(*Request){
 		func(r *Request) { r.Descriptor = inputs[0].Descriptor },
 		func(r *Request) { r.Admission.ProfileID = service.GatewayMiMoResponsesProfile },
 		func(r *Request) { r.Descriptor.BaseURL = primary.BaseURL },
 		func(r *Request) { r.Descriptor.Model = primary.Model },
 		func(r *Request) {
-			r.Payload = json.RawMessage(strings.Replace(string(r.Payload), service.GatewayOpenRouterModel, primary.Model, 1))
+			r.Payload = json.RawMessage(strings.Replace(string(r.Payload), dynamicOpenRouterModel, primary.Model, 1))
 		},
 		func(r *Request) {
 			r.Payload = json.RawMessage(strings.TrimSuffix(string(r.Payload), "}") + `,"max_output_tokens":81}`)
@@ -315,8 +372,18 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		require.Contains(t, string(result.body), "custom_tool_call")
 		require.Contains(t, string(result.body), "controlled final")
 	}
-	require.EqualValues(t, 2, admits.Load())
-	require.EqualValues(t, 2, entries.Load())
+	// Tool continuation is a second explicit admission, with native custom and
+	// function result bytes preserved through the same finite Responses transport.
+	for _, input := range inputs[2:] {
+		input.RequestRef += "-tool-turn"
+		input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":[{"type":"custom_tool_call","call_id":"c1","name":"exec","input":"echo preserved"},{"type":"custom_tool_call_output","call_id":"c1","output":"preserved result"},{"type":"function_call","call_id":"c2","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"c2","output":"function result"}],"store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}},{"type":"function","name":"read","parameters":{"type":"object"}}]}`, input.Descriptor.Model))
+		result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusOK, result.code)
+		require.Contains(t, string(result.body), "controlled final")
+	}
+	require.EqualValues(t, 8, admits.Load())
+	require.EqualValues(t, 8, entries.Load())
 	// A valid ingress tuple cannot survive a stored cross-profile endpoint
 	// change while the sole admit callback is in flight. Forward rechecks it.
 	driftAfterAdmit.Store(true)
@@ -324,8 +391,8 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	stale.RequestRef = "openrouter-stale-tuple"
 	result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, stale)
 	require.NoError(t, result.err)
-	require.EqualValues(t, 3, admits.Load())
-	require.EqualValues(t, 2, entries.Load())
+	require.EqualValues(t, 9, admits.Load())
+	require.EqualValues(t, 8, entries.Load())
 	require.NotContains(t, string(result.body), "controlled final")
 }
 
@@ -1119,9 +1186,12 @@ func (*oauthTransportRows) UnknownGatewayNativeOAuthRefresh(context.Context, ser
 }
 
 func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
-	for _, mode := range []string{"valid", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
+	for _, mode := range []string{"valid", "dynamic", "unknown-model", "unsupported-effort", "raw-ultra", "legacy-raw-ultra", "disabled", "disabled-field", "zero", "multi", "foreign", "wrong-owner", "forged-descriptor"} {
 		t.Run(mode, func(t *testing.T) {
 			var entries, admits, refreshes, checks atomic.Int32
+			dynamicCatalog := mode == "dynamic" || mode == "unknown-model" || mode == "unsupported-effort" || mode == "raw-ultra"
+			disabledCatalog := mode == "disabled" || mode == "disabled-field"
+			success := mode == "valid" || mode == "dynamic" || mode == "disabled"
 			key, err := rsa.GenerateKey(rand.Reader, 2048)
 			require.NoError(t, err)
 			subject := uuid.NewString()
@@ -1144,8 +1214,25 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 					refreshes.Add(1)
 					require.Equal(t, "auth.openai.com", r.Host)
 					_ = json.NewEncoder(w).Encode(map[string]any{"access_token": nextAccess, "refresh_token": uuid.NewString(), "id_token": signed, "token_type": "Bearer", "expires_in": 3600})
+				case "/backend-api/codex/models":
+					if dynamicCatalog {
+						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_in_api":false,"visibility":"list","supported_reasoning_levels":["ultra","max"],"default_reasoning_level":"ultra"}]}`)
+					} else if disabledCatalog {
+						_, _ = io.WriteString(w, `{"models":[{"slug":"unseen-native-model","supported_reasoning_levels":[],"default_reasoning_level":null}]}`)
+					} else {
+						w.WriteHeader(http.StatusServiceUnavailable)
+					}
 				case "/backend-api/codex/responses":
 					entries.Add(1)
+					body, readErr := io.ReadAll(r.Body)
+					require.NoError(t, readErr)
+					if mode == "dynamic" {
+						require.Contains(t, string(body), `"reasoning":{"effort":"max"}`)
+						require.NotContains(t, string(body), `"ultra"`)
+					}
+					if mode == "disabled" {
+						require.Contains(t, string(body), `"reasoning":{}`)
+					}
 					require.Equal(t, "chatgpt.com", r.Host)
 					require.Equal(t, "Bearer "+nextAccess, r.Header.Get("Authorization"))
 					require.Equal(t, providerID, r.Header.Get("ChatGPT-Account-Id"))
@@ -1189,7 +1276,7 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			require.NotNil(t, descriptor.Native)
 			refresh, err := service.NewGatewayNativeOAuthRefresh(rows, custody, verifier, provider)
 			require.NoError(t, err)
-			if mode == "valid" {
+			if success {
 				out, err := refresh.Refresh(ownerCtx, service.GatewayNativeOAuthRefreshIntent{Scope: scope, AccountID: 7, CreatedAt: birth, ExpectedVersion: 1, Operation: uuid.NewString(), Intent: uuid.NewString()})
 				require.NoError(t, err)
 				require.EqualValues(t, 2, out.Version)
@@ -1232,14 +1319,37 @@ func TestProtectedOAuthTransportPostAdmitCanonicalBinding(t *testing.T) {
 			input := ownerRequest()
 			input.Descriptor = *descriptor.Native
 			input.Admission.ProfileID = service.GatewayCodexOAuthResponsesProfile
-			input.Payload = json.RawMessage(`{"model":"gpt-6.1-sol","input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`)
+			input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]}`, service.GatewayCodexOAuthModel))
+			if dynamicCatalog {
+				selected, effort := "unseen-native-model", "max"
+				if mode == "unknown-model" {
+					selected = "not-in-catalog"
+				}
+				if mode == "unsupported-effort" {
+					effort = "high"
+				}
+				if mode == "raw-ultra" {
+					effort = "ultra"
+				}
+				input.Payload = json.RawMessage(fmt.Sprintf(`{"model":%q,"reasoning":{"effort":%q},"input":"controlled","store":false,"stream":true,"service_tier":"default","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, selected, effort))
+			}
+			if disabledCatalog {
+				reasoning := "{}"
+				if mode == "disabled-field" {
+					reasoning = `{"summary":"none"}`
+				}
+				input.Payload = json.RawMessage(fmt.Sprintf(`{"model":"unseen-native-model","reasoning":%s,"input":"controlled","store":false,"stream":true,"service_tier":"default"}`, reasoning))
+			}
+			if mode == "legacy-raw-ultra" {
+				input.Payload = json.RawMessage(strings.TrimSuffix(string(input.Payload), "}") + `,"reasoning":{"effort":"ultra"}}`)
+			}
 			if mode == "forged-descriptor" {
 				input.Descriptor.CreatedAt = input.Descriptor.CreatedAt.Add(time.Microsecond)
 			}
 			result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, input)
 			require.NoError(t, result.err)
 			require.EqualValues(t, 1, admits.Load())
-			if mode == "valid" {
+			if success {
 				require.EqualValues(t, 1, entries.Load())
 				require.EqualValues(t, 1, refreshes.Load())
 				require.Equal(t, "2", rows.row.GetCredential("credential_version"))

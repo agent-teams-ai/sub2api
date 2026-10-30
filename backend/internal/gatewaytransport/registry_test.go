@@ -257,8 +257,8 @@ func TestNEWTESTReadbackCallbackNoPermission(t *testing.T) {
 			}
 			other := NEWTESTRequest()
 			other.RequestRef = "NEWTESTother"
-			if _, _, err := NEWTESTReserve(t, h, other); err == nil {
-				t.Fatal("other-effect readback released retained capacity")
+			if _, _, err := NEWTESTReserve(t, h, other); err != nil {
+				t.Fatal("closed status-only attempt retained local capacity", err)
 			}
 		})
 	}
@@ -546,5 +546,33 @@ func TestNEWTESTCleanupLostACKRetainsExactReceipt(t *testing.T) {
 	r, err := h.cleanup(context.Background(), "NEWTESTconsumer", "read", cleanupRequest{p, lease})
 	if err != nil || r.Acknowledged || r.Proof == nil || *r.Proof != p || !r.Sealed {
 		t.Fatal("lost ACK changed original receipt", r, err)
+	}
+}
+
+// Native usage is returned only on the existing protected reservation receipt;
+// it does not revise the independently settled effect or lifetime evidence.
+func TestGatewayNativeUsageReceipt(t *testing.T) {
+	callback := httptest.NewServer(http.NotFoundHandler())
+	defer callback.Close()
+	h := NEWTESTRegistry(callback, 2)
+	e, _, err := NEWTESTReserve(t, h, NEWTESTRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, output := int64(9), int64(3)
+	h.mu.Lock()
+	e.usage = &service.GatewayNativeUsage{Source: "native_provider_response", State: "complete", InputTokens: &input, OutputTokens: &output, CostState: "unknown", Finalized: true}
+	h.mu.Unlock()
+	got := h.receipt("NEWTESTconsumer", e)
+	if got.NativeUsage == nil || *got.NativeUsage.InputTokens != 9 || !got.NativeUsage.Finalized {
+		t.Fatal("missing native usage")
+	}
+	if got.Effect == "completed" || got.Lifetime.Completed {
+		t.Fatal("usage must not settle delivery")
+	}
+	*got.NativeUsage.InputTokens = 100
+	got.NativeUsage.State = "unknown"
+	if h.receipt("NEWTESTconsumer", e).NativeUsage.State != "complete" || *h.receipt("NEWTESTconsumer", e).NativeUsage.InputTokens != 9 {
+		t.Fatal("receipt aliases reservation")
 	}
 }

@@ -13,13 +13,17 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
@@ -32,6 +36,9 @@ import (
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile {
+		return GatewayGrokOAuthBaseURL + "/v1/responses", nil
+	}
 	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
 		return GatewayCodexOAuthBaseURL + "/responses", nil
 	}
@@ -92,6 +99,86 @@ const (
 	gatewayNativeFailureWrite       gatewayNativeResponseFailurePhase = "downstream_write"
 	gatewayNativeFailureFlush       gatewayNativeResponseFailurePhase = "downstream_flush"
 )
+
+// Transport observations contain only fixed protocol state, never peer names,
+// addresses, headers or error strings. Hooks compose with existing request traces.
+// Flags describe callbacks observed at failure time; false never proves zero
+// bytes written, absent provider effects or permission to retry.
+type gatewayNativeTransportObservation struct {
+	connection      atomic.Uint32 // 0: no connection, 1: new, 2: reused
+	requestWritten  atomic.Bool
+	responseStarted atomic.Bool
+}
+
+func (o *gatewayNativeTransportObservation) trace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			state := uint32(1)
+			if info.Reused {
+				state = 2
+			}
+			o.connection.Store(state)
+		},
+		WroteRequest:         func(info httptrace.WroteRequestInfo) { o.requestWritten.Store(info.Err == nil) },
+		GotFirstResponseByte: func() { o.responseStarted.Store(true) },
+	}
+}
+
+func (o *gatewayNativeTransportObservation) connectionKind() string {
+	switch o.connection.Load() {
+	case 1:
+		return "new"
+	case 2:
+		return "reused"
+	default:
+		return "not_obtained"
+	}
+}
+
+func gatewayNativeTransportErrorReason(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, io.EOF):
+		return "eof"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, net.ErrClosed), errors.Is(err, os.ErrClosed), errors.Is(err, io.ErrClosedPipe):
+		return "connection_closed"
+	case errors.Is(err, syscall.EPIPE):
+		return "broken_pipe"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	}
+	// A url.Error is itself a net.Error, but Timeout may be false when an
+	// intervening fmt wrapper hides a deeper typed timeout. Inspect each cause
+	// independently, including joined causes, without inspecting error text.
+	pending := []error{err}
+	for visited := 0; len(pending) > 0 && visited < 32; visited++ {
+		last := len(pending) - 1
+		current := pending[last]
+		pending = pending[:last]
+		if current == nil {
+			continue
+		}
+		if networkError, ok := current.(net.Error); ok && networkError.Timeout() {
+			return "transport_timeout"
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			causes := joined.Unwrap()
+			for i := min(len(causes), 32-len(pending)) - 1; i >= 0; i-- {
+				pending = append(pending, causes[i])
+			}
+		} else if cause := errors.Unwrap(current); cause != nil {
+			pending = append(pending, cause)
+		}
+	}
+	return "other"
+}
 
 type gatewayNativeHTTPErrorDiagnostic struct {
 	category, shape, parameter string
@@ -468,15 +555,23 @@ func gatewayNativeErrorFieldsCategory(code, kind, message, param string) string 
 }
 
 func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context, c *gin.Context, a *Account, body []byte) (*OpenAIForwardResult, error) {
+	observation := GatewayNativeUsage{Source: "native_provider_response", State: "unknown", CostState: "unknown"}
+	defer func() {
+		observation.Finalized = true
+		if observe, ok := ctx.Value(gatewayNativeUsageObserverKey{}).(func(GatewayNativeUsage)); ok {
+			observe(observation)
+		}
+	}()
 	target, err := s.gatewayNativeTargetURL(a)
 	if err != nil {
 		return nil, ErrGatewayNativeIdentity
 	}
 	upstreamBody := body
-	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
-		// Internal admission still requires default. MiMo does not document this
-		// provider field: delete only its top-level span after validation, keeping
-		// every unrelated tool/user byte. Other profiles retain the original body.
+	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayKimiCodeResponsesProfile || a.Extra[GatewayProfileExtraKey] == GatewayMiniMaxMPlanResponsesProfile {
+		// Admission accepts only default. MiMo omits this provider field; Kimi
+		// rejects default and MiniMax-M3.1-Flash does not support the field.
+		// Remove only the validated top-level span;
+		// retain every unrelated byte and every other profile's original body.
 		upstreamBody, err = sjson.DeleteBytes(body, "service_tier")
 		if err != nil {
 			return nil, ErrGatewayNativeIdentity
@@ -492,6 +587,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		request.Header.Set("Authorization", "Bearer "+a.GetCredential("api_key"))
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if GatewayNativeCodingPlanProfileIDValid(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		request.Header.Set("User-Agent", "ReviewRouter/native-account-gateway")
+	}
 	if a.Extra[GatewayProfileExtraKey] == GatewayMiMoResponsesProfile {
 		request.Header.Set("x-openai-internal-codex-responses-lite", "true")
 	}
@@ -505,6 +603,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// bounded status and static phases reach the private process stderr channel.
 	// It works without initializing the general logger and leaves readiness on
 	// stdout intact. Never include context fields, headers, bodies or error text.
+	transport := &gatewayNativeTransportObservation{}
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), transport.trace()))
+	var transportError error
 	status := 0
 	providerErrorCategory := ""
 	providerErrorShape, providerErrorParameter := "", ""
@@ -517,17 +618,32 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			phase = gatewayNativeFailureDeadline
 		}
 		event := struct {
-			Event                  string                            `json:"event"`
-			Phase                  gatewayNativeResponseFailurePhase `json:"phase"`
-			HTTPStatus             int                               `json:"http_status,omitempty"`
-			ProviderErrorCategory  string                            `json:"provider_error_category,omitempty"`
-			ProviderErrorShape     string                            `json:"provider_error_shape,omitempty"`
-			ProviderErrorParameter string                            `json:"provider_error_parameter,omitempty"`
-			ReadErrorReason        string                            `json:"read_error_reason,omitempty"`
-			UpstreamMediaCategory  string                            `json:"upstream_media_category,omitempty"`
-			UpstreamBodyShape      string                            `json:"upstream_body_shape,omitempty"`
-			UpstreamBodyPrefix     string                            `json:"upstream_body_prefix,omitempty"`
+			Event                   string                            `json:"event"`
+			Phase                   gatewayNativeResponseFailurePhase `json:"phase"`
+			HTTPStatus              int                               `json:"http_status,omitempty"`
+			TransportErrorReason    string                            `json:"transport_error_reason,omitempty"`
+			UpstreamConnection      string                            `json:"upstream_connection,omitempty"`
+			UpstreamRequestWritten  *bool                             `json:"upstream_request_written,omitempty"`
+			UpstreamResponseStarted *bool                             `json:"upstream_response_started,omitempty"`
+			NativeEntered           *bool                             `json:"native_entered,omitempty"`
+			ProviderErrorCategory   string                            `json:"provider_error_category,omitempty"`
+			ProviderErrorShape      string                            `json:"provider_error_shape,omitempty"`
+			ProviderErrorParameter  string                            `json:"provider_error_parameter,omitempty"`
+			ReadErrorReason         string                            `json:"read_error_reason,omitempty"`
+			UpstreamMediaCategory   string                            `json:"upstream_media_category,omitempty"`
+			UpstreamBodyShape       string                            `json:"upstream_body_shape,omitempty"`
+			UpstreamBodyPrefix      string                            `json:"upstream_body_prefix,omitempty"`
 		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
+		if phase == gatewayNativeFailureTransport {
+			event.TransportErrorReason = gatewayNativeTransportErrorReason(transportError)
+			event.UpstreamConnection = transport.connectionKind()
+			written, started := transport.requestWritten.Load(), transport.responseStarted.Load()
+			event.UpstreamRequestWritten, event.UpstreamResponseStarted = &written, &started
+			if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+				entered := lifetime.Snapshot().Entered
+				event.NativeEntered = &entered
+			}
+		}
 		if phase == gatewayNativeFailureSSERead {
 			event.ReadErrorReason = readErrorReason
 		}
@@ -557,10 +673,16 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if err == ErrGatewayNativeIdentity || err == ErrGatewayNativeReplay {
 			return nil, err
 		}
+		transportError = err
 		return nil, fail(gatewayNativeFailureTransport)
 	}
 	if resp == nil || resp.Body == nil {
 		return nil, fail(gatewayNativeFailureResponse)
+	}
+	// Passive quota evidence from this already admitted response only.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusTooManyRequests {
+		s.captureGatewayAccountLimits(ctx, resp.Header)
+		captureGatewayGrokPassiveLimits(ctx, resp.Header)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// HTTP400 diagnostics never export vendor content or alter settlement.
@@ -601,6 +723,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			return nil, fail(gatewayNativeFailureLimit)
 		}
 		fields, ok := gatewayNativeCanonicalObject(output, "status")
+		gatewayNativeObserveUsage(output, &observation, ok && gjson.ParseBytes(fields["status"]).String() == "completed")
 		if !ok || gjson.ParseBytes(fields["status"]).String() != "completed" {
 			return nil, fail(gatewayNativeFailureFinal)
 		}
@@ -627,10 +750,11 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		(encoding == "" || strings.EqualFold(encoding, "identity"))
 	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") && !awaitingCodexFrame {
 		upstreamMediaCategory = gatewayNativeUpstreamMediaCategory(resp.Header.Get("Content-Type"))
-		if upstreamMediaCategory == "json" {
+		switch upstreamMediaCategory {
+		case "json":
 			diagnostic := gatewayNativeHTTPErrorCategory(reader, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
-		} else if upstreamMediaCategory == "missing" {
+		case "missing":
 			var diagnostic gatewayNativeHTTPErrorDiagnostic
 			upstreamBodyShape, upstreamBodyPrefix, diagnostic = gatewayNativeMissingMediaDiagnostic(reader, resp.Header.Get("Content-Encoding"))
 			providerErrorCategory, providerErrorShape, providerErrorParameter = diagnostic.category, diagnostic.shape, diagnostic.parameter
@@ -647,9 +771,20 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	// Include original LF/CRLF bytes in each token for bounds and forwarding.
 	scanner.Split(gatewayNativeRawSSELine)
 	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
+	var toolRestorer *apicompat.ResponsesClientToolStreamRestorer
+	if gatewayNativeProviderProfile(fmt.Sprint(a.Extra[GatewayProfileExtraKey])) {
+		if mapping, ok := grokResponsesClientToolMapping(c); ok {
+			toolRestorer = apicompat.NewResponsesClientToolStreamRestorer(mapping)
+		}
+	}
 	var event bytes.Buffer
 	var data []string
 	total := 0
+	outputLimit := int64(gatewayNativeResponseLimit)
+	if lifetime := gatewayNativeLifetime(ctx); lifetime != nil {
+		outputLimit = lifetime.outputBytes
+	}
+	var delivered int64
 	for scanner.Scan() {
 		raw := scanner.Bytes()
 		total += len(raw)
@@ -681,7 +816,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if !utf8.Valid(event.Bytes()) {
 			return nil, fail(gatewayNativeFailureFrame)
 		}
+		if a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile && gatewayNativeGrokPingFrame(event.Bytes()) {
+			event.Reset()
+			data = nil
+			continue
+		}
 		completed := false
+		var restoredFrames []byte
 		if len(data) > 0 {
 			// SSE joins all data fields in an event before JSON interpretation.
 			payload := []byte(strings.Join(data, "\n"))
@@ -701,6 +842,9 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 					return nil, fail(gatewayNativeFailureEvent)
 				}
 				status = gjson.ParseBytes(responseFields["status"]).String()
+				if kind == "response.completed" || kind == "response.failed" || kind == "response.incomplete" || kind == "response.in_progress" {
+					gatewayNativeObserveUsage(response, &observation, kind == "response.completed" && status == "completed")
+				}
 			}
 			if kind == "error" || kind == "response.failed" || kind == "response.incomplete" {
 				return nil, fail(gatewayNativeFailureProvider)
@@ -712,8 +856,21 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 				completed = true
 				result.Usage = OpenAIUsage{InputTokens: int(gjson.GetBytes(payload, "response.usage.input_tokens").Int()), OutputTokens: int(gjson.GetBytes(payload, "response.usage.output_tokens").Int())}
 			}
+			if toolRestorer != nil {
+				payloads, changed, restoreErr := toolRestorer.RestoreEvent(payload)
+				if restoreErr != nil {
+					return nil, fail(gatewayNativeFailureEvent)
+				}
+				if changed {
+					restoredFrames, restoreErr = gatewayNativeGrokRestoredFrames(event.Bytes(), payloads)
+					if restoreErr != nil {
+						return nil, fail(gatewayNativeFailureFrameLimit)
+					}
+				}
+			}
 			if awaitingCodexFrame {
-				if !((kind == "response.created" || kind == "response.in_progress") && status == "in_progress") && !completed {
+				inProgressFrame := (kind == "response.created" || kind == "response.in_progress") && status == "in_progress"
+				if !inProgressFrame && !completed {
 					return nil, fail(gatewayNativeFailureEvent)
 				}
 				awaitingCodexFrame = false
@@ -726,9 +883,19 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			// same event buffer remains bounded; these bytes alone prove nothing.
 			continue
 		}
-		if n, err := c.Writer.Write(event.Bytes()); err != nil || n != event.Len() {
+		forwardFrame := event.Bytes()
+		if restoredFrames != nil {
+			forwardFrame = restoredFrames
+		}
+		// The admitted output cap covers the emitted protocol, including events
+		// expanded by tool restoration, not only bytes read from the provider.
+		if int64(len(forwardFrame)) > outputLimit-delivered {
+			return nil, fail(gatewayNativeFailureLimit)
+		}
+		if n, err := c.Writer.Write(forwardFrame); err != nil || n != len(forwardFrame) {
 			return nil, fail(gatewayNativeFailureWrite)
 		}
+		delivered += int64(len(forwardFrame))
 		if gatewayNativeFlush(c.Writer) != nil {
 			return nil, fail(gatewayNativeFailureFlush)
 		}

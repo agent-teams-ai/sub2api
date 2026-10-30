@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ type gatewayConnectInput struct {
 	Owner      string `json:"owner_ref"`
 	Account    string `json:"account_ref"`
 	Generation string `json:"generation"`
+	Method     string `json:"method,omitempty"`
 }
 
 // Opt-in private root group ONLY, on a sanitized server with no body/query/error/
@@ -35,7 +37,7 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 	control := group.Group("/private/native/v1/oauth", authorize)
 	control.POST("/connect", func(c *gin.Context) {
 		var req gatewayConnectInput
-		if !gatewayConnectDecode(c, &req) {
+		if !gatewayConnectDecode(c, &req, true) {
 			fail(c)
 			return
 		}
@@ -45,7 +47,11 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 			return
 		}
 		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
-		out, err := connect.BeginConnect(c.Request.Context(), scope, req.Operation)
+		method := req.Method
+		if method == "" {
+			method = "browser"
+		}
+		out, err := connect.BeginConnectMethod(c.Request.Context(), scope, req.Operation, method)
 		if err != nil {
 			fail(c)
 			return
@@ -65,6 +71,26 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 		}
 		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
 		out, err := connect.ReadConnect(c.Request.Context(), scope, req.Operation)
+		if err != nil {
+			fail(c)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	})
+
+	control.POST("/connect/poll", func(c *gin.Context) {
+		var req gatewayConnectInput
+		if !gatewayConnectDecode(c, &req) {
+			fail(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+		out, err := connect.PollDeviceConnect(c.Request.Context(), scope, req.Operation)
 		if err != nil {
 			fail(c)
 			return
@@ -185,7 +211,8 @@ func DecodeGatewayNativeOAuthConnectCompletion(raw []byte) (GatewayNativeOAuthCo
 	return req, true
 }
 
-func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {
+func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput, allowMethod ...bool) bool {
+	begin := len(allowMethod) == 1 && allowMethod[0]
 	c.Header("Cache-Control", "no-store")
 	if c.Request.URL.RawQuery != "" {
 		return false
@@ -204,12 +231,13 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {
 	for d.More() {
 		tok, err = d.Token()
 		name, ok := tok.(string)
-		if err != nil || !ok || seen[name] || (name != "operation" && name != "owner_ref" && name != "account_ref" && name != "generation") {
+		allowedName := name == "operation" || name == "owner_ref" || name == "account_ref" || name == "generation" || (begin && name == "method")
+		if err != nil || !ok || seen[name] || !allowedName {
 			return false
 		}
 		seen[name] = true
 		var value string
-		if d.Decode(&value) != nil || !service.GatewayNativeCredentialRefValid(value) {
+		if d.Decode(&value) != nil || !service.GatewayNativeCredentialRefValid(value) || (name == "method" && value != "browser" && value != "device_code") {
 			return false
 		}
 		switch name {
@@ -221,10 +249,12 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {
 			req.Account = value
 		case "generation":
 			req.Generation = value
+		case "method":
+			req.Method = value
 		}
 	}
 	tok, err = d.Token()
-	if err != nil || tok != json.Delim('}') || len(seen) != 4 {
+	if err != nil || tok != json.Delim('}') || len(seen) != 4+boolInt(seen["method"]) || !seen["operation"] || !seen["owner_ref"] || !seen["account_ref"] || !seen["generation"] {
 		return false
 	}
 	_, err = d.Token()
@@ -233,11 +263,19 @@ func gatewayConnectDecode(c *gin.Context, req *gatewayConnectInput) bool {
 
 // Only the original connect selectors enter maintenance; no F2 reference/version
 // is an input. Output cannot serialize the private repository projection.
-func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *service.GatewayNativeOAuthRefresh, authorize gin.HandlerFunc) error {
+func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh interface {
+	Maintain(context.Context, service.GatewayNativeCredentialScope, string) (service.GatewayNativeOAuthMaintenanceOutcome, error)
+}, authorize gin.HandlerFunc, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || refresh == nil || authorize == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/refresh", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && (prefix[0] == "/private/native/v1/claude/oauth" || prefix[0] == "/private/native/v1/grok/oauth") {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/refresh", authorize, func(c *gin.Context) {
 		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_refresh_unavailable"}) }
 		var req gatewayConnectInput
 		if !gatewayConnectDecode(c, &req) {
@@ -268,11 +306,19 @@ func RegisterGatewayNativeOAuthRefreshRoute(group *gin.RouterGroup, refresh *ser
 }
 
 // Cleanup has its own purpose/role authorization, never connect owner policy.
-func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect *service.GatewayNativeOAuthConnect, authorize gin.HandlerFunc, authority service.GatewayNativeOAuthCleanupAuthorizer) error {
+func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect interface {
+	Cleanup(context.Context, service.GatewayNativeOAuthCleanupRequest, service.GatewayNativeOAuthCleanupAuthorizer) (service.GatewayNativeOAuthCleanupResult, error)
+}, authorize gin.HandlerFunc, authority service.GatewayNativeOAuthCleanupAuthorizer, prefix ...string) error {
 	if group == nil || group.BasePath() != "/" || connect == nil || authorize == nil || authority == nil {
 		return service.ErrGatewayNativeIdentity
 	}
-	group.POST("/private/native/v1/oauth/connect/cleanup", authorize, func(c *gin.Context) {
+	path := "/private/native/v1/oauth"
+	if len(prefix) == 1 && (prefix[0] == "/private/native/v1/claude/oauth" || prefix[0] == "/private/native/v1/grok/oauth") {
+		path = prefix[0]
+	} else if len(prefix) > 0 {
+		return service.ErrGatewayNativeIdentity
+	}
+	group.POST(path+"/connect/cleanup", authorize, func(c *gin.Context) {
 		fail := func() { c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_cleanup_unavailable"}) }
 		c.Header("Cache-Control", "no-store")
 		if c.Request.URL.RawQuery != "" {
@@ -338,4 +384,11 @@ func RegisterGatewayNativeOAuthCleanupRoute(group *gin.RouterGroup, connect *ser
 		c.JSON(http.StatusOK, out)
 	})
 	return nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
