@@ -62,29 +62,38 @@ type claudeTransportHTTP struct {
 	status   int
 	headers  http.Header
 	closeErr error
+	doErr    error
 	closed   atomic.Bool
 	inspect  func(*http.Request)
+	onRead   func()
 }
 type claudeTransportBody struct {
 	io.Reader
 	closed *atomic.Bool
 	err    error
+	onRead func()
 }
 
 func (b *claudeTransportBody) Close() error { b.closed.Store(true); return b.err }
+func (b *claudeTransportBody) Read(p []byte) (int, error) {
+	if b.onRead != nil {
+		b.onRead()
+	}
+	return b.Reader.Read(p)
+}
 func (u *claudeTransportHTTP) Do(r *http.Request, proxy string, id int64, concurrency int) (*http.Response, error) {
 	u.calls++
 	if u.inspect != nil {
 		u.inspect(r)
 	}
-	return &http.Response{StatusCode: u.status, Header: u.headers, Body: &claudeTransportBody{strings.NewReader(u.body), &u.closed, u.closeErr}, Request: r}, nil
+	return &http.Response{StatusCode: u.status, Header: u.headers, Body: &claudeTransportBody{strings.NewReader(u.body), &u.closed, u.closeErr, u.onRead}, Request: r}, u.doErr
 }
 
 // The real source seam, AEAD bundle opening, one-use/lifetime CAS, converter,
 // passive snapshot writer and physical body close run with controlled storage.
 // PostgreSQL locking and OAuth exchange are separately covered by native tests.
 func TestGatewayNativeClaudeResponsesDispatchLifecycle(t *testing.T) {
-	for _, mode := range []string{"complete", "truncated", "rate-limit", "close-failure", "output-cap", "sealed"} {
+	for _, mode := range []string{"complete", "truncated", "rate-limit", "close-failure", "output-cap", "sealed", "invalid-media", "transport-error"} {
 		t.Run(mode, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			scope := GatewayNativeCredentialScope{Consumer: "claude-consumer", Owner: "claude-owner", Account: "claude-account", Generation: uuid.NewString(), Purpose: GatewayOAuthBundlePurpose}
@@ -96,6 +105,7 @@ func TestGatewayNativeClaudeResponsesDispatchLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			upstream := &claudeTransportHTTP{status: http.StatusOK, body: claudeMessagesFixtureSSE, headers: http.Header{"Content-Type": {"text/event-stream"}, "Anthropic-Ratelimit-Unified-5h-Utilization": {"0.25"}, "Anthropic-Ratelimit-Unified-5h-Reset": {"1792700000"}, "X-Secret-Provider-Diagnostic": {"must-not-escape"}}}
 			upstream.inspect = func(r *http.Request) {
+				require.Zero(t, store.releases, "credential identity must remain fenced through provider entry")
 				require.Equal(t, "https://api.anthropic.com/v1/messages?beta=true", r.URL.String())
 				require.Equal(t, "Bearer fixture-claude-access", r.Header.Get("Authorization"))
 				require.Equal(t, "2023-06-01", r.Header.Get("anthropic-version"))
@@ -132,6 +142,10 @@ func TestGatewayNativeClaudeResponsesDispatchLifecycle(t *testing.T) {
 				require.Equal(t, "Fixture system instructions stay at system priority.", system[3].Text)
 
 			}
+			upstream.onRead = func() {
+				require.Equal(t, store.locks, store.releases, "SQL identity guard must release before the first SSE body read")
+				require.Equal(t, 1, store.captures, "passive limits publish after releasing SQL and before streaming")
+			}
 			if mode == "truncated" {
 				upstream.body = strings.Split(claudeMessagesFixtureSSE, "event: message_stop")[0]
 			}
@@ -140,6 +154,12 @@ func TestGatewayNativeClaudeResponsesDispatchLifecycle(t *testing.T) {
 			}
 			if mode == "close-failure" {
 				upstream.closeErr = errors.New("fixture close failed")
+			}
+			if mode == "invalid-media" {
+				upstream.headers.Set("Content-Type", "application/json")
+			}
+			if mode == "transport-error" {
+				upstream.doErr = errors.New("fixture transport failed after response ownership")
 			}
 			wrapped, err := NewGatewayNativeLifetimeUpstream(upstream)
 			require.NoError(t, err)
@@ -195,11 +215,15 @@ func TestGatewayNativeClaudeResponsesDispatchLifecycle(t *testing.T) {
 			}
 			if mode != "sealed" {
 				require.Equal(t, 1, upstream.calls)
-				require.True(t, upstream.closed.Load())
-				require.Equal(t, 1, store.captures)
-				require.Len(t, store.limits.Windows, 1)
-				require.Equal(t, GatewayClaudeFiveHour, store.limits.Windows[0].ID)
-				require.False(t, store.observed.IsZero())
+				require.Eventually(t, upstream.closed.Load, time.Second, time.Millisecond)
+				if mode == "transport-error" {
+					require.Zero(t, store.captures)
+				} else {
+					require.Equal(t, 1, store.captures)
+					require.Len(t, store.limits.Windows, 1)
+					require.Equal(t, GatewayClaudeFiveHour, store.limits.Windows[0].ID)
+					require.False(t, store.observed.IsZero())
+				}
 			}
 			require.Equal(t, store.locks, store.releases)
 			snapshot := life.Snapshot()

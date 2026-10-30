@@ -74,7 +74,7 @@ func (s *GatewayOpenRouterModels) fetch(ctx context.Context) GatewayAccountModel
 	if err != nil || response == nil || response.Body == nil {
 		return unavailable
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != gatewayOpenRouterModelsURL {
 		return unavailable
 	}

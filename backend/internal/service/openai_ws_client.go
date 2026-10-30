@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -12,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/wsnetpolicy"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -72,17 +73,26 @@ type openAIWSTransportMetricsDialer interface {
 	SnapshotTransportMetrics() OpenAIWSTransportMetricsSnapshot
 }
 
-func newDefaultOpenAIWSClientDialer() openAIWSClientDialer {
-	return &coderOpenAIWSClientDialer{
+func newDefaultOpenAIWSClientDialer(configs ...*config.Config) openAIWSClientDialer {
+	dialer := &coderOpenAIWSClientDialer{
 		proxyClients: make(map[string]*openAIWSProxyClientEntry),
 	}
+	if len(configs) > 0 && configs[0] != nil && configs[0].Security.URLAllowlist.Enabled {
+		policy := configs[0].Security.URLAllowlist
+		dialer.networkPolicy = wsnetpolicy.New(policy.UpstreamHosts, policy.AllowPrivateHosts)
+	}
+	return dialer
 }
 
 type coderOpenAIWSClientDialer struct {
-	proxyMu      sync.Mutex
-	proxyClients map[string]*openAIWSProxyClientEntry
-	proxyHits    atomic.Int64
-	proxyMisses  atomic.Int64
+	proxyMu          sync.Mutex
+	proxyClients     map[string]*openAIWSProxyClientEntry
+	proxyHits        atomic.Int64
+	proxyMisses      atomic.Int64
+	networkPolicy    *wsnetpolicy.Policy
+	directClientOnce sync.Once
+	directClient     *http.Client
+	directClientErr  error
 }
 
 // openAIWSHandshakeError keeps a bounded, non-logged HTTP error body so the
@@ -122,6 +132,13 @@ func (d *coderOpenAIWSClientDialer) Dial(
 	if targetURL == "" {
 		return nil, 0, nil, errors.New("ws url is empty")
 	}
+	if d.networkPolicy != nil {
+		var err error
+		ctx, err = d.networkPolicy.PrepareDial(ctx, targetURL)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+	}
 
 	wrapped := &coderOpenAIWSClientConn{}
 	opts := &coderws.DialOptions{
@@ -138,6 +155,15 @@ func (d *coderOpenAIWSClientDialer) Dial(
 			return nil, 0, nil, err
 		}
 		opts.HTTPClient = proxyClient
+	}
+	if d.networkPolicy != nil && opts.HTTPClient == nil {
+		d.directClientOnce.Do(func() {
+			d.directClient, d.directClientErr = d.networkPolicy.WrapClient(http.DefaultClient)
+		})
+		if d.directClientErr != nil {
+			return nil, 0, nil, d.directClientErr
+		}
+		opts.HTTPClient = d.directClient
 	}
 
 	conn, resp, err := coderws.Dial(ctx, targetURL, opts)
@@ -176,7 +202,7 @@ func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string) (*http.Client,
 	}
 	parsedProxyURL, err := url.Parse(normalizedProxy)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy url: %w", err)
+		return nil, errors.New("invalid proxy url")
 	}
 	now := time.Now().UnixNano()
 
@@ -197,6 +223,12 @@ func (d *coderOpenAIWSClientDialer) proxyHTTPClient(proxy string) (*http.Client,
 		ForceAttemptHTTP2:   true,
 	}
 	client := &http.Client{Transport: transport}
+	if d.networkPolicy != nil {
+		client, err = d.networkPolicy.WrapClient(client)
+		if err != nil {
+			return nil, err
+		}
+	}
 	d.proxyClients[normalizedProxy] = &openAIWSProxyClientEntry{
 		client:           client,
 		lastUsedUnixNano: now,
@@ -265,9 +297,7 @@ func closeOpenAIWSProxyClient(client *http.Client) {
 	if client == nil || client.Transport == nil {
 		return
 	}
-	if transport, ok := client.Transport.(*http.Transport); ok && transport != nil {
-		transport.CloseIdleConnections()
-	}
+	client.CloseIdleConnections()
 }
 
 func (d *coderOpenAIWSClientDialer) SnapshotTransportMetrics() OpenAIWSTransportMetricsSnapshot {

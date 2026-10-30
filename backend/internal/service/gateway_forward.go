@@ -347,7 +347,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// 调试日志：记录即将转发的账号信息
 	logger.LegacyPrintf("service.gateway", "[Forward] Using account: ID=%d Name=%s Platform=%s Type=%s TLSFingerprint=%v Proxy=%s",
-		account.ID, account.Name, account.Platform, account.Type, tlsProfile, proxyURL)
+		account.ID, account.Name, account.Platform, account.Type, tlsProfile, proxyURLForLog(proxyURL))
 	// Pre-filter: strip empty text blocks (including nested in tool_result) to prevent upstream 400.
 	if err := replaceBody(StripEmptyTextBlocks(body)); err != nil {
 		return nil, err
@@ -668,7 +668,9 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		if account.Platform == PlatformGemini && resp.StatusCode < 400 && s.cfg != nil && s.cfg.Gateway.GeminiDebugResponseHeaders {
 			logger.LegacyPrintf("service.gateway", "[DEBUG] Gemini API Response Headers for account %d:", account.ID)
 			for k, v := range resp.Header {
-				logger.LegacyPrintf("service.gateway", "[DEBUG]   %s: %v", k, v)
+				if strings.HasPrefix(strings.ToLower(k), "x-ratelimit") {
+					logger.LegacyPrintf("service.gateway", "[DEBUG]   %s: %v", k, v)
+				}
 			}
 		}
 		break

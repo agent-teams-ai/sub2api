@@ -233,3 +233,7 @@ func TestGatewayAccountModelsUnrepresentableReasoning(t *testing.T) {
 	require.Equal(t, GatewayAccountModelsResult{Status: "unavailable"}, f.dispatch.accountModels(f.ctx, f.store.row, f.store.physical, false))
 	require.Zero(t, f.entries.Load())
 }
+
+func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
+	return projectGatewayCodexAccountModels(raw, &gatewayCodexCatalogProjection{})
+}

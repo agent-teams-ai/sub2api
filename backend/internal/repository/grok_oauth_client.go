@@ -245,7 +245,7 @@ func createGrokHTTPClient(proxyURL string, noRedirect bool) (*http.Client, error
 	if strings.TrimSpace(proxyURL) != "" {
 		parsed, err := url.Parse(proxyURL)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("invalid proxy URL")
 		}
 		transport.Proxy = http.ProxyURL(parsed)
 	}

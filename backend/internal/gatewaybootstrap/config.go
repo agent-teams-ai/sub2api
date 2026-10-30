@@ -34,18 +34,22 @@ var integer = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 // Config is decoded only from inherited FD 6. It has no CLI/env representation,
 // provider credential, migration option, discovery or insecure-TLS switch.
 type Config struct {
-	ListenAddress string             `json:"listenAddress"`
-	PostgresDSN   string             `json:"postgresDSN"`
-	Authority     AuthorityConfig    `json:"authority"`
-	Custody       CustodyConfig      `json:"custody"`
-	Peers         []ControlPeer      `json:"peers"`
-	Profile       ProfileConfig      `json:"profile"`
-	MaxEntries    int64              `json:"maxEntries"`
-	OAuth         *OAuthConfig       `json:"oauth,omitempty"`
-	OpenRouter    *ProfileConfig     `json:"openRouter,omitempty"`
-	Claude        *ProfileConfig     `json:"claude,omitempty"`
-	CodingPlans   []CodingPlanConfig `json:"codingPlans,omitempty"`
-	Grok          *GrokConfig        `json:"grok,omitempty"`
+	ListenAddress string `json:"listenAddress"`
+	// Public inference has an independent listener and admission budget. The
+	// private control listener never accepts execution capabilities from clients.
+	PublicListenAddress string             `json:"publicListenAddress,omitempty"`
+	PublicMaxActive     int64              `json:"publicMaxActive,omitempty"`
+	PostgresDSN         string             `json:"postgresDSN"`
+	Authority           AuthorityConfig    `json:"authority"`
+	Custody             CustodyConfig      `json:"custody"`
+	Peers               []ControlPeer      `json:"peers"`
+	Profile             ProfileConfig      `json:"profile"`
+	MaxEntries          int64              `json:"maxEntries"`
+	OAuth               *OAuthConfig       `json:"oauth,omitempty"`
+	OpenRouter          *ProfileConfig     `json:"openRouter,omitempty"`
+	Claude              *ProfileConfig     `json:"claude,omitempty"`
+	CodingPlans         []CodingPlanConfig `json:"codingPlans,omitempty"`
+	Grok                *GrokConfig        `json:"grok,omitempty"`
 }
 
 // The optional OAuth key is separate from custody, inherited in protected FD6,
@@ -206,6 +210,17 @@ func fixedOrigin(origin string) bool {
 		(u.Scheme == "https" || u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))
 }
 func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
+	if c.PublicListenAddress != "" {
+		publicHost, publicPort, publicErr := net.SplitHostPort(c.PublicListenAddress)
+		publicPortNumber, publicPortErr := strconv.Atoi(publicPort)
+		if publicErr != nil || (publicHost != "127.0.0.1" && publicHost != "::1") ||
+			!integer.MatchString(publicPort) || publicPortErr != nil || publicPortNumber < 1 || publicPortNumber > 65535 ||
+			c.PublicListenAddress == c.ListenAddress || c.PublicMaxActive < 1 || c.PublicMaxActive > 2048 {
+			return nil, ErrDenied
+		}
+	} else if c.PublicMaxActive != 0 {
+		return nil, ErrDenied
+	}
 	host, port, err := net.SplitHostPort(c.ListenAddress)
 	portNumber, portErr := strconv.Atoi(port)
 	if err != nil || (host != "127.0.0.1" && host != "::1") || !integer.MatchString(port) || portErr != nil || portNumber < 1 || portNumber > 65535 ||

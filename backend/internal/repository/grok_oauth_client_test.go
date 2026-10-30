@@ -14,6 +14,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCreateGrokHTTPClientInvalidProxyExcludesCredentials(t *testing.T) {
+	client, err := createGrokHTTPClient("http://proxy-user-marker:proxy-password-marker@%:8080", true)
+	require.Nil(t, client)
+	require.EqualError(t, err, "invalid proxy URL")
+	require.NotContains(t, err.Error(), "proxy-user-marker")
+	require.NotContains(t, err.Error(), "proxy-password-marker")
+}
+
 func TestGrokOAuthClientExchangeAndRefreshUseFormFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
