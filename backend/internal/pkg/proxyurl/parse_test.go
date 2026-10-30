@@ -213,3 +213,21 @@ func TestParse_无Scheme裸地址(t *testing.T) {
 		t.Fatal("无 scheme 的裸地址应返回错误")
 	}
 }
+
+func TestParseErrorsExcludeCredentialsAndQuery(t *testing.T) {
+	for _, raw := range []string{
+		"http://username-marker:password-marker@%?token=query-marker",
+		"http://username-marker:password-marker@:0/private?token=query-marker",
+		"http://username-marker:password-marker@proxy.example:invalid-port?token=query-marker",
+	} {
+		_, _, err := Parse(raw)
+		if err == nil {
+			t.Fatal("malformed proxy must remain rejected")
+		}
+		for _, secret := range []string{"username-marker", "password-marker", "query-marker"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("proxy error exposes %s", secret)
+			}
+		}
+	}
+}

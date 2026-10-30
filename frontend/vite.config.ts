@@ -94,14 +94,10 @@ export default defineConfig(({ mode }) => {
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
-      // 使用 vue-i18n 运行时版本，避免 CSP unsafe-eval 问题
+      // 使用 vue-i18n 运行时版本，避免 CSP unsafe-eval 问题；
+      // v10 起 JIT 编译恒开启，消息编译为 AST 对象而非 JS 代码，无需 unsafe-eval
       'vue-i18n': 'vue-i18n/dist/vue-i18n.runtime.esm-bundler.js'
     }
-  },
-  define: {
-    // 启用 vue-i18n JIT 编译，在 CSP 环境下处理消息插值
-    // JIT 编译器生成 AST 对象而非 JS 代码，无需 unsafe-eval
-    __INTLIFY_JIT_COMPILATION__: true
   },
   build: {
     outDir: '../backend/internal/web/dist',
@@ -112,8 +108,33 @@ export default defineConfig(({ mode }) => {
          * 手动分包配置
          * 分离第三方库并按功能合并应用代码，避免循环依赖
          */
-        manualChunks(id: string) {
-          if (id.includes('node_modules')) {
+        manualChunks(id: string, { getModuleInfo }: {
+          getModuleInfo(id: string): {
+            isEntry: boolean
+            importers: readonly string[]
+            dynamicImporters: readonly string[]
+          } | null
+        }) {
+          // Keep SDK-exclusive dependencies lazy, including virtual helpers.
+          const dependency = id.includes('node_modules'), virtual = id.startsWith('\0')
+          if (dependency || virtual) {
+            const pending = [id], seen = new Set<string>()
+            let reachesAirwallex = false, shared = false
+            while (pending.length && !shared) {
+              const current = pending.pop()!
+              if (seen.has(current)) continue
+              seen.add(current)
+              if (current.includes('/@airwallex/components-sdk/')) {
+                reachesAirwallex = true
+                continue
+              }
+              const info = getModuleInfo(current)
+              const importers = info ? [...info.importers, ...info.dynamicImporters] : []
+              if (!info || info.isEntry || importers.length === 0) shared = true
+              else pending.push(...importers)
+            }
+            if (reachesAirwallex && !shared) return 'vendor-airwallex'
+            if (virtual) return 'vendor-misc'
             // Vue 核心库
             if (
               id.includes('/vue/') ||

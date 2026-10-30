@@ -37,8 +37,10 @@
 # golangci-lint（CI 用 v2.13，本地建议装同一版以免版本差异带来的噪音）
 go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13
 
-# pnpm (前端包管理)
-npm install -g pnpm
+# 前端构建默认 Node.js 26.11.1（.node-version/.nvmrc）；CI 保留 24.21.0 兼容性。
+# Node 26 不自带 Corepack；pnpm 与 frontend/package.json 保持一致。
+npm install --prefix "$PWD/.tools/pnpm" --engine-strict pnpm@9.15.9
+export PATH="$PWD/.tools/pnpm/node_modules/.bin:$PATH"
 ```
 
 ## 三、CI/CD 流水线

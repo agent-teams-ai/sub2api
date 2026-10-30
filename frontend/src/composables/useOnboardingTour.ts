@@ -1,4 +1,4 @@
-import { onMounted, onUnmounted, nextTick } from 'vue'
+import { onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { driver, type Driver, type DriveStep } from 'driver.js'
 import 'driver.js/dist/driver.css'
 import { useAuthStore as useUserStore } from '@/stores/auth'
@@ -9,6 +9,7 @@ import { getAdminSteps, getUserSteps } from '@/components/Guide/steps'
 export interface OnboardingOptions {
   storageKey?: string
   autoStart?: boolean
+  canStart?: () => boolean
 }
 
 export function useOnboardingTour(options: OnboardingOptions) {
@@ -55,6 +56,10 @@ export function useOnboardingTour(options: OnboardingOptions) {
     eventTypes?: string[] // Track which event types were added
   } | null = null
   let autoStartTimer: ReturnType<typeof setTimeout> | null = null
+  let pendingStartup: AbortController | null = null
+  let mounted = false
+  let disposed = false
+  let autoStartConsumed = false
   let globalKeyboardHandler: ((e: KeyboardEvent) => void) | null = null
 
   const getStorageKey = () => {
@@ -76,35 +81,78 @@ export function useOnboardingTour(options: OnboardingOptions) {
     localStorage.removeItem(getStorageKey())
   }
 
+  const canStart = (): boolean => {
+    return !disposed && (options.canStart?.() ?? true)
+  }
+
+  const cancelPendingStartup = (): void => {
+    if (autoStartTimer !== null) {
+      clearTimeout(autoStartTimer)
+      autoStartTimer = null
+    }
+    pendingStartup?.abort()
+    pendingStartup = null
+  }
+
   /**
    * 检查元素是否存在，如果不存在则重试
    */
-  const ensureElement = async (selector: string, timeout = 5000): Promise<boolean> => {
+  const ensureElement = async (
+    selector: string,
+    timeout = 5000,
+    signal?: AbortSignal
+  ): Promise<boolean> => {
     const startTime = Date.now()
     while (Date.now() - startTime < timeout) {
+      if (signal?.aborted) return false
+
       const element = document.querySelector(selector)
       if (element && element.getBoundingClientRect().height > 0) {
         return true
       }
-      await new Promise((resolve) => setTimeout(resolve, 150))
+
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          clearTimeout(timer)
+          signal?.removeEventListener('abort', finish)
+          resolve()
+        }
+        const timer = setTimeout(finish, 150)
+        signal?.addEventListener('abort', finish, { once: true })
+      })
     }
     return false
   }
 
+
   const startTour = async (startIndex = 0) => {
-    // 动态获取当前用户角色和步骤
+    if (!canStart()) return
+    cancelPendingStartup()
+
     const isAdmin = userStore.user?.role === 'admin'
     const isSimpleMode = userStore.isSimpleMode
     const steps = isAdmin ? getAdminSteps(t, isSimpleMode) : getUserSteps(t)
 
-    // 确保 DOM 就绪
-    await nextTick()
+    const startup = new AbortController()
+    pendingStartup = startup
 
-    // 如果指定了起始步骤，确保元素可见
-    const currentStep = steps[startIndex]
-    if (currentStep?.element && typeof currentStep.element === 'string') {
-      await ensureElement(currentStep.element, TIMING.ELEMENT_TIMEOUT_MS)
+    try {
+      await nextTick()
+      if (startup.signal.aborted || !canStart()) return
+
+      const currentStep = steps[startIndex]
+      if (currentStep?.element && typeof currentStep.element === 'string') {
+        await ensureElement(
+          currentStep.element,
+          TIMING.ELEMENT_TIMEOUT_MS,
+          startup.signal
+        )
+      }
+    } finally {
+      if (pendingStartup === startup) pendingStartup = null
     }
+
+    if (startup.signal.aborted || !canStart()) return
 
     if (driverInstance) {
       driverInstance.destroy()
@@ -498,6 +546,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
     }
 
     document.addEventListener('keydown', globalKeyboardHandler, { capture: true })
+    autoStartConsumed = true
     driverInstance.drive(startIndex)
   }
 
@@ -516,11 +565,45 @@ export function useOnboardingTour(options: OnboardingOptions) {
   }
 
   const replayTour = () => {
+    if (!canStart()) return
     clearSeen()
     void startTour()
   }
 
-  onMounted(async () => {
+  const canAutoStart = (): boolean => {
+    return mounted &&
+      canStart() &&
+      !autoStartConsumed &&
+      options.autoStart === true &&
+      !userStore.isSimpleMode &&
+      userStore.user?.role === 'admin' &&
+      !hasSeen() &&
+      !onboardingStore.isDriverActive()
+  }
+
+  const scheduleAutoStart = (): void => {
+    if (
+      !canAutoStart() ||
+      autoStartTimer !== null ||
+      pendingStartup !== null
+    ) return
+
+    autoStartTimer = setTimeout(() => {
+      autoStartTimer = null
+      if (canAutoStart()) void startTour()
+    }, TIMING.AUTO_START_DELAY_MS)
+  }
+
+  watch(canStart, (allowed) => {
+    if (!allowed) {
+      cancelPendingStartup()
+      return
+    }
+    scheduleAutoStart()
+  }, { flush: 'sync' })
+
+  onMounted(() => {
+    mounted = true
     onboardingStore.setControlMethods({
       nextStep,
       isCurrentStep
@@ -528,32 +611,18 @@ export function useOnboardingTour(options: OnboardingOptions) {
 
     if (onboardingStore.isDriverActive()) {
       driverInstance = onboardingStore.getDriverInstance()
+      autoStartConsumed = true
       return
     }
 
-    // 简易模式下禁用新手引导
-    if (userStore.isSimpleMode) {
-      return
-    }
-
-    // 只在管理员+标准模式下自动启动
-    const isAdmin = userStore.user?.role === 'admin'
-    if (!isAdmin) {
-      return
-    }
-
-    if (!options.autoStart || hasSeen()) return
-    autoStartTimer = setTimeout(() => {
-      void startTour()
-    }, TIMING.AUTO_START_DELAY_MS)
+    scheduleAutoStart()
   })
 
   onUnmounted(() => {
-    if (autoStartTimer) {
-      clearTimeout(autoStartTimer)
-      autoStartTimer = null
-    }
-    // 关键修复：不再此处清理 globalKeyboardHandler，交由 driver.onDestroyed 管理
+    mounted = false
+    disposed = true
+    cancelPendingStartup()
+    // An already driven tour remains owned by the onboarding store.
     onboardingStore.clearControlMethods()
   })
 

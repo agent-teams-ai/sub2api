@@ -171,6 +171,9 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	executor OAuthRefreshExecutor,
 	refreshWindow time.Duration,
 ) (*OAuthRefreshResult, error) {
+	if HasGatewayNativeIdentity(account) {
+		return nil, ErrGatewayNativeIdentity
+	}
 	if api == nil || api.accountRepo == nil {
 		return nil, errors.New("oauth refresh account repository is not configured")
 	}
@@ -224,6 +227,9 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	}
 	if freshAccount.ID != account.ID {
 		return nil, fmt.Errorf("%w: account identity mismatch", errOAuthRefreshAccountRereadFailed)
+	}
+	if HasGatewayNativeIdentity(freshAccount) {
+		return nil, ErrGatewayNativeIdentity
 	}
 	if !freshAccount.IsActive() {
 		if requestPath {
@@ -420,7 +426,7 @@ func (api *OAuthRefreshAPI) tryRecoverFromRefreshRace(ctx context.Context, usedA
 		return nil, false
 	}
 	reReadAccount, err := api.accountRepo.GetByID(ctx, usedAccount.ID)
-	if err != nil || reReadAccount == nil {
+	if err != nil || reReadAccount == nil || HasGatewayNativeIdentity(reReadAccount) {
 		return nil, false
 	}
 	usedRT := usedAccount.GetCredential("refresh_token")
