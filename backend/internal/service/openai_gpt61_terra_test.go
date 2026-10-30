@@ -130,7 +130,7 @@ func TestGPT61TerraChatFallbackRejectsTools(t *testing.T) {
 				case "chat":
 					_, err = service.forwardAsRawChatCompletions(context.Background(), ginContext, account, []byte(body), "")
 				case "responses":
-					_, err = service.forwardResponsesViaRawChatCompletions(context.Background(), ginContext, account, []byte(body), time.Now())
+					_, err = service.forwardResponsesViaRawChatCompletionsWithStartTime(context.Background(), ginContext, account, []byte(body), time.Now())
 				case "messages":
 					_, err = service.forwardAnthropicViaRawChatCompletions(context.Background(), ginContext, account, []byte(body), "")
 				}
