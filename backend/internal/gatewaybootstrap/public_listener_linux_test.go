@@ -118,7 +118,7 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 				results <- err
 				return
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			var body struct{ Code, Effect, RequestRef string }
 			if err = json.NewDecoder(response.Body).Decode(&body); err != nil {
 				results <- err
