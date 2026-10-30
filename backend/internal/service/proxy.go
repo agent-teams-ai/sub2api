@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 )
 
 const (
@@ -48,6 +50,18 @@ func (p *Proxy) URL() string {
 		u.User = url.UserPassword(p.Username, p.Password)
 	}
 	return u.String()
+}
+
+// proxyURLForLog preserves the proxy endpoint without credentials or URL suffixes.
+func proxyURLForLog(raw string) string {
+	_, parsed, err := proxyurl.Parse(raw)
+	if err != nil {
+		return "[invalid proxy URL]"
+	}
+	if parsed == nil {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 type ProxyWithAccountCount struct {
