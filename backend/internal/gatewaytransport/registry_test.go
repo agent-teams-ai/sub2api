@@ -168,8 +168,13 @@ func TestNEWTESTHeldAndLostAdmitACKNeverRearms(t *testing.T) {
 			}
 			e.life.NoForward()
 			r := h.receipt("NEWTESTconsumer", e)
-			if !r.Sealed || r.Phase != "closed" || r.Lifetime.Entered || r.Effect != "effect_unknown" {
+			if !r.Sealed || r.Phase != "closed" || r.Lifetime.Entered || r.Effect != "effect_unknown" || r.Acknowledged {
 				t.Fatalf("wrong lost-ACK facts: %+v", r)
+			}
+			other := NEWTESTRequest()
+			other.RequestRef = "NEWTESTother"
+			if _, _, err := NEWTESTReserve(t, h, other); err == nil {
+				t.Fatal("lost/held callback released retained capacity")
 			}
 		})
 	}
@@ -231,17 +236,84 @@ func TestNEWTESTCallbackFullBindingMutationsDeny(t *testing.T) {
 }
 
 func TestNEWTESTReadbackCallbackNoPermission(t *testing.T) {
+	for _, effect := range []string{"dispatch_started", "response_started", "completed", "effect_unknown", "rejected_before_dispatch"} {
+		t.Run(effect, func(t *testing.T) {
+			cb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req admitRequest
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(admitReply{ConsumerID: req.ConsumerID, Admission: req.Admission, Status: requestStatus{RequestRef: req.RequestRef, Effect: effect}})
+			}))
+			defer cb.Close()
+			h := NEWTESTRegistry(cb, 1)
+			e, _, _ := NEWTESTReserve(t, h, NEWTESTRequest())
+			if ok, err := h.admit(context.Background(), "NEWTESTconsumer", e); err != nil || ok {
+				t.Fatal("readback became permission", err)
+			}
+			h.seal(e)
+			e.life.NoForward()
+			if h.receipt("NEWTESTconsumer", e).Acknowledged {
+				t.Fatal("other-effect readback acknowledged")
+			}
+			other := NEWTESTRequest()
+			other.RequestRef = "NEWTESTother"
+			if _, _, err := NEWTESTReserve(t, h, other); err != nil {
+				t.Fatal("closed status-only attempt retained local capacity", err)
+			}
+		})
+	}
+}
+
+func TestNEWTESTPositiveDenialPrivateHTTPCapacity(t *testing.T) {
+	var callbacks atomic.Int32
 	cb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		if r.URL.Path != "/private/native/v1/admit" || r.Header.Get("Authorization") != "Bearer NEWTESTcallback" {
+			t.Error("wrong fixed callback authority")
+		}
 		var req admitRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			t.Error("invalid admit request")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(admitReply{ConsumerID: req.ConsumerID, Admission: req.Admission, Status: requestStatus{RequestRef: req.RequestRef, Effect: "completed"}})
+		_ = json.NewEncoder(w).Encode(admitReply{ConsumerID: req.ConsumerID, Admission: req.Admission, Status: requestStatus{RequestRef: req.RequestRef, Effect: "not_dispatched"}})
 	}))
 	defer cb.Close()
 	h := NEWTESTRegistry(cb, 1)
-	e, _, _ := NEWTESTReserve(t, h, NEWTESTRequest())
-	if ok, err := h.admit(context.Background(), "NEWTESTconsumer", e); err != nil || ok {
-		t.Fatal("readback became permission", err)
+	h.cfg.Authorize = func(*http.Request) (Peer, error) { return Peer{"NEWTESTconsumer", "execution"}, nil }
+	h.cfg.IOTimeout = time.Second
+	h.cfg.EnvelopeBytes = 8192
+	h.cfg.Profile = QualifiedProfile{Profile: service.GatewayMiMoResponsesProfile, Model: "NEWTESTmodel", BaseURL: "https://NEWTEST.invalid", RequestBytes: 4096, OutputBytes: 4096, Tokens: 100, ProviderTokenUpperBound: 200}
+	server := httptest.NewServer(h)
+	defer server.Close()
+	input := NEWTESTRequest()
+	for i, ref := range []string{"NEWTESTrequest", "NEWTESTrequest", "NEWTESTother"} {
+		input.RequestRef = ref
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := server.Client().Post(server.URL+transportsPath, "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receipt Receipt
+		err = json.NewDecoder(resp.Body).Decode(&receipt)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted || err != nil {
+			t.Fatalf("positive denial request %d: status=%d decode=%v", i, resp.StatusCode, err)
+		}
+		if receipt.Status == nil || receipt.Status.Effect != "not_dispatched" || receipt.Proof != nil || receipt.Lifetime.Entered || !closed(receipt.Lifetime) {
+			t.Fatalf("positive denial lost no-entry/closure facts: %+v", receipt)
+		}
+		wantCallbacks := int32(1)
+		if i == 2 {
+			wantCallbacks = 2
+		}
+		if callbacks.Load() != wantCallbacks {
+			t.Fatal("duplicate reissued callback or new denial did not reach it", callbacks.Load())
+		}
 	}
 }
 
@@ -345,13 +417,13 @@ func TestNEWTESTDuplicateCallbackInvocationNoSecondPermission(t *testing.T) {
 		t.Fatal("duplicate callback returned permission", err)
 	}
 	r := h.receipt("NEWTESTconsumer", e)
-	if calls.Load() != 1 || r.Status == nil || r.Status.Effect != "dispatch_started" {
+	if calls.Load() != 1 || r.Status == nil || r.Status.Effect != "dispatch_started" || r.Acknowledged {
 		t.Fatal("duplicate callback lost readback or reissued claim")
 	}
 }
 
 func TestNEWTESTCallbackAmbiguousBytesAndBoundedFailure(t *testing.T) {
-	for _, kind := range []string{"duplicate", "alias", "invalidUTF8", "bounded", "timeout", "http4xx", "missingDispatchFields"} {
+	for _, kind := range []string{"duplicate", "alias", "invalidUTF8", "bounded", "timeout", "http4xx", "missingDispatchFields", "denialNativeDescriptor", "denialLease"} {
 		t.Run(kind, func(t *testing.T) {
 			cb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var req admitRequest
@@ -376,6 +448,15 @@ func TestNEWTESTCallbackAmbiguousBytesAndBoundedFailure(t *testing.T) {
 				case "missingDispatchFields":
 					reply.LeaseExpiresAt = ""
 					raw, _ = json.Marshal(reply)
+				case "denialNativeDescriptor", "denialLease":
+					reply.Dispatch = nil
+					reply.Status.Effect = "not_dispatched"
+					if kind == "denialNativeDescriptor" {
+						reply.LeaseExpiresAt = ""
+					} else {
+						reply.NativeDescriptor = nil
+					}
+					raw, _ = json.Marshal(reply)
 				}
 				_, _ = w.Write(raw)
 			}))
@@ -392,8 +473,13 @@ func TestNEWTESTCallbackAmbiguousBytesAndBoundedFailure(t *testing.T) {
 			h.seal(e)
 			e.life.NoForward()
 			r := h.receipt("NEWTESTconsumer", e)
-			if r.Effect != "effect_unknown" || r.Lifetime.Entered {
+			if r.Effect != "effect_unknown" || r.Lifetime.Entered || r.Acknowledged {
 				t.Fatal("HTTP failure inferred durable no-effect")
+			}
+			other := NEWTESTRequest()
+			other.RequestRef = "NEWTESTother"
+			if _, _, err := NEWTESTReserve(t, h, other); err == nil {
+				t.Fatal("ambiguous callback released retained capacity")
 			}
 		})
 	}

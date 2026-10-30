@@ -415,7 +415,7 @@ func newHTTPClient(proxyURL string) (*http.Client, error) {
 	if proxyURL != "" {
 		parsed, err := url.Parse(proxyURL)
 		if err != nil {
-			return nil, fmt.Errorf("invalid proxy URL %q: %w", proxyURL, err)
+			return nil, errors.New("invalid proxy URL")
 		}
 		if err := proxyutil.ConfigureTransportProxy(transport, parsed); err != nil {
 			return nil, fmt.Errorf("configure proxy: %w", err)

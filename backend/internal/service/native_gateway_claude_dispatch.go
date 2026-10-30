@@ -50,12 +50,24 @@ func (s *OpenAIGatewayService) forwardGatewayClaudeRoute(ctx context.Context, c 
 	if _, owned := s.httpUpstream.(*gatewayNativeLifetimeUpstream); !owned {
 		return nil, false, ErrGatewayNativeIdentity
 	}
-	fields, ok := GatewayNativePayloadFields(body, "max_output_tokens")
+	nativeMessages := gatewayNativeClaudeMessagesMode(ctx)
+	tokenField := "max_output_tokens"
+	if nativeMessages {
+		tokenField = "max_tokens"
+	}
+	fields, ok := GatewayNativePayloadFields(body, tokenField)
 	var cap int64
-	if !ok || json.Unmarshal(fields["max_output_tokens"], &cap) != nil || cap < 1 || cap > binding.tokens {
+	if !ok || json.Unmarshal(fields[tokenField], &cap) != nil || cap < 1 || cap > binding.tokens {
 		return nil, false, ErrGatewayNativeIdentity
 	}
-	wire, headers, err := gatewayClaudePrepareResponses(body)
+	var wire []byte
+	var headers map[string]string
+	var err error
+	if nativeMessages {
+		wire, headers, err = gatewayClaudePrepareNativeMessages(body, binding.requestBytes, binding.tokens)
+	} else {
+		wire, headers, err = gatewayClaudePrepareResponses(body)
+	}
 	if err != nil || int64(len(wire)) > binding.requestBytes {
 		return nil, false, ErrGatewayNativeIdentity
 	}

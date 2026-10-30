@@ -82,7 +82,7 @@ func (s *GatewayCodexVersionResolver) fetch(ctx context.Context) string {
 	if response.Body == nil {
 		return ""
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != gatewayCodexLatestReleaseURL {
 		return ""
 	}

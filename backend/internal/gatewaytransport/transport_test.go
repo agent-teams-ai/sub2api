@@ -320,6 +320,17 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			return Peer{}, errDenied
 		}, VerifyEnrollment: func(context.Context, Enrollment) error { return nil }, VerifyDispatch: func(context.Context, string, Proof, time.Time) error { return nil },
 		AuthorizeCleanup: func(context.Context, string, Proof, CleanupLease) error { return errDenied }, AcknowledgeClosure: func(context.Context, string, Proof, CleanupLease, Receipt) error { return errDenied }}
+	for _, idle := range []time.Duration{300 * time.Second, 300*time.Second + time.Nanosecond} {
+		bounded := cfg
+		bounded.ProviderReadIdle = idle
+		candidate, err := New(context.Background(), bounded)
+		if (err == nil) != (idle == 300*time.Second) {
+			t.Fatal("private provider read-idle ceiling is not 300s", idle, err)
+		}
+		if candidate != nil {
+			_ = candidate.Stop(context.Background())
+		}
+	}
 	h, err := New(context.Background(), cfg)
 	require.NoError(t, err)
 	defer h.Stop(context.Background())
@@ -583,6 +594,7 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				},
 			}
 			if mode == "paused" {
+				cfg.IOTimeout = time.Second
 				cfg.ProviderReadIdle = 2 * time.Second
 			}
 			if mode == "steadyBeyondIO" {
@@ -694,8 +706,8 @@ func TestGatewayNativeOwnerHTTPClosureOnActualCompletedTransport(t *testing.T) {
 				if (mode == "completed" || mode == "paused" || mode == "steadyBeyondIO") && (result.err != nil || result.code != 200) {
 					t.Fatal("actual completed stream failed", result.code, result.err)
 				}
-				if mode == "steadyBeyondIO" && (result.duration <= cfg.IOTimeout || !bytes.Contains(result.body, []byte("response.completed"))) {
-					t.Fatal("active stream failed to deliver completion beyond one I/O timeout", result.duration)
+				if (mode == "paused" || mode == "steadyBeyondIO") && (result.duration <= cfg.IOTimeout || !bytes.Contains(result.body, []byte("response.completed"))) {
+					t.Fatal("stream failed to deliver completion beyond one write I/O timeout", result.duration)
 				}
 				if strings.HasPrefix(mode, "idle") && bytes.Contains(result.body, []byte("response.completed")) {
 					t.Fatal("read-idle delivered a false completed event")
