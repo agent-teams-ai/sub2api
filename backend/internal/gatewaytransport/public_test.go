@@ -389,6 +389,9 @@ func TestPublicTerminalEventAndEOFWaitForDurableSettlementAndFailureTruncates(t 
 	}
 }
 
+// FLAKY ON LINUX CI: failed once on a GitHub-hosted runner (require.Equal(1, failed) saw 0)
+// and passed on rerun; 30/30 locally on macOS. Likely a timing race between abort() and
+// the aborted stream finishing. If it fails again, investigate instead of just rerunning.
 func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *testing.T) {
 	var original Request
 	var active, maximum, settlements, entries atomic.Int32
