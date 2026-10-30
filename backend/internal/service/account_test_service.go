@@ -1864,7 +1864,7 @@ func (s *AccountTestService) testGrokRealtime(c *gin.Context, ctx context.Contex
 
 	dialer := s.grokWSDialer
 	if dialer == nil {
-		dialer = newDefaultOpenAIWSClientDialer()
+		dialer = newDefaultOpenAIWSClientDialer(s.cfg)
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, grokRealtimeProbeTimeout)

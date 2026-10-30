@@ -1,13 +1,46 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCoderOpenAIWSClientDialerPolicyIsOptInAndPreservesProxyIsolation(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.UpstreamHosts = []string{"relay.example"}
+	impl, ok := newDefaultOpenAIWSClientDialer(cfg).(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+	require.Nil(t, impl.networkPolicy, "disabled allowlist must retain the original dial path")
+	cfg.Security.URLAllowlist.Enabled = true
+	cfg.Security.URLAllowlist.AllowPrivateHosts = true
+	impl, ok = newDefaultOpenAIWSClientDialer(cfg).(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+	require.NotNil(t, impl.networkPolicy)
+	_, status, _, err := impl.Dial(context.Background(), "ws://relay.example", nil, "")
+	require.Error(t, err)
+	require.Zero(t, status)
+	const firstProxy = "http://user:first-secret@proxy.example:8080"
+	const secondProxy = "http://user:second-secret@proxy.example:8080"
+	first, err := impl.proxyHTTPClient(firstProxy)
+	require.NoError(t, err)
+	reused, err := impl.proxyHTTPClient(firstProxy)
+	require.NoError(t, err)
+	second, err := impl.proxyHTTPClient(secondProxy)
+	require.NoError(t, err)
+	require.Same(t, first, reused)
+	require.NotSame(t, first, second, "log/network policy must not collapse credential-specific cache keys")
+	require.Len(t, impl.proxyClients, 2)
+	service := &OpenAIGatewayService{cfg: cfg}
+	passthrough, ok := service.getOpenAIWSPassthroughDialer().(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+	require.NotNil(t, passthrough.networkPolicy)
+}
 
 func TestCoderOpenAIWSClientDialer_ProxyHTTPClientReuse(t *testing.T) {
 	dialer := newDefaultOpenAIWSClientDialer()
