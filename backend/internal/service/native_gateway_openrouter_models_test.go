@@ -70,6 +70,29 @@ func TestGatewayOpenRouterModelsFullDynamicProjection(t *testing.T) {
 	}
 }
 
+func TestGatewayOpenRouterModelsUnsupportedSelectorsDoNotPoisonCatalog(t *testing.T) {
+	rows := []string{
+		openRouterModelRow("vendor/fixed-model", true),
+		openRouterModelRow("~unbiased/pareto-latest", true),
+		openRouterModelRow("~openai/gpt-astra-latest", true),
+		openRouterModelRow("another/vendor-model", false),
+	}
+	models, err := parseGatewayOpenRouterModels([]byte(`{"data":[` + strings.Join(rows, ",") + `]}`))
+	require.NoError(t, err, "unsupported provider selectors must not hide the executable catalogue")
+	require.Len(t, models, 2)
+	require.Equal(t, []string{"vendor/fixed-model", "another/vendor-model"}, []string{models[0].ModelID, models[1].ModelID})
+	for _, selector := range []string{"~unbiased/pareto-latest", "~openai/gpt-astra-latest"} {
+		require.False(t, GatewayOpenRouterModelValid(selector), "catalogue filtering must not widen enrollment or execution descriptors")
+	}
+	duplicateSelector := openRouterModelRow("~openai/gpt-astra-latest", true)
+	_, err = parseGatewayOpenRouterModels([]byte(`{"data":[` + duplicateSelector + `,` + duplicateSelector + `]}`))
+	require.Error(t, err, "ignored selectors must not weaken duplicate identity rejection")
+	for _, malformed := range []string{"~", "~vendor", "~~vendor/model", "~https://forbidden.invalid/model"} {
+		_, err := parseGatewayOpenRouterModels([]byte(`{"data":[` + openRouterModelRow(malformed, true) + `]}`))
+		require.Error(t, err, "malformed selectors must retain fail-closed parsing")
+	}
+}
+
 func TestGatewayOpenRouterModelsMalformedAndUnsupported(t *testing.T) {
 	row := openRouterModelRow("vendor/model", true)
 	for _, raw := range []string{

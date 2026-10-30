@@ -104,7 +104,13 @@ func parseGatewayOpenRouterModels(raw []byte) ([]GatewayAccountModel, error) {
 	for _, row := range rows {
 		fields, ok := GatewayNativePayloadFields(row, "id", "architecture", "supported_parameters", "reasoning")
 		var id string
-		if !ok || json.Unmarshal(fields["id"], &id) != nil || !GatewayOpenRouterModelValid(id) || seen[id] {
+		if !ok || json.Unmarshal(fields["id"], &id) != nil || seen[id] {
+			return nil, ErrGatewayNativeIdentity
+		}
+		// Provider selectors use a namespace outside the executable descriptor ABI.
+		// Ignore only a bounded selector; malformed and duplicate rows still fail closed.
+		selector := strings.HasPrefix(id, "~") && GatewayOpenRouterModelValid(strings.TrimPrefix(id, "~"))
+		if !GatewayOpenRouterModelValid(id) && !selector {
 			return nil, ErrGatewayNativeIdentity
 		}
 		seen[id] = true
@@ -114,7 +120,7 @@ func parseGatewayOpenRouterModels(raw []byte) ([]GatewayAccountModel, error) {
 			(fields["supported_parameters"] != nil && json.Unmarshal(fields["supported_parameters"], &parameters) != nil) {
 			return nil, ErrGatewayNativeIdentity
 		}
-		if !slices.Contains(input, "text") || !slices.Contains(output, "text") {
+		if selector || !slices.Contains(input, "text") || !slices.Contains(output, "text") {
 			continue
 		}
 		tools := GatewayAccountModelChoices{Allowed: []string{"none"}, Default: "none"}
