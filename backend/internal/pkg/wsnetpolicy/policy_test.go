@@ -137,12 +137,12 @@ func TestCustomDialHooksAndOpaqueTransportsCannotBypassPolicy(t *testing.T) {
 	}
 	unexpected := func() { t.Error("custom dial hook bypassed policy") }
 	base := &http.Transport{
-		Dial: func(string, string) (net.Conn, error) { unexpected(); return nil, errors.New("fixture") },
+		Dial: func(string, string) (net.Conn, error) { unexpected(); return nil, errors.New("fixture") }, //nolint:staticcheck // Intentionally exercise the deprecated hook as bypass regression coverage.
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			unexpected()
 			return nil, errors.New("fixture")
 		},
-		DialTLS: func(string, string) (net.Conn, error) { unexpected(); return nil, errors.New("fixture") },
+		DialTLS: func(string, string) (net.Conn, error) { unexpected(); return nil, errors.New("fixture") }, //nolint:staticcheck // Intentionally exercise the deprecated hook as bypass regression coverage.
 		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
 			unexpected()
 			return nil, errors.New("fixture")
