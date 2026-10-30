@@ -131,7 +131,7 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 	defer cancel()
 	db, err := openOAuthDispatchFixtureDB(dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(4)
 	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
 	require.NoError(t, ApplyMigrations(ctx, db))
@@ -193,7 +193,12 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.25")
 		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", "1792700000")
 		_, _ = io.WriteString(w, claudeStreamingStart)
-		w.(http.Flusher).Flush()
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "response writer cannot flush", http.StatusInternalServerError)
+			return
+		}
+		flusher.Flush()
 		arrived <- index
 		select {
 		case <-r.Context().Done():
@@ -208,7 +213,9 @@ func TestGatewayNativeClaudePostgresStreamsReleaseSQLAtHeaders(t *testing.T) {
 	}))
 	defer provider.Close()
 	defer close(shutdown)
-	transport := provider.Client().Transport.(*http.Transport).Clone()
+	baseTransport, ok := provider.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	transport := baseTransport.Clone()
 	transport.Proxy = nil
 	transport.DisableKeepAlives = true
 	transport.TLSClientConfig.ServerName = "example.com"

@@ -48,9 +48,9 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 	defer authority.Close()
 	db, err := sql.Open("postgres", c.PostgresDSN)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	repo := repository.NewAccountRepository(client, db, nil)
 	svcCfg := privateGatewayServiceConfig()
 	upstream, err := service.NewGatewayNativeLifetimeUpstream(repository.NewHTTPUpstream(svcCfg))
@@ -118,7 +118,7 @@ func TestPublicListenerSaturatedRequestsReturnSafeAdmissionRefusal(t *testing.T)
 				results <- err
 				return
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			var body struct{ Code, Effect, RequestRef string }
 			if err = json.NewDecoder(response.Body).Decode(&body); err != nil {
 				results <- err

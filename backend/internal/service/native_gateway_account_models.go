@@ -234,7 +234,7 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 	if response.Body == nil {
 		return unavailable
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != endpoint {
 		return unavailable
 	}
@@ -269,9 +269,6 @@ type gatewayCodexCatalogProjection struct {
 	excluded map[string]int
 }
 
-func parseGatewayCodexAccountModels(raw []byte) ([]GatewayAccountModel, error) {
-	return projectGatewayCodexAccountModels(raw, &gatewayCodexCatalogProjection{})
-}
 func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalogProjection) ([]GatewayAccountModel, error) {
 	root, ok := GatewayNativePayloadFields(raw, "models")
 	if !ok {
@@ -375,7 +372,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 			projection.excluded[exclusion]++
 			continue
 		}
-		m := GatewayAccountModel{ModelID: slug, Fast: &GatewayAccountModelChoices{[]string{"balanced"}, "balanced"}, Tools: GatewayAccountModelChoices{[]string{"function"}, "function"}}
+		m := GatewayAccountModel{ModelID: slug, Fast: &GatewayAccountModelChoices{Allowed: []string{"balanced"}, Default: "balanced"}, Tools: GatewayAccountModelChoices{Allowed: []string{"function"}, Default: "function"}}
 		var def string
 		if value := fields["default_reasoning_level"]; value != nil && string(value) != "null" {
 			if json.Unmarshal(value, &def) != nil {
@@ -418,7 +415,7 @@ func projectGatewayCodexAccountModels(raw []byte, projection *gatewayCodexCatalo
 			if !efforts[def] {
 				return nil, ErrGatewayNativeIdentity
 			}
-			m.Reasoning = &GatewayAccountModelChoices{allowed, def}
+			m.Reasoning = &GatewayAccountModelChoices{Allowed: allowed, Default: def}
 		} else if unsupportedLevels || def != "" && def != "none" {
 			return nil, ErrGatewayNativeIdentity
 		}
