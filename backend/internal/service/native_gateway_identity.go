@@ -473,8 +473,8 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		return noop, ErrGatewayNativeIdentity
 	}
 	if state.route.Profile == GatewayOpenRouterResponsesProfile && !gatewayOpenRouterModelsAllow(catalogue, state.route.Model, state.requestedModel, payload) {
-		gatewayNativeCatalogAdmissionDiagnostic(catalogue)
 		release()
+		gatewayNativeCatalogAdmissionDiagnostic(catalogue)
 		return noop, ErrGatewayNativeIdentity
 	}
 	// The ONLY decode boundary. The row stays encrypted, and no plaintext enters
