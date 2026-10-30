@@ -42,7 +42,7 @@ func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 				return fmt.Errorf("分页和统计范围不同")
 			}
 			// 允许模型映射子字段投影，禁止读取完整 credentials。
-			projected := strings.ReplaceAll(actual, `"accounts"."credentials"->'model_mapping' AS model_mapping`, "model_mapping")
+			projected := strings.ReplaceAll(actual[:strings.Index(actual, " FROM ")], `"accounts"."credentials"->'model_mapping' AS model_mapping`, "model_mapping")
 			if strings.Contains(projected, `"credentials"`) || strings.Contains(projected, `"extra"`) {
 				return fmt.Errorf("读取了敏感字段")
 			}
@@ -97,7 +97,7 @@ func TestScopedAdminAccountListPostgresRulesAndPagination(t *testing.T) {
 	_, err = db.Exec(`CREATE TABLE accounts (
 		id BIGINT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', notes TEXT, platform TEXT NOT NULL,
 		type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', schedulable BOOLEAN NOT NULL DEFAULT true,
-		concurrency INT NOT NULL DEFAULT 1, priority INT NOT NULL DEFAULT 1, credentials JSONB DEFAULT '{}', deleted_at TIMESTAMPTZ
+		concurrency INT NOT NULL DEFAULT 1, priority INT NOT NULL DEFAULT 1, credentials JSONB DEFAULT '{}', extra JSONB DEFAULT '{}', deleted_at TIMESTAMPTZ
 	);
 	CREATE TABLE account_groups(account_id BIGINT, group_id BIGINT, priority INT DEFAULT 50, created_at TIMESTAMPTZ DEFAULT NOW());
 	INSERT INTO accounts(id,platform,type) VALUES
@@ -145,6 +145,24 @@ func TestScopedAdminAccountListPostgresRulesAndPagination(t *testing.T) {
 	_, total, err = repo.ScopedAdminList(ctx, pagination.DefaultPagination(), "", "", "", "")
 	require.NoError(t, err)
 	require.EqualValues(t, 4, total)
+
+	// Protected identities remain hidden even when ungrouped Grok OAuth rows match the policy.
+	_, err = db.Exec(`INSERT INTO accounts(id,platform,type) VALUES (100,'grok','oauth')`)
+	require.NoError(t, err)
+	for i, marker := range []string{
+		service.GatewayGenerationExtraKey, service.GatewayProfileExtraKey, service.GatewayCredentialScopeExtraKey,
+		"gateway_claude_generation_v1", "gateway_claude_profile_v1", "gateway_claude_scope_v1",
+		"gateway_grok_generation_v1", "gateway_grok_profile_v1", "gateway_grok_scope_v1",
+	} {
+		_, err = db.Exec(`INSERT INTO accounts(id,platform,type,extra) VALUES ($1,'grok','oauth',jsonb_build_object($2::text,NULL))`, 101+i, marker)
+		require.NoError(t, err)
+	}
+	principal.Policy.Rules = []adminaccess.Rule{{Permissions: []string{"accounts.read"}, Platforms: []string{"grok"}, AccountTypes: []string{"oauth"}, AllGroups: true, IncludeUngrouped: true}}
+	rows, total, err = repo.ScopedAdminList(ctx, pagination.PaginationParams{Page: 1, PageSize: 1}, "", "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, rows, 1)
+	require.EqualValues(t, 100, rows[0].ID)
 }
 
 func TestScopedAdminCodexCandidatesQueryIsBounded(t *testing.T) {
@@ -170,7 +188,7 @@ func TestScopedAdminCodexCandidatesQueryIsBounded(t *testing.T) {
 
 func TestScopedAdminCodexCandidatesUseCredentialWriteScope(t *testing.T) {
 	db := scopedAdminKeyTestDB(t)
-	_, err := db.Exec(`CREATE TABLE accounts(id BIGINT PRIMARY KEY,platform TEXT,type TEXT,credentials JSONB DEFAULT '{}',deleted_at TIMESTAMPTZ);
+	_, err := db.Exec(`CREATE TABLE accounts(id BIGINT PRIMARY KEY,platform TEXT,type TEXT,credentials JSONB DEFAULT '{}',extra JSONB DEFAULT '{}',deleted_at TIMESTAMPTZ);
  CREATE TABLE account_groups(account_id BIGINT,group_id BIGINT);
  INSERT INTO accounts(id,platform,type,credentials) VALUES
  (1,'openai','oauth','{"access_token":"inside"}'),(2,'openai','oauth','{"access_token":"outside"}'),
@@ -201,7 +219,7 @@ func TestScopedAdminCodexCandidatesUseCredentialWriteScope(t *testing.T) {
 
 func TestScopedAdminCodexCandidatesMatchIdentityWithoutLoadingUnrelatedCredentials(t *testing.T) {
 	db := scopedAdminKeyTestDB(t)
-	_, err := db.Exec(`CREATE TABLE accounts(id BIGINT PRIMARY KEY,platform TEXT,type TEXT,credentials JSONB DEFAULT '{}',deleted_at TIMESTAMPTZ);
+	_, err := db.Exec(`CREATE TABLE accounts(id BIGINT PRIMARY KEY,platform TEXT,type TEXT,credentials JSONB DEFAULT '{}',extra JSONB DEFAULT '{}',deleted_at TIMESTAMPTZ);
  CREATE TABLE account_groups(account_id BIGINT,group_id BIGINT);
  INSERT INTO accounts(id,platform,type,credentials) VALUES
  (1,'openai','oauth','{"chatgpt_account_id":"workspace","chatgpt_user_id":"member","access_token":"old","refresh_token":"must-not-load","large_extra":"must-not-load"}'),
@@ -211,7 +229,7 @@ func TestScopedAdminCodexCandidatesMatchIdentityWithoutLoadingUnrelatedCredentia
  (5,'openai','oauth','{"email":" Test@Example.COM ","access_token":"email-only"}'),
  (6,'openai','oauth','{"chatgpt_account_id":"elsewhere","chatgpt_user_id":"member","email":"test@example.com","access_token":"different-workspace"}'),
  (7,'openai','oauth','{"chatgpt_account_id":123.00,"chatgpt_user_id":9007199254740993,"access_token":"numeric-legacy"}');
- INSERT INTO accounts SELECT id,'openai','oauth',jsonb_build_object('access_token','unrelated-'||id,'refresh_token',repeat('x',8192)),NULL FROM generate_series(100,1100) AS id;`)
+ INSERT INTO accounts(id,platform,type,credentials,deleted_at) SELECT id,'openai','oauth',jsonb_build_object('access_token','unrelated-'||id,'refresh_token',repeat('x',8192)),NULL FROM generate_series(100,1100) AS id;`)
 	require.NoError(t, err)
 	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
 	repo := newAccountRepositoryWithSQL(client, db, nil)
@@ -247,7 +265,7 @@ func TestScopedAdminCodexCandidatesMatchIdentityWithoutLoadingUnrelatedCredentia
 		})
 	}
 	// 同一身份有大量旧副本时仍只取 ID 最大者；首尾 Unicode 空白与导入器一致。
-	_, err = db.Exec(`INSERT INTO accounts SELECT id,'openai','oauth',jsonb_build_object('chatgpt_account_id', E'\tworkspace　','chatgpt_user_id','member','access_token','duplicate','refresh_token',repeat('x',8192)),NULL FROM generate_series(2000,3000) AS id;`)
+	_, err = db.Exec(`INSERT INTO accounts(id,platform,type,credentials,deleted_at) SELECT id,'openai','oauth',jsonb_build_object('chatgpt_account_id', E'\tworkspace　','chatgpt_user_id','member','access_token','duplicate','refresh_token',repeat('x',8192)),NULL FROM generate_series(2000,3000) AS id;`)
 	require.NoError(t, err)
 	rows, err := repo.ScopedAdminCodexCandidates(ctx, service.ScopedCodexIdentity{AccountID: "workspace", UserID: "member"})
 	require.NoError(t, err)
