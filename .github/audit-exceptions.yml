@@ -28,3 +28,24 @@ exceptions:
     mitigation: "No zero-size custom generators in codebase; upgrade when nanoid releases fix"
     expires_on: "2026-10-13"
     owner: "security@your-domain"
+  - package: vue-i18n
+    advisory: "GHSA-83rm-6c8r-g728"
+    severity: high
+    reason: "No patched release exists yet. The advisory needs the escapeParameter option, which this app does not use; translation messages are static bundled strings"
+    mitigation: "Do not enable escapeParameter; bump vue-i18n once a fixed version is published"
+    expires_on: "2026-12-31"
+    owner: "security@your-domain"
+  - package: @intlify/shared
+    advisory: "GHSA-83rm-6c8r-g728"
+    severity: high
+    reason: "No patched release exists yet. The advisory needs the escapeParameter option, which this app does not use; translation messages are static bundled strings"
+    mitigation: "Do not enable escapeParameter; bump vue-i18n once a fixed version is published"
+    expires_on: "2026-12-31"
+    owner: "security@your-domain"
+  - package: @intlify/core-base
+    advisory: "GHSA-83rm-6c8r-g728"
+    severity: high
+    reason: "No patched release exists yet. The advisory needs the escapeParameter option, which this app does not use; translation messages are static bundled strings"
+    mitigation: "Do not enable escapeParameter; bump vue-i18n once a fixed version is published"
+    expires_on: "2026-12-31"
+    owner: "security@your-domain"
