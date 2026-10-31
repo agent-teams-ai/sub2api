@@ -297,10 +297,13 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			}
 		case "reasoning":
 			keys := []string{"type", "id", "summary", "encrypted_content", "status"}
-			// MiniMax returns clear reasoning content in its Responses output.
-			// Accept that exact text-only shape on subsequent full-history turns;
-			// keep it opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile {
+			// MiniMax and the open reasoning models served through OpenRouter
+			// return clear reasoning content in their Responses output. Clients
+			// replay output items unchanged on the next turn, so a text-only
+			// reasoning_text content part must be accepted there; without it
+			// every multi-turn review on such a model was refused at input
+			// admission. It stays opaque through the existing client-tool codec.
+			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile {
 				keys = append(keys, "content")
 			}
 			fields, ok = gatewayClaudeObject(raw, keys...)
