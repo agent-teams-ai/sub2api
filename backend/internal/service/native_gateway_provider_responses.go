@@ -306,6 +306,12 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile {
 				keys = append(keys, "content")
 			}
+			// OpenRouter tags every reasoning item with the format of its
+			// reasoning data (observed in production: a replayed item with this
+			// key was the only thing refused at input admission).
+			if profile == GatewayOpenRouterResponsesProfile {
+				keys = append(keys, "format")
+			}
 			fields, ok = gatewayClaudeObject(raw, keys...)
 			if !ok {
 				return false
@@ -323,6 +329,9 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 				}
 			}
 			if value := fields["encrypted_content"]; value != nil && !gatewayNativeProviderString(value) {
+				return false
+			}
+			if value := fields["format"]; value != nil && !gatewayNativeProviderString(value) {
 				return false
 			}
 			if summary := fields["summary"]; summary != nil {

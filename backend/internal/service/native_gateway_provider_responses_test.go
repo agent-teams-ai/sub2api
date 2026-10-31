@@ -294,13 +294,16 @@ func TestGatewayNativeOpenRouterAcceptsReplayedReasoningText(t *testing.T) {
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"deep thought"}]}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"s"}],"content":[{"type":"reasoning_text","text":"t"}],"encrypted_content":"abc","status":"completed"}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[]}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"t"}],"format":"unknown"}]`,
 	}
 	for _, raw := range accepted {
 		require.True(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
 	}
 	// Everything else stays strict: unknown keys, null values, other part types.
 	rejected := []string{
-		`[{"type":"reasoning","id":"rs_1","summary":[],"format":"unknown"}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"format":null}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"format":7}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"signature":"x"}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":null}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"input_text","text":"x"}]}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"x","extra":1}]}]`,
@@ -309,6 +312,7 @@ func TestGatewayNativeOpenRouterAcceptsReplayedReasoningText(t *testing.T) {
 	for _, raw := range rejected {
 		require.False(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
 	}
-	// A profile that never returned reasoning content still refuses it.
+	// A profile that never returned reasoning content or a format still refuses them.
 	require.False(t, gatewayNativeProviderTextInput(GatewayKimiCodeResponsesProfile, []byte(accepted[0])))
+	require.False(t, gatewayNativeProviderTextInput(GatewayKimiCodeResponsesProfile, []byte(accepted[3])))
 }
