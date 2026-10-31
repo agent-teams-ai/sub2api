@@ -269,10 +269,23 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			if json.Unmarshal(fields["content"], &parts) != nil {
 				return false
 			}
+			partKeys := []string{"type", "text", "annotations"}
+			// OpenRouter returns an empty logprobs array on every output_text
+			// part and a client replays the item unchanged (confirmed in
+			// production: the only refused item of a replayed history).
+			if profile == GatewayOpenRouterResponsesProfile {
+				partKeys = append(partKeys, "logprobs")
+			}
 			for _, raw := range parts {
-				part, ok := gatewayClaudeObject(raw, "type", "text", "annotations")
+				part, ok := gatewayClaudeObject(raw, partKeys...)
 				if !ok || (string(part["type"]) != `"input_text"` && string(part["type"]) != `"output_text"`) || json.Unmarshal(part["text"], &text) != nil {
 					return false
+				}
+				if logprobs := part["logprobs"]; logprobs != nil {
+					var entries []json.RawMessage
+					if json.Unmarshal(logprobs, &entries) != nil {
+						return false
+					}
 				}
 			}
 		case "function_call", "custom_tool_call":
@@ -297,11 +310,20 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			}
 		case "reasoning":
 			keys := []string{"type", "id", "summary", "encrypted_content", "status"}
-			// MiniMax returns clear reasoning content in its Responses output.
-			// Accept that exact text-only shape on subsequent full-history turns;
-			// keep it opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile {
+			// MiniMax and the open reasoning models served through OpenRouter
+			// return clear reasoning content in their Responses output. Clients
+			// replay output items unchanged on the next turn, so a text-only
+			// reasoning_text content part must be accepted there; without it
+			// every multi-turn review on such a model was refused at input
+			// admission. It stays opaque through the existing client-tool codec.
+			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile {
 				keys = append(keys, "content")
+			}
+			// OpenRouter tags every reasoning item with the format of its
+			// reasoning data (observed in production: a replayed item with this
+			// key was the only thing refused at input admission).
+			if profile == GatewayOpenRouterResponsesProfile {
+				keys = append(keys, "format")
 			}
 			fields, ok = gatewayClaudeObject(raw, keys...)
 			if !ok {
@@ -320,6 +342,9 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 				}
 			}
 			if value := fields["encrypted_content"]; value != nil && !gatewayNativeProviderString(value) {
+				return false
+			}
+			if value := fields["format"]; value != nil && !gatewayNativeProviderString(value) {
 				return false
 			}
 			if summary := fields["summary"]; summary != nil {

@@ -284,3 +284,47 @@ func TestGatewayProviderResponsesNamespaceGuards(t *testing.T) {
 	}
 	require.ErrorIs(t, ValidateGatewayNativeProviderResponsesBounded(GatewayKimiCodeResponsesProfile, payload(tools, "text", map[string]any{"type": "function", "name": "missing", "namespace": "functions"}), 32768), ErrGatewayNativeIdentity)
 }
+
+// Clients replay the previous output items unchanged on the next turn. Open
+// reasoning models served through OpenRouter put their text in a reasoning
+// item's content, which used to be refused at input admission (a 502 for the
+// whole review).
+func TestGatewayNativeOpenRouterAcceptsReplayedReasoningText(t *testing.T) {
+	accepted := []string{
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"deep thought"}]}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"s"}],"content":[{"type":"reasoning_text","text":"t"}],"encrypted_content":"abc","status":"completed"}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[]}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"t"}],"format":"unknown"}]`,
+	}
+	for _, raw := range accepted {
+		require.True(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
+	}
+	// Everything else stays strict: unknown keys, null values, other part types.
+	rejected := []string{
+		`[{"type":"reasoning","id":"rs_1","summary":[],"format":null}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"format":7}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"signature":"x"}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":null}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"input_text","text":"x"}]}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"x","extra":1}]}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":null}]`,
+	}
+	for _, raw := range rejected {
+		require.False(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
+	}
+	// The assistant message OpenRouter returns carries an empty logprobs array per
+	// output_text part; replayed unchanged it must pass, other shapes must not.
+	message := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":[]}]}]`
+	require.True(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(message)))
+	for _, raw := range []string{
+		`[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":"x"}]}]`,
+		`[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":null}]}]`,
+		`[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"extra":[]}]}]`,
+	} {
+		require.False(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
+	}
+	require.False(t, gatewayNativeProviderTextInput(GatewayKimiCodeResponsesProfile, []byte(message)))
+	// A profile that never returned reasoning content or a format still refuses them.
+	require.False(t, gatewayNativeProviderTextInput(GatewayKimiCodeResponsesProfile, []byte(accepted[0])))
+	require.False(t, gatewayNativeProviderTextInput(GatewayKimiCodeResponsesProfile, []byte(accepted[3])))
+}
