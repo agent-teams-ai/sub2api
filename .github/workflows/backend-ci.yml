@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   shell:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -46,6 +48,7 @@ jobs:
         working-directory: backend
         run: make test-unit
       - name: Integration tests
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
         working-directory: backend
         run: make test-integration
 
