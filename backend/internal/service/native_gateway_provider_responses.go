@@ -269,10 +269,23 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			if json.Unmarshal(fields["content"], &parts) != nil {
 				return false
 			}
+			partKeys := []string{"type", "text", "annotations"}
+			// OpenRouter returns an empty logprobs array on every output_text
+			// part and a client replays the item unchanged (confirmed in
+			// production: the only refused item of a replayed history).
+			if profile == GatewayOpenRouterResponsesProfile {
+				partKeys = append(partKeys, "logprobs")
+			}
 			for _, raw := range parts {
-				part, ok := gatewayClaudeObject(raw, "type", "text", "annotations")
+				part, ok := gatewayClaudeObject(raw, partKeys...)
 				if !ok || (string(part["type"]) != `"input_text"` && string(part["type"]) != `"output_text"`) || json.Unmarshal(part["text"], &text) != nil {
 					return false
+				}
+				if logprobs := part["logprobs"]; logprobs != nil {
+					var entries []json.RawMessage
+					if json.Unmarshal(logprobs, &entries) != nil {
+						return false
+					}
 				}
 			}
 		case "function_call", "custom_tool_call":
