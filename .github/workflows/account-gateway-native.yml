@@ -1,6 +1,7 @@
 name: Account gateway native qualification
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'backend/**'
       - '.github/workflows/account-gateway-native.yml'
@@ -12,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   native:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     services:
       postgres:

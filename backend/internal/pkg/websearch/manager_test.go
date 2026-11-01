@@ -1,9 +1,12 @@
 package websearch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -300,6 +303,43 @@ func TestNewHTTPClient_InvalidProxy(t *testing.T) {
 	_, err := newHTTPClient("://bad-url")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid proxy URL")
+}
+
+func TestManagerInvalidProxyLogsExcludeCredentials(t *testing.T) {
+	const raw = "http://proxy-user-marker:proxy-password-marker@%:8080"
+	for _, accountProxy := range []bool{true, false} {
+		name := "provider"
+		if accountProxy {
+			name = "account"
+		}
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			cfg := ProviderConfig{Type: "brave", APIKey: "test"}
+			req := SearchRequest{Query: "test"}
+			if accountProxy {
+				req.ProxyURL = raw
+			} else {
+				cfg.ProxyURL = raw
+			}
+			m := NewManager([]ProviderConfig{cfg}, nil)
+			_, _, err := m.SearchWithBestProvider(context.Background(), req)
+			require.Error(t, err)
+			if accountProxy {
+				require.True(t, errors.Is(err, ErrProxyUnavailable))
+				require.Contains(t, logs.String(), "account proxy error, aborting failover")
+			} else {
+				require.Contains(t, err.Error(), "no available provider")
+				require.Contains(t, logs.String(), "provider proxy error, trying next provider")
+			}
+			for _, secret := range []string{"proxy-user-marker", "proxy-password-marker"} {
+				require.NotContains(t, logs.String(), secret)
+				require.NotContains(t, err.Error(), secret)
+			}
+		})
+	}
 }
 
 func TestNewHTTPClient_ValidHTTPProxy(t *testing.T) {

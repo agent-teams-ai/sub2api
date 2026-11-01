@@ -385,8 +385,8 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 		return nil, ErrGatewayNativeEffectUnknown
 	}
 	idle, _ := ctx.Value(gatewayNativeProviderReadIdleKey{}).(time.Duration)
-	if idle <= 0 || idle > gatewayNativeUpstreamReadIdle {
-		idle = gatewayNativeUpstreamReadIdle
+	if idle <= 0 || idle > GatewayNativeProviderReadIdle {
+		idle = GatewayNativeProviderReadIdle
 	}
 	reader := &gatewayNativeIdleReader{reader: response.Body, idle: idle, cancel: cancel}
 	scanner := bufio.NewScanner(io.LimitReader(reader, gatewayNativeResponseLimit+1))

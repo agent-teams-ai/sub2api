@@ -184,7 +184,7 @@ func Run(ctx context.Context, options Options) error {
 	tcfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, Authorize: auth,
 		Enrollment: gatewaytransport.Enrollment{OriginRef: origin, EngineIncarnation: inc, QualificationRef: c.Profile.QualificationRef},
 		Profile:    c.qualifiedProfile(), CodingPlans: c.codingPlanProfiles(), Grok: c.grokProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
-		IOTimeout: 30 * time.Second, ProviderReadIdle: 30 * time.Second, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
+		IOTimeout: 30 * time.Second, ProviderReadIdle: service.GatewayNativeProviderReadIdle, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
 	var oauth *privateOAuth
 	if c.OAuth != nil || c.Claude != nil || c.Grok != nil || len(c.CodingPlans) > 0 || c.OpenRouter != nil {
 		owners := options.OAuthOwnerAuthority
