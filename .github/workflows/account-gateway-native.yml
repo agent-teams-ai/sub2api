@@ -52,6 +52,7 @@ jobs:
         run: |
           set -o pipefail
           docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_oauth_test_ci
+          go test -tags unit ./internal/service ./internal/handler/admin -run 'TestGatewayAccountAdmissionUsesStockCodexPolicy|TestGatewayAccountLimitsPrivateHTTPContract' -count=1
           go test -tags unit ./internal/service ./internal/repository ./internal/handler/admin -run GatewayNative -skip '^TestGatewayNativeReviewReasoningRealRedis$' -count=1 -v | tee "$RUNNER_TEMP/native-boundary.log"
           test "$(grep -c '^--- PASS: TestGatewayNativeOAuthRealRedisGuards ' "$RUNNER_TEMP/native-boundary.log")" -eq 1
           ! grep -Eq '^--- SKIP: TestGatewayNativeOAuthRealRedisGuards([[:space:]]|$)' "$RUNNER_TEMP/native-boundary.log"
