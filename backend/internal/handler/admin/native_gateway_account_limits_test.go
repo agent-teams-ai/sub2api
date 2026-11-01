@@ -78,6 +78,16 @@ func TestGatewayAccountLimitsPrivateHTTPContract(t *testing.T) {
 	require.Equal(t, "private, no-store", out.Header().Get("Cache-Control"))
 	require.Equal(t, 2, store.reads)
 	require.Zero(t, store.writes)
+	// Admission shares the same authenticated logical selector and fences; no
+	// raw IDs, quota refresh or provider dispatch are introduced by this route.
+	require.Equal(t, http.StatusForbidden, request("POST", "/private/native/v1/account-admission/read", input, "").Code)
+	require.Equal(t, http.StatusBadRequest, request("POST", "/private/native/v1/account-admission/read", input[:len(input)-1]+`,"nativeAccountId":1}`, "Bearer fixture-control").Code)
+	admission := request("POST", "/private/native/v1/account-admission/read", input, "Bearer fixture-control")
+	require.Equal(t, http.StatusOK, admission.Code)
+	require.JSONEq(t, `{"status":"unknown"}`, admission.Body.String())
+	require.Equal(t, 4, store.reads)
+	require.Zero(t, store.writes)
+
 	cap := request("GET", "/private/native/v1/account-limits/capabilities", "", "Bearer fixture-control")
 	var capabilities service.GatewayAccountLimitsCapabilities
 	require.NoError(t, json.Unmarshal(cap.Body.Bytes(), &capabilities))

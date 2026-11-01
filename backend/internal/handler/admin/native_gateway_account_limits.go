@@ -45,6 +45,16 @@ func RegisterGatewayAccountLimitsRoutes(group *gin.RouterGroup, reader *service.
 		}
 		c.JSON(http.StatusOK, reader.Read(c.Request.Context(), in))
 	})
+	group.POST("/private/native/v1/account-admission/read", authorize, func(c *gin.Context) {
+		c.Header("Cache-Control", "private, no-store")
+		data, err := io.ReadAll(io.LimitReader(c.Request.Body, 4097))
+		in, valid := DecodeGatewayAccountLimitsInput(data)
+		if err != nil || !valid {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "account_admission_unavailable"})
+			return
+		}
+		c.JSON(http.StatusOK, reader.ReadAdmission(c.Request.Context(), in))
+	})
 	return nil
 }
 
