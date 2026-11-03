@@ -613,11 +613,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 	upstreamBodyShape := ""
 	upstreamBodyPrefix := ""
 	readErrorReason := ""
+	var rateLimit *gatewayNativeRateLimitDiagnostic
 	fail := func(phase gatewayNativeResponseFailurePhase) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			phase = gatewayNativeFailureDeadline
 		}
 		event := struct {
+			RateLimit               *gatewayNativeRateLimitDiagnostic `json:"rate_limit,omitempty"`
 			Event                   string                            `json:"event"`
 			Phase                   gatewayNativeResponseFailurePhase `json:"phase"`
 			HTTPStatus              int                               `json:"http_status,omitempty"`
@@ -633,7 +635,7 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 			UpstreamMediaCategory   string                            `json:"upstream_media_category,omitempty"`
 			UpstreamBodyShape       string                            `json:"upstream_body_shape,omitempty"`
 			UpstreamBodyPrefix      string                            `json:"upstream_body_prefix,omitempty"`
-		}{Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
+		}{RateLimit: rateLimit, Event: "gateway_native_response_failure", Phase: phase, ProviderErrorCategory: providerErrorCategory, ProviderErrorShape: providerErrorShape, ProviderErrorParameter: providerErrorParameter}
 		if phase == gatewayNativeFailureTransport {
 			event.TransportErrorReason = gatewayNativeTransportErrorReason(transportError)
 			event.UpstreamConnection = transport.connectionKind()
@@ -685,6 +687,10 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		captureGatewayGrokPassiveLimits(ctx, resp.Header)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			diagnostic := gatewayNativeRateLimitEvidence(resp.Body, resp.Header)
+			rateLimit = &diagnostic
+		}
 		// HTTP400 diagnostics never export vendor content or alter settlement.
 		if resp.StatusCode == http.StatusBadRequest {
 			diagnostic := gatewayNativeHTTPErrorCategory(resp.Body, resp.Header.Get("Content-Encoding"))
