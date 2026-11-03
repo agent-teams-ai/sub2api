@@ -309,7 +309,7 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 		{name: "http400 schema message not exact", status: 400, phase: "http_status", category: "unknown", shape: "root_error_object", parameter: "other", wire: `{"error":{"code":"responses_feature_not_supported","message":"text.format type 'json_schema' is not supported, only 'text' and 'json_object' are allowed. private-unrecognized","param":""}}`},
 		{name: "http400 bound", status: 400, phase: "http_status", category: "body_limit", wire: strings.Repeat(sentinel, 1024)},
 		{name: "http401", status: 401, phase: "http_status", unread: true, wire: sentinel},
-		{name: "http429", status: 429, phase: "http_status", unread: true, wire: sentinel},
+		{name: "http429", status: 429, phase: "http_status", wire: sentinel},
 		{name: "out of range status", status: 999, phase: "http_status", unread: true, wire: sentinel},
 		{name: "transport", phase: "transport", transportErr: errors.New(sentinel), transportReason: "other"},
 		{name: "transport entered wrapped EOF", phase: "transport", transportErr: fmt.Errorf("%s: %w", sentinel, io.EOF), transportReason: "eof", outputCap: 4096},
@@ -415,6 +415,10 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 			if tc.status == 400 || tc.mediaCategory == "json" || tc.mediaCategory == "missing" {
 				require.LessOrEqual(t, body.bytesRead, 8193, "diagnostic body read is bounded")
 			}
+			if tc.status == 429 {
+				require.Positive(t, body.reads, "rate limit diagnostics inspect the existing failing response")
+				require.LessOrEqual(t, body.bytesRead, 16385, "rate limit body read is bounded")
+			}
 			if tc.unread {
 				require.Zero(t, body.reads, "a rejected response must not be consumed")
 			}
@@ -448,6 +452,11 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 				require.EqualValues(t, tc.status, event["http_status"])
 			} else {
 				require.NotContains(t, event, "http_status")
+			}
+			if tc.status == 429 {
+				require.Equal(t, map[string]any{}, event["rate_limit"], "unrecognized provider text supplies no diagnostic fields")
+			} else {
+				require.NotContains(t, event, "rate_limit")
 			}
 			if tc.category != "" {
 				require.Equal(t, tc.category, event["provider_error_category"])
