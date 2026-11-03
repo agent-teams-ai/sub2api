@@ -690,6 +690,13 @@ func (s *OpenAIGatewayService) forwardGatewayNativeResponses(ctx context.Context
 		if resp.StatusCode == http.StatusTooManyRequests {
 			diagnostic := gatewayNativeRateLimitEvidence(resp.Body, resp.Header)
 			rateLimit = &diagnostic
+			if a.Extra[GatewayProfileExtraKey] == GatewayOpenRouterResponsesProfile {
+				if quota := gatewayNativeConfirmedProviderQuota(diagnostic); quota != nil {
+					if observe, ok := ctx.Value(gatewayNativeProviderQuotaObserverKey{}).(func(GatewayNativeProviderQuota)); ok {
+						observe(*quota)
+					}
+				}
+			}
 		}
 		// HTTP400 diagnostics never export vendor content or alter settlement.
 		if resp.StatusCode == http.StatusBadRequest {

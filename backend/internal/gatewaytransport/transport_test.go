@@ -178,6 +178,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	var entries, admits atomic.Int32
 	const dynamicOpenRouterModel = "unseen-vendor/new-model:free"
 	var driftAfterAdmit atomic.Bool
+	var quotaResponse atomic.Bool
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/models" {
 			require.Empty(t, r.Header.Get("Authorization"))
@@ -185,6 +186,15 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			return
 		}
 		entries.Add(1)
+		if quotaResponse.Load() {
+			time.Sleep(150 * time.Millisecond)
+			w.Header().Set("X-RateLimit-Limit", "1000")
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", "1793750400000")
+			w.WriteHeader(429)
+			_, _ = io.WriteString(w, `{"error":{"message":"PRIVATE_QUOTA_SENTINEL"}}`)
+			return
+		}
 		var payload map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
 		if r.Host == "api.kimi.ai" || r.Host == "api.z.ai" || r.Host == "api.minimax.io" {
@@ -384,6 +394,29 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	}
 	require.EqualValues(t, 8, admits.Load())
 	require.EqualValues(t, 8, entries.Load())
+	quotaResponse.Store(true)
+	h.cfg.IOTimeout = 50 * time.Millisecond
+	quotaInput := inputs[1]
+	quotaInput.RequestRef = "openrouter-confirmed-quota"
+	encodedQuota, err := json.Marshal(quotaInput)
+	require.NoError(t, err)
+	quotaRequest, err := http.NewRequest(http.MethodPost, server.URL+transportsPath, bytes.NewReader(encodedQuota))
+	require.NoError(t, err)
+	quotaRequest.Header.Set("Content-Type", "application/json")
+	quotaRequest.Header.Set("Authorization", "Bearer "+fixtureExecutionToken)
+	quotaReply, err := server.Client().Do(quotaRequest)
+	require.NoError(t, err)
+	require.Equal(t, 502, quotaReply.StatusCode)
+	require.Equal(t, quotaInput.RequestRef, quotaReply.Header.Get("X-Gateway-Request-Ref"))
+	require.Equal(t, "1000", quotaReply.Header.Get("X-Gateway-Provider-Quota-Limit"))
+	require.Equal(t, "0", quotaReply.Header.Get("X-Gateway-Provider-Quota-Remaining"))
+	require.Equal(t, "2026-11-04T00:00:00.000Z", quotaReply.Header.Get("X-Gateway-Provider-Quota-Reset-At"))
+	quotaBody, err := io.ReadAll(quotaReply.Body)
+	require.NoError(t, err)
+	require.NoError(t, quotaReply.Body.Close())
+	require.NotContains(t, string(quotaBody), "PRIVATE_QUOTA_SENTINEL")
+	quotaResponse.Store(false)
+	h.cfg.IOTimeout = 5 * time.Second
 	// A valid ingress tuple cannot survive a stored cross-profile endpoint
 	// change while the sole admit callback is in flight. Forward rechecks it.
 	driftAfterAdmit.Store(true)
@@ -391,8 +424,8 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	stale.RequestRef = "openrouter-stale-tuple"
 	result := ownerPOST(server.Client(), server.URL, "", fixtureExecutionToken, stale)
 	require.NoError(t, result.err)
-	require.EqualValues(t, 9, admits.Load())
-	require.EqualValues(t, 8, entries.Load())
+	require.EqualValues(t, 10, admits.Load())
+	require.EqualValues(t, 9, entries.Load())
 	require.NotContains(t, string(result.body), "controlled final")
 }
 

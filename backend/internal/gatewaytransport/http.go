@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -271,9 +272,20 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 	}
 	c, _ := gin.CreateTestContext(raw)
 	c.Writer = &privateGinWriter{ResponseWriter: c.Writer, raw: raw, renewWriteDeadline: renewWriteDeadline}
+	ctx = service.WithGatewayNativeProviderQuotaObserver(ctx, func(quota service.GatewayNativeProviderQuota) {
+		if c.Writer.Written() || renewWriteDeadline() != nil {
+			return
+		}
+		raw.Header().Set("X-Gateway-Provider-Quota-Limit", strconv.FormatInt(quota.Limit, 10))
+		raw.Header().Set("X-Gateway-Provider-Quota-Remaining", "0")
+		raw.Header().Set("X-Gateway-Provider-Quota-Reset-At", quota.ResetAt)
+		c.Writer.WriteHeader(http.StatusBadGateway)
+		c.Writer.WriteHeaderNow()
+	})
 	c.Request = r.Clone(ctx)
 	raw.Header().Set("X-Gateway-Request-Ref", input.RequestRef)
 	_, _, _ = h.cfg.Gateway.ForwardGatewayRoute(ctx, c, input.Descriptor, payload)
+
 	// Service observation records forward return/physical Close and terminal
 	// delivery. HTTP completion itself never acknowledges kernel settlement.
 	h.mu.Lock()
