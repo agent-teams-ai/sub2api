@@ -512,6 +512,10 @@ func TestGatewayNativeResponsesFailureDiagnostics(t *testing.T) {
 				}
 			}
 			for field := range event {
+				if field == "rate_limit" {
+					require.Equal(t, 429, tc.status)
+					continue
+				}
 				require.Contains(t, append([]string{"event", "phase", "http_status", "provider_error_category", "provider_error_shape", "provider_error_parameter", "read_error_reason", "upstream_media_category", "upstream_body_shape", "upstream_body_prefix"}, transportFields...), field)
 			}
 			for _, private := range []string{sentinel, "gateway native output limit", "sandbox-fixture", "99999999-9999-4999-8999-999999999999", "http://127.0.0.1", "account_id"} {
