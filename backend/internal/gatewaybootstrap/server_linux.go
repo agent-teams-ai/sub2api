@@ -347,6 +347,11 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			panic("invalid private account models composition")
 		}
 	}
+	if oauth != nil && oauth.limitsRefresh != nil {
+		if admin.RegisterGatewayAccountLimitsRefreshRoutes(router.Group(""), oauth.limitsRefresh, authorizeCandidate) != nil {
+			panic("invalid private account limits refresh composition")
+		}
+	}
 	if oauth != nil && oauth.limits != nil {
 		if admin.RegisterGatewayAccountLimitsRoutes(router.Group(""), oauth.limits, authorizeCandidate) != nil {
 			panic("invalid private account limits composition")
@@ -564,13 +569,13 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			return
 		}
 		switch {
-		case oauth != nil && (oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/capabilities" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/capabilities"):
+		case oauth != nil && (oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh-capabilities" || oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/capabilities" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/capabilities"):
 			if r.Method != http.MethodGet {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
 			}
 			management.ServeHTTP(w, r)
-		case oauth != nil && (oauth.models != nil && r.URL.Path == "/private/native/v1/account-models/read" || oauth.limits != nil && (r.URL.Path == "/private/native/v1/account-limits/read" || r.URL.Path == "/private/native/v1/account-admission/read") || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
+		case oauth != nil && (oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh" || oauth.models != nil && r.URL.Path == "/private/native/v1/account-models/read" || oauth.limits != nil && (r.URL.Path == "/private/native/v1/account-limits/read" || r.URL.Path == "/private/native/v1/account-admission/read") || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
@@ -764,16 +769,17 @@ type NativeOAuthCleanupAuthority interface {
 }
 
 type privateOAuth struct {
-	connect  *service.GatewayNativeOAuthConnect
-	dispatch *service.GatewayNativeOAuthDispatch
-	owners   NativeOAuthOwnerAuthority
-	refresh  *service.GatewayNativeOAuthRefresh
-	cleanup  service.GatewayNativeOAuthCleanupAuthorizer
-	limits   *service.GatewayAccountLimitsReader
-	models   *service.GatewayAccountModelsReader
-	claude   *service.GatewayNativeClaudeOAuth
-	grok     *service.GatewayNativeGrokOAuth
-	limitsV2 *service.GatewayAccountLimitsReaderV2
+	connect       *service.GatewayNativeOAuthConnect
+	dispatch      *service.GatewayNativeOAuthDispatch
+	owners        NativeOAuthOwnerAuthority
+	refresh       *service.GatewayNativeOAuthRefresh
+	cleanup       service.GatewayNativeOAuthCleanupAuthorizer
+	limitsRefresh *service.GatewayAccountLimitsRefresher
+	limits        *service.GatewayAccountLimitsReader
+	models        *service.GatewayAccountModelsReader
+	claude        *service.GatewayNativeClaudeOAuth
+	grok          *service.GatewayNativeGrokOAuth
+	limitsV2      *service.GatewayAccountLimitsReaderV2
 }
 
 func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *service.GatewayNativeCredentialCustody, cfg *OAuthConfig, owners NativeOAuthOwnerAuthority) (*privateOAuth, error) {
@@ -860,6 +866,23 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 		}
 	}
 	out := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup, limits: limits}
+	if limits != nil {
+		source, sourceOK := repo.(service.GatewayAccountLimitsRepository)
+		authority, authorityOK := owners.(NativeAccountLimitsAuthority)
+		if !sourceOK || !authorityOK {
+			return nil, ErrDenied
+		}
+		out.limitsRefresh, err = service.NewGatewayAccountLimitsRefresher(dispatch, source, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+			consumer, e := service.GatewayNativeConsumer(ctx)
+			if e != nil {
+				return service.GatewayNativeRoute{}, ErrDenied
+			}
+			return authority.AuthorizeNativeAccountLimits(ctx, consumer, in)
+		})
+		if err != nil {
+			return nil, ErrDenied
+		}
+	}
 	return out, nil
 }
 
