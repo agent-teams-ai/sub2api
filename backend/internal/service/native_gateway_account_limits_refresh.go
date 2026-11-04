@@ -147,7 +147,7 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountLimits(ctx context.Context, a *
 	if response.Body == nil {
 		return invalid()
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != chatGPTUsageURL {
 		return invalid()
 	}

@@ -867,8 +867,11 @@ func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *se
 	}
 	out := &privateOAuth{connect: connect, dispatch: dispatch, owners: owners, refresh: refresh, cleanup: cleanup.AuthorizeNativeOAuthCleanup, limits: limits}
 	if limits != nil {
-		source := repo.(service.GatewayAccountLimitsRepository)
-		authority := owners.(NativeAccountLimitsAuthority)
+		source, sourceOK := repo.(service.GatewayAccountLimitsRepository)
+		authority, authorityOK := owners.(NativeAccountLimitsAuthority)
+		if !sourceOK || !authorityOK {
+			return nil, ErrDenied
+		}
 		out.limitsRefresh, err = service.NewGatewayAccountLimitsRefresher(dispatch, source, func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
 			consumer, e := service.GatewayNativeConsumer(ctx)
 			if e != nil {
