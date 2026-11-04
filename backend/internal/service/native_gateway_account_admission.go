@@ -2,13 +2,11 @@ package service
 
 import (
 	"context"
-	"net/http"
-	"strconv"
 	"time"
 )
 
-// A private projection of Sub2API policy, not a second scheduler. The caller
-// receives no raw quota windows and never interprets provider thresholds.
+// A private cached admission hint, not a second scheduler or a total-spend
+// eligibility decision. The caller receives no raw quota windows.
 type GatewayAccountAdmissionResult struct {
 	Status             string `json:"status"`
 	PhysicalGeneration string `json:"physicalGeneration,omitempty"`
@@ -25,7 +23,7 @@ func gatewayAccountAdmission(snapshot GatewayAccountLimitsResult, now time.Time)
 	if snapshot.Status != "snapshot" {
 		return GatewayAccountAdmissionResult{Status: snapshot.Status}
 	}
-	headers := http.Header{}
+	status := "available"
 	for _, w := range snapshot.Windows {
 		if w.Family != "codex" {
 			return GatewayAccountAdmissionResult{Status: "unsupported"}
@@ -37,19 +35,14 @@ func gatewayAccountAdmission(snapshot GatewayAccountLimitsResult, now time.Time)
 		if err != nil || !reset.After(now) {
 			continue
 		}
-		prefix := "x-codex-" + w.ID + "-"
-		headers.Set(prefix+"used-percent", strconv.FormatFloat(*w.UsedPercent, 'f', -1, 64))
-		if w.DurationSeconds != nil {
-			headers.Set(prefix+"window-minutes", strconv.FormatInt(*w.DurationSeconds/60, 10))
+		if *w.UsedPercent >= 100 {
+			// Subscription exhaustion is not total-spend exhaustion: Codex may
+			// still accept paid credits. Cached windows contain neither credit
+			// eligibility nor an authoritative refusal, so they must never
+			// become a limited decision, even when the reset is in the future.
+			// The admitted request's real upstream 429 remains authoritative.
+			status = "unknown"
 		}
-		headers.Set(prefix+"reset-after-seconds", strconv.FormatInt(int64(reset.Sub(now)/time.Second), 10))
 	}
-	// The exact stock rule chooses the exhausted normalized 7d window before 5h.
-	// Reconstruct remaining time from the fenced observation, never restart its
-	// original reset-after duration when a cached snapshot is read again.
-	reset := calculateOpenAI429ResetTimeAt(headers, now)
-	if reset == nil || !reset.After(now) {
-		return GatewayAccountAdmissionResult{Status: "available"}
-	}
-	return GatewayAccountAdmissionResult{Status: "limited", PhysicalGeneration: snapshot.PhysicalGeneration, RetryAt: reset.UTC().Format(time.RFC3339Nano)}
+	return GatewayAccountAdmissionResult{Status: status}
 }

@@ -1,24 +1,25 @@
 package service
 
 import (
-	"github.com/stretchr/testify/require"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-func TestGatewayAccountAdmissionUsesStockCodexPolicy(t *testing.T) {
+func TestGatewayAccountAdmissionDoesNotTreatSubscriptionExhaustionAsCreditExhaustion(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name, primaryMinutes, secondaryMinutes, primaryUsed, secondaryUsed, primaryReset, secondaryReset string
-		want                                                                                             int
+		want                                                                                             string
 	}{
-		{"both exhausted prefer 7d even with earlier reset", "300", "10080", "100", "100", "600", "120", 120},
-		{"reversed windows use duration not identifier", "10080", "300", "100", "100", "120", "600", 120},
-		{"only 5h exhausted", "300", "10080", "100", "16", "600", "120", 600},
-		{"below threshold", "300", "10080", "99.9", "16", "600", "120", 0},
-		{"legacy aliases preserve stock mapping", "", "", "100", "100", "120", "600", 120},
-		{"elapsed reset cannot restart", "300", "10080", "100", "16", "0", "120", 0},
+		{"both subscriptions exhausted credits unknown", "300", "10080", "100", "100", "600", "120", "unknown"},
+		{"reversed exhausted subscription windows", "10080", "300", "100", "100", "120", "600", "unknown"},
+		{"only 5h exhausted", "300", "10080", "100", "16", "600", "120", "unknown"},
+		{"below threshold", "300", "10080", "99.9", "16", "600", "120", "available"},
+		{"legacy aliases do not establish credit exhaustion", "", "", "100", "100", "120", "600", "unknown"},
+		{"elapsed reset cannot restart", "300", "10080", "100", "16", "0", "120", "available"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := http.Header{}
@@ -29,18 +30,18 @@ func TestGatewayAccountAdmissionUsesStockCodexPolicy(t *testing.T) {
 			}
 			snapshot := GatewayAccountLimitsResult{Status: "snapshot", PhysicalGeneration: "fixture-generation", Windows: NormalizeGatewayCodexLimits(CaptureGatewayCodexLimits(h, now))}
 			result := gatewayAccountAdmission(snapshot, now)
-			if tc.want == 0 {
+			if tc.want == "available" {
 				require.Equal(t, "available", result.Status)
 				return
 			}
-			require.Equal(t, "limited", result.Status)
-			require.Equal(t, "fixture-generation", result.PhysicalGeneration)
-			expected := now.Add(time.Duration(tc.want) * time.Second)
-			require.Equal(t, expected.Format(time.RFC3339Nano), result.RetryAt)
-			require.Equal(t, calculateOpenAI429ResetTimeAt(h, now).UTC().Format(time.RFC3339Nano), result.RetryAt)
+			// A zero subscription remainder with unknown credits must not block
+			// dispatch or advertise a total-spend reset/generation.
+			require.Equal(t, GatewayAccountAdmissionResult{Status: "unknown"}, result)
 			require.Equal(t, "available", gatewayAccountAdmission(snapshot, now.Add(20*time.Minute)).Status)
 		})
 	}
-	require.Equal(t, "unknown", gatewayAccountAdmission(GatewayAccountLimitsResult{Status: "unknown"}, now).Status)
+	for _, status := range []string{"unknown", "unavailable", "unsupported"} {
+		require.Equal(t, GatewayAccountAdmissionResult{Status: status}, gatewayAccountAdmission(GatewayAccountLimitsResult{Status: status}, now))
+	}
 	require.Equal(t, "unsupported", gatewayAccountAdmission(GatewayAccountLimitsResult{Status: "snapshot", Windows: []GatewayAccountLimitWindow{{Family: "claude"}}}, now).Status)
 }
