@@ -46,18 +46,20 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			nativeFixtureSealAccount(t, a)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
-			syntheticChat := `{"id":"chat-synthetic","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_synthetic","type":"function","function":{"name":"echo_status","arguments":"{\"item\":\"alpha\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}`
+			syntheticSSE := "data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + \",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_synthetic\",\"type\":\"function\",\"function\":{\"name\":\"echo_status\",\"arguments\":\"{\\\"item\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":null}]}\n\n" +
+				"data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + \",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: [DONE]\n\n"
 			upstream := &nativeDiagnosticHTTP{response: &http.Response{
 				StatusCode: 200,
-				Header: http.Header{"Content-Type": []string{"application/json"}},
-				Body: io.NopCloser(strings.NewReader(syntheticChat)),
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(syntheticSSE)),
 			}}
 			svc := &OpenAIGatewayService{
 				accountRepo: &gatewayIdentityRepoFixture{row: a},
 				httpUpstream: upstream,
 				cfg: rawChatCompletionsTestConfig(),
 			}
-			payload := []byte(`{"model":"` + model + `","input":"synthetic only","store":false,"stream":false,"max_output_tokens":128,"tools":[{"type":"function","name":"echo_status","description":"synthetic","parameters":{"type":"object","properties":{"item":{"type":"string"}},"required":["item"]}}],"tool_choice":"auto"}`)
+			payload := []byte(`{"model":"` + model + `","input":"synthetic only","store":false,"stream":true,"max_output_tokens":128,"tools":[{"type":"function","name":"echo_status","description":"synthetic","parameters":{"type":"object","properties":{"item":{"type":"string"}},"required":["item"]}}],"tool_choice":"auto"}`)
 			call := func(wire []byte) (*httptest.ResponseRecorder, bool, error) {
 				rec := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(rec)
