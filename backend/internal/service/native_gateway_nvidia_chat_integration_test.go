@@ -46,7 +46,7 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			nativeFixtureSealAccount(t, a)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
-			syntheticChat := `{"id":"chat-synthetic","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_synthetic","type":"function","function":{"name":"echo_status","arguments":"{\\"item\\":\\"alpha\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}`
+			syntheticChat := `{"id":"chat-synthetic","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_synthetic","type":"function","function":{"name":"echo_status","arguments":"{\"item\":\"alpha\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}`
 			upstream := &nativeDiagnosticHTTP{response: &http.Response{
 				StatusCode: 200,
 				Header: http.Header{"Content-Type": []string{"application/json"}},
