@@ -46,7 +46,7 @@ func GatewayNativeCodingPlanProfileIDValid(profile string) bool {
 
 func gatewayNativeProviderProfile(profile string) bool {
 	switch profile {
-	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile:
+	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile, GatewayNVIDIABuildChatProfile:
 		return true
 	}
 	return false
@@ -129,6 +129,10 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 		return deny()
 	}
 	switch profile {
+	case GatewayNVIDIABuildChatProfile:
+		if !GatewayNVIDIABuildModelValid(model) {
+			return deny()
+		}
 	case GatewayKimiCodeResponsesProfile:
 		if model != GatewayKimiCodeResponsesModel {
 			return deny()
