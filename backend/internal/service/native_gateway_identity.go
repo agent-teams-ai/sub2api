@@ -328,17 +328,11 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		defer clearGrokResponsesClientToolMapping(c)
 	}
 	if route.Profile == GatewayNVIDIABuildChatProfile {
-		model := gjson.GetBytes(body, "model").String()
-		fields, valid := gatewayOpenRouterResponsesFields(body)
-		if !GatewayNVIDIABuildModelValid(model) || !valid ||
-			!gatewayNativeProviderTextInput(route.Profile, fields["input"]) ||
-			(fields["tools"] != nil && !gatewayNativeProviderTools(fields["tools"])) {
+		// Reuse the existing strict provider guard, not an OpenRouter-specific
+		// parser or a second converter. The declared model is checked here.
+		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
+		if prepareErr != nil {
 			gatewayNativeAdmissionDiagnostic(gatewayAdmissionPayload)
-			return nil, false, ErrGatewayNativeIdentity
-		}
-		prepared, mapping, prepareErr := adaptResponsesClientToolsForFunctionUpstream(body, "NVIDIA Build")
-		if prepareErr != nil || len(prepared) > 4<<20 {
-			gatewayNativeAdmissionDiagnostic(gatewayAdmissionMapping)
 			return nil, false, ErrGatewayNativeIdentity
 		}
 		body = prepared
