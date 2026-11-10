@@ -47,6 +47,7 @@ type Config struct {
 	MaxEntries          int64              `json:"maxEntries"`
 	OAuth               *OAuthConfig       `json:"oauth,omitempty"`
 	OpenRouter          *ProfileConfig     `json:"openRouter,omitempty"`
+	NVIDIA              *ProfileConfig     `json:"nvidia,omitempty"`
 	Claude              *ProfileConfig     `json:"claude,omitempty"`
 	CodingPlans         []CodingPlanConfig `json:"codingPlans,omitempty"`
 	Grok                *GrokConfig        `json:"grok,omitempty"`
@@ -256,6 +257,11 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 	if c.OpenRouter != nil && (!c.OpenRouter.valid() || c.OpenRouter.BaseURL != service.GatewayOpenRouterBaseURL || !service.GatewayOpenRouterModelValid(c.OpenRouter.Model)) {
 		return nil, ErrDenied
 	}
+	if c.NVIDIA != nil && (!c.NVIDIA.valid() ||
+		c.NVIDIA.BaseURL != service.GatewayNVIDIABuildBaseURL ||
+		c.NVIDIA.Model != service.GatewayNVIDIABuildAnchorModel) {
+		return nil, ErrDenied
+	}
 	if c.Claude != nil && (!c.Claude.valid() || c.Claude.BaseURL != service.GatewayClaudeOAuthBaseURL || c.Claude.Model != service.GatewayClaudeOAuthModel || c.Claude.Tokens > 65536 || c.Claude.ProviderTokenUpperBound > 65536) {
 		return nil, ErrDenied
 	}
@@ -303,6 +309,15 @@ func (c Config) openRouterProfile() *gatewaytransport.QualifiedProfile {
 	}
 	p := c.OpenRouter.qualified()
 	p.Profile = service.GatewayOpenRouterResponsesProfile
+	return &p
+}
+
+func (c Config) nvidiaProfile() *gatewaytransport.QualifiedProfile {
+	if c.NVIDIA == nil {
+		return nil
+	}
+	p := c.NVIDIA.qualified()
+	p.Profile = service.GatewayNVIDIABuildChatProfile
 	return &p
 }
 
