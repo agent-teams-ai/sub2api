@@ -1,6 +1,7 @@
 package service
 
 import (
+	"reflect"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -87,6 +88,9 @@ func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccount
 	if in.ProfileID == GatewayOpenRouterResponsesProfile {
 		return s.openRouter.readGatewayOpenRouterAccountModels(ctx, in, before, s.authorize)
 	}
+	if in.ProfileID == GatewayNVIDIABuildChatProfile {
+		return s.readNVIDIABuildAccountModels(ctx, in, before)
+	}
 	if in.ProfileID != GatewayCodexOAuthResponsesProfile {
 		return GatewayAccountModelsResult{Status: "unsupported"}
 	}
@@ -131,6 +135,52 @@ func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccount
 		return unavailable
 	}
 	return out
+}
+
+// Native alone qualifies the bounded static NVIDIA model set for one exact
+// managed account. This is NOT an upstream entitlement/credit observation.
+// Owner, physical generation and current encrypted account are checked again.
+func (s *GatewayAccountModelsReader) readNVIDIABuildAccountModels(
+	ctx context.Context, in GatewayAccountModelsInput, before GatewayNativeRoute,
+) GatewayAccountModelsResult {
+	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
+	if s.openRouter == nil || s.openRouter.accountRepo == nil ||
+		before.Profile != GatewayNVIDIABuildChatProfile ||
+		!gatewayAccountLimitsRouteValid(before, in.GatewayAccountLimitsInput) ||
+		!GatewayNativeAPIKeyProfileValid(before.Profile, before.BaseURL, before.Model) {
+		return unavailable
+	}
+	account, err := s.openRouter.accountRepo.GetByID(ctx, before.AccountID)
+	if err != nil || validateGatewayNativeRoute(before, account) != nil {
+		return unavailable
+	}
+	scope, err := GatewayNativeCredentialScopeForAccount(account)
+	if err != nil || scope.Owner != in.OwnerRef || scope.Account != in.AccountRef ||
+		scope.Generation != before.Generation {
+		return unavailable
+	}
+	after, err := s.authorize(ctx, in.GatewayAccountLimitsInput)
+	if err != nil || ctx.Err() != nil || !SameGatewayNativeDescriptor(before, after) {
+		return unavailable
+	}
+	fresh, err := s.openRouter.accountRepo.GetByID(ctx, before.AccountID)
+	if err != nil || validateGatewayNativeRoute(before, fresh) != nil ||
+		!reflect.DeepEqual(account.Credentials, fresh.Credentials) ||
+		!reflect.DeepEqual(account.Extra, fresh.Extra) {
+		return unavailable
+	}
+	now := time.Now().UTC()
+	models := []GatewayAccountModel{
+		{ModelID: GatewayNVIDIABuildAnchorModel, Tools: GatewayAccountModelChoices{Allowed: []string{"none"}, Default: "none"}},
+		{ModelID: GatewayNVIDIABuildGLMModel, Tools: GatewayAccountModelChoices{Allowed: []string{"none"}, Default: "none"}},
+	}
+	return GatewayAccountModelsResult{
+		Status: "snapshot", Source: "nvidia", PhysicalGeneration: before.Generation,
+		PrincipalVersion: in.AccountRef,
+		FetchedAt: now.Format(time.RFC3339Nano),
+		ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+		Models: &models,
+	}
 }
 
 // A private, custody-bound GET only. It does not create an ordinary credential
