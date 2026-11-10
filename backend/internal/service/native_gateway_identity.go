@@ -328,16 +328,14 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		defer clearGrokResponsesClientToolMapping(c)
 	}
 	if route.Profile == GatewayNVIDIABuildChatProfile {
-		// Reuse the existing strict provider guard, not an OpenRouter-specific
-		// parser or a second converter. The declared model is checked here.
-		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
-		if prepareErr != nil {
+		// Validate the bounded provider subset before custody, but do NOT
+		// pre-lower custom/namespace tools. The existing protected Chat bridge
+		// owns the single Responses-to-Chat conversion and reverse restoration.
+		// Double lowering loses the caller's original tool identity.
+		if ValidateGatewayNativeProviderResponsesBounded(route.Profile, body, 4<<20) != nil {
 			gatewayNativeAdmissionDiagnostic(gatewayAdmissionPayload)
 			return nil, false, ErrGatewayNativeIdentity
 		}
-		body = prepared
-		setGrokResponsesClientToolMapping(c, mapping)
-		defer clearGrokResponsesClientToolMapping(c)
 	}
 	if GatewayNativeCodingPlanProfileIDValid(route.Profile) {
 		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
