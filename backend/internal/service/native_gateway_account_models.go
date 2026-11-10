@@ -1,13 +1,13 @@
 package service
 
 import (
-	"reflect"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -177,9 +177,9 @@ func (s *GatewayAccountModelsReader) readNVIDIABuildAccountModels(
 	return GatewayAccountModelsResult{
 		Status: "snapshot", Source: "nvidia", PhysicalGeneration: before.Generation,
 		PrincipalVersion: in.AccountRef,
-		FetchedAt: now.Format(time.RFC3339Nano),
-		ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
-		Models: &models,
+		FetchedAt:        now.Format(time.RFC3339Nano),
+		ExpiresAt:        now.Add(time.Minute).Format(time.RFC3339Nano),
+		Models:           &models,
 	}
 }
 
