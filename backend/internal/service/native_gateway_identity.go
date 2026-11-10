@@ -27,6 +27,17 @@ const GatewayOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 const GatewayOpenRouterModel = "openai/gpt-5.4-mini"
 const GatewayOpenRouterNanoModel = "openai/gpt-5.4-nano"
 
+// NVIDIA Build is a separate API-key principal and a fixed upstream, not
+// an alias for DeepSeek/GLM direct plans or an OpenRouter credential.
+const GatewayNVIDIABuildChatProfile = "nvidia-build-chat-apikey-v1"
+const GatewayNVIDIABuildBaseURL = "https://integrate.api.nvidia.com/v1"
+const GatewayNVIDIABuildAnchorModel = "deepseek-ai/deepseek-v4.1-flash"
+const GatewayNVIDIABuildGLMModel = "z-ai/glm-5.3-flash"
+
+func GatewayNVIDIABuildModelValid(model string) bool {
+	return model == GatewayNVIDIABuildAnchorModel || model == GatewayNVIDIABuildGLMModel
+}
+
 func GatewayOpenRouterModelValid(model string) bool {
 	// This validates descriptor syntax only. Candidate qualification and every
 	// requested model are separately admitted by the fixed provider catalogue.
@@ -37,6 +48,7 @@ func GatewayOpenRouterModelValid(model string) bool {
 func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
 	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
 		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model) ||
+		profile == GatewayNVIDIABuildChatProfile && baseURL == GatewayNVIDIABuildBaseURL && model == GatewayNVIDIABuildAnchorModel ||
 		GatewayNativeCodingPlanProfileValid(profile, baseURL, model)
 }
 
@@ -142,10 +154,10 @@ func validateGatewayNativeShape(a *Account) error {
 	}
 	profile, profileOK := a.Extra[GatewayProfileExtraKey].(string)
 	mode, passthrough := "force_responses", true
-	if profile == GatewayLegacyBridgeProfile {
+	if profile == GatewayLegacyBridgeProfile || profile == GatewayNVIDIABuildChatProfile {
 		mode, passthrough = "force_chat_completions", false
 	}
-	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && !GatewayNativeCodingPlanProfileIDValid(profile)) ||
+	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && profile != GatewayNVIDIABuildChatProfile && !GatewayNativeCodingPlanProfileIDValid(profile)) ||
 		a.Extra["openai_responses_mode"] != mode ||
 		a.Extra["openai_passthrough"] != passthrough ||
 		a.Extra["native_api_key_cancel_on_disconnect"] != true ||
@@ -285,7 +297,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		return s.forwardGatewayOAuthRoute(ctx, c, route, body)
 	}
 	if ctx == nil || c == nil || c.Request == nil || s.accountRepo == nil || len(body) > 4<<20 || !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() || !gatewayNativeUnambiguousPolicyFields(body) ||
-		(route.Profile != GatewayOpenRouterResponsesProfile && gjson.GetBytes(body, "model").String() != route.Model) || !GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) ||
+		(route.Profile != GatewayOpenRouterResponsesProfile && route.Profile != GatewayNVIDIABuildChatProfile && gjson.GetBytes(body, "model").String() != route.Model) || !GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) ||
 		gjson.GetBytes(body, "previous_response_id").String() != "" ||
 		(gjson.GetBytes(body, "service_tier").Exists() && gjson.GetBytes(body, "service_tier").String() != "default") ||
 		(gjson.GetBytes(body, "store").Exists() && gjson.GetBytes(body, "store").Bool()) {
@@ -307,6 +319,24 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 			return nil, false, ErrGatewayNativeIdentity
 		}
 		prepared, mapping, prepareErr := adaptResponsesClientToolsForFunctionUpstream(body, "OpenRouter")
+		if prepareErr != nil || len(prepared) > 4<<20 {
+			gatewayNativeAdmissionDiagnostic(gatewayAdmissionMapping)
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		body = prepared
+		setGrokResponsesClientToolMapping(c, mapping)
+		defer clearGrokResponsesClientToolMapping(c)
+	}
+	if route.Profile == GatewayNVIDIABuildChatProfile {
+		model := gjson.GetBytes(body, "model").String()
+		fields, valid := gatewayOpenRouterResponsesFields(body)
+		if !GatewayNVIDIABuildModelValid(model) || !valid ||
+			!gatewayNativeProviderTextInput(route.Profile, fields["input"]) ||
+			(fields["tools"] != nil && !gatewayNativeProviderTools(fields["tools"])) {
+			gatewayNativeAdmissionDiagnostic(gatewayAdmissionPayload)
+			return nil, false, ErrGatewayNativeIdentity
+		}
+		prepared, mapping, prepareErr := adaptResponsesClientToolsForFunctionUpstream(body, "NVIDIA Build")
 		if prepareErr != nil || len(prepared) > 4<<20 {
 			gatewayNativeAdmissionDiagnostic(gatewayAdmissionMapping)
 			return nil, false, ErrGatewayNativeIdentity
@@ -355,6 +385,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	}
 	a = snapshotGatewayNativeAccount(a)
 	state := &gatewayNativeDispatch{route: route, account: a, scope: scope, custody: custody}
+	if route.Profile == GatewayNVIDIABuildChatProfile {
+		state.requestedModel = gjson.GetBytes(body, "model").String()
+	}
 	if route.Profile == GatewayOpenRouterResponsesProfile {
 		state.requestedModel = gjson.GetBytes(body, "model").String()
 		if s.gatewayOpenRouterModels == nil {
@@ -471,6 +504,26 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		release()
 		gatewayNativeAdmissionDiagnostic(gatewayAdmissionCredential)
 		return noop, ErrGatewayNativeIdentity
+	}
+	if state.route.Profile == GatewayNVIDIABuildChatProfile {
+		// The bound provider/model tuple and the actual outgoing Chat body
+		// must still agree at the final locked credential entry boundary.
+		if request.GetBody == nil || !GatewayNVIDIABuildModelValid(state.requestedModel) {
+			release()
+			return noop, ErrGatewayNativeIdentity
+		}
+		reader, readErr := request.GetBody()
+		if readErr != nil {
+			release()
+			return noop, ErrGatewayNativeIdentity
+		}
+		payload, readErr := io.ReadAll(io.LimitReader(reader, (4<<20)+1))
+		_ = reader.Close()
+		if readErr != nil || len(payload) > 4<<20 ||
+			gjson.GetBytes(payload, "model").String() != state.requestedModel {
+			release()
+			return noop, ErrGatewayNativeIdentity
+		}
 	}
 	if state.route.Profile == GatewayOpenRouterResponsesProfile && !gatewayOpenRouterModelsAllow(catalogue, state.route.Model, state.requestedModel, payload) {
 		release()
