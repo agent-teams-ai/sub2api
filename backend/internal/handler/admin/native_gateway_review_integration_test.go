@@ -197,6 +197,38 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		require.Equal(t, service.StatusDisabled, stored.Status)
 		require.False(t, stored.Schedulable)
 	})
+	t.Run("NVIDIA Build sandbox birth stays encrypted and uses exact Chat tuple", func(t *testing.T) {
+		nvidia := GatewayNativeProfile{
+			ID: service.GatewayNVIDIABuildChatProfile,
+			BaseURL: service.GatewayNVIDIABuildBaseURL,
+			Model: service.GatewayNVIDIABuildAnchorModel,
+		}
+		routes := gin.New()
+		RegisterGatewayNativeRoutes(routes.Group(""), adminSvc, gateway, profile,
+			nativeReviewAuthorize, func(*gin.Context, service.GatewayNativeRoute) error { return nil },
+			func(*gin.Context, bool, error) {}, nativeReviewCustody(t), nvidia)
+		fixture := httptest.NewServer(routes)
+		defer fixture.Close()
+		status, data := nativeReviewHTTP(t, fixture.Client(), http.MethodPost,
+			fixture.URL+"/private/native/v1/candidates", map[string]any{
+				"generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+				"profile": nvidia.ID, "name": "Synthetic NVIDIA sandbox",
+				"api_key": nativeReviewSyntheticKey(t),
+				"owner_ref": "owner/fixture", "account_ref": "account/nvidia-fixture",
+			})
+		require.Equal(t, http.StatusOK, status)
+		var got GatewayNativeCandidate
+		require.NoError(t, json.Unmarshal(data, &got))
+		stored, err := repo.GetByID(ctx, got.Descriptor.AccountID)
+		require.NoError(t, err)
+		require.Equal(t, service.GatewayNVIDIABuildChatProfile, stored.Extra[service.GatewayProfileExtraKey])
+		require.Equal(t, "force_chat_completions", stored.Extra["openai_responses_mode"])
+		require.Equal(t, service.GatewayNVIDIABuildBaseURL, stored.GetCredential("base_url"))
+		require.True(t, strings.HasPrefix(stored.GetCredential("api_key"), "gcn1.fixture-k1."))
+		require.Equal(t, service.StatusDisabled, stored.Status)
+		require.False(t, stored.Schedulable)
+		require.Len(t, stored.Extra, 8)
+	})
 	require.True(t, birth.Equal(candidate.Descriptor.CreatedAt), "POST birth must be the actually persisted instant")
 	var count int
 	countCandidates := func() int {
