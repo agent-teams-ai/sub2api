@@ -8,7 +8,9 @@ func TestGatewayNVIDIABuildProfileIsFixedAndIndependent(t *testing.T) {
 	if !GatewayNativeAPIKeyProfileValid(GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildBaseURL, GatewayNVIDIABuildAnchorModel) {
 		t.Fatal("fixed NVIDIA profile must be valid")
 	}
-	for _, profile := range []string{GatewayOpenRouterResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayLegacyBridgeProfile} {
+	// The historical MiMo Chat bridge accepts variable endpoints by design;
+	// other fixed-vendor profiles must never accept the NVIDIA tuple.
+	for _, profile := range []string{GatewayOpenRouterResponsesProfile, GatewayGLMCodingResponsesProfile} {
 		if GatewayNativeAPIKeyProfileValid(profile, GatewayNVIDIABuildBaseURL, GatewayNVIDIABuildAnchorModel) {
 			t.Fatalf("another provider must not accept NVIDIA credentials: %s", profile)
 		}
