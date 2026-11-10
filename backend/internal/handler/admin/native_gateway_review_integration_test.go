@@ -125,7 +125,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 	server := httptest.NewServer(router)
 	defer server.Close()
 	generation := "77777777-7777-4777-8777-777777777777"
-	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key": nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/fixture"}
+	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key":   nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/fixture"}
 	status, raw := nativeReviewHTTP(t, server.Client(), http.MethodPost, server.URL+"/private/native/v1/candidates", create)
 	require.Equal(t, http.StatusOK, status)
 	var candidate GatewayNativeCandidate
@@ -199,9 +199,9 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 	})
 	t.Run("NVIDIA Build sandbox birth stays encrypted and uses exact Chat tuple", func(t *testing.T) {
 		nvidia := GatewayNativeProfile{
-			ID: service.GatewayNVIDIABuildChatProfile,
+			ID:      service.GatewayNVIDIABuildChatProfile,
 			BaseURL: service.GatewayNVIDIABuildBaseURL,
-			Model: service.GatewayNVIDIABuildAnchorModel,
+			Model:   service.GatewayNVIDIABuildAnchorModel,
 		}
 		routes := gin.New()
 		RegisterGatewayNativeRoutes(routes.Group(""), adminSvc, gateway, profile,
@@ -212,7 +212,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 		status, data := nativeReviewHTTP(t, fixture.Client(), http.MethodPost,
 			fixture.URL+"/private/native/v1/candidates", map[string]any{
 				"generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-				"profile": nvidia.ID, "name": "Synthetic NVIDIA sandbox",
+				"profile":    nvidia.ID, "name": "Synthetic NVIDIA sandbox",
 				"api_key": nativeReviewSyntheticKey(t),
 				"owner_ref": "owner/fixture", "account_ref": "account/nvidia-fixture",
 			})
