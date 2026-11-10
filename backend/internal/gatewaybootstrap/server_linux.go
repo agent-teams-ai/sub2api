@@ -183,10 +183,10 @@ func Run(ctx context.Context, options Options) error {
 	auth := authorize(c.Peers)
 	tcfg := gatewaytransport.Config{Gateway: gateway, Custody: custody, Authorize: auth,
 		Enrollment: gatewaytransport.Enrollment{OriginRef: origin, EngineIncarnation: inc, QualificationRef: c.Profile.QualificationRef},
-		Profile:    c.qualifiedProfile(), CodingPlans: c.codingPlanProfiles(), Grok: c.grokProfile(), OpenRouter: c.openRouterProfile(), Codex: c.codexProfile(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
+		Profile:    c.qualifiedProfile(), CodingPlans: c.codingPlanProfiles(), Grok: c.grokProfile(), OpenRouter: c.openRouterProfile(), NVIDIA: c.nvidiaProfile(), Codex: c.codexProfile(), MaxEntries: int(c.MaxEntries), CallbackTimeout: 5 * time.Second,
 		IOTimeout: 30 * time.Second, ProviderReadIdle: service.GatewayNativeProviderReadIdle, CleanupTimeout: 5 * time.Second, EnvelopeBytes: 5 << 20, CallbackBytes: 262144}
 	var oauth *privateOAuth
-	if c.OAuth != nil || c.Claude != nil || c.Grok != nil || len(c.CodingPlans) > 0 || c.OpenRouter != nil {
+	if c.OAuth != nil || c.Claude != nil || c.Grok != nil || len(c.CodingPlans) > 0 || c.OpenRouter != nil || c.NVIDIA != nil {
 		owners := options.OAuthOwnerAuthority
 		if owners == nil {
 			owners = a
@@ -335,6 +335,9 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 	var second []admin.GatewayNativeProfile
 	if hasOpenRouter {
 		second = []admin.GatewayNativeProfile{{ID: secondary.Profile, BaseURL: secondary.BaseURL, Model: secondary.Model}}
+	}
+	if nvidia, enabled := transport.NVIDIAProfile(); enabled {
+		second = append(second, admin.GatewayNativeProfile{ID: nvidia.Profile, BaseURL: nvidia.BaseURL, Model: nvidia.Model})
 	}
 	for _, p := range transport.CodingPlanProfiles() {
 		second = append(second, admin.GatewayNativeProfile{ID: p.Profile, BaseURL: p.BaseURL, Model: p.Model})
