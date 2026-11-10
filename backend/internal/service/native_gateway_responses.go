@@ -42,7 +42,7 @@ func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error
 	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayOAuthStagingProfile {
 		return GatewayCodexOAuthBaseURL + "/responses", nil
 	}
-	if a.Extra[GatewayProfileExtraKey] == GatewayLegacyBridgeProfile {
+	if a.Extra[GatewayProfileExtraKey] == GatewayLegacyBridgeProfile || a.Extra[GatewayProfileExtraKey] == GatewayNVIDIABuildChatProfile {
 		return s.openAIChatCompletionsTargetURL(a)
 	}
 	base, err := s.validateUpstreamBaseURL(a.GetCredential("base_url"))
