@@ -320,7 +320,7 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			// reasoning_text content part must be accepted there; without it
 			// every multi-turn review on such a model was refused at input
 			// admission. It stays opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile {
+			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile {
 				keys = append(keys, "content")
 			}
 			// OpenRouter tags every reasoning item with the format of its
