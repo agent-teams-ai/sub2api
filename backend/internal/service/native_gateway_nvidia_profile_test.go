@@ -20,7 +20,7 @@ func TestGatewayNVIDIABuildProfileIsFixedAndIndependent(t *testing.T) {
 		{"http://integrate.api.nvidia.com/v1", GatewayNVIDIABuildAnchorModel},
 		{"https://integrate.api.nvidia.com/v1/", GatewayNVIDIABuildAnchorModel},
 		{"https://integrate.api.nvidia.com/v1?redirect=true", GatewayNVIDIABuildAnchorModel},
-		{GatewayNVIDIABuildBaseURL, GatewayNVIDIABuildGLMModel},
+		{GatewayNVIDIABuildBaseURL, "z-ai/glm-5.3-flash"},
 		{GatewayNVIDIABuildBaseURL, "deepseek-ai/latest"},
 	} {
 		if GatewayNativeAPIKeyProfileValid(GatewayNVIDIABuildChatProfile, candidate.url, candidate.anchor) {
@@ -30,12 +30,12 @@ func TestGatewayNVIDIABuildProfileIsFixedAndIndependent(t *testing.T) {
 }
 
 func TestGatewayNVIDIABuildStaticModelMembership(t *testing.T) {
-	for _, model := range []string{GatewayNVIDIABuildAnchorModel, GatewayNVIDIABuildGLMModel} {
+	for _, model := range []string{GatewayNVIDIABuildAnchorModel} {
 		if !GatewayNVIDIABuildModelValid(model) {
 			t.Fatalf("qualified model refused: %s", model)
 		}
 	}
-	for _, model := range []string{"", "z-ai/glm-5.3-flash:free", "deepseek-ai/deepseek-v4.1-flash ", "https://integrate.api.nvidia.com", "moonshotai/kimi-k3.1-pro"} {
+	for _, model := range []string{"", "z-ai/glm-5.3-flash:free", "deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3.5-super-vl-120b-a12b ", "https://integrate.api.nvidia.com", "moonshotai/kimi-k3.1-pro"} {
 		if GatewayNVIDIABuildModelValid(model) {
 			t.Fatalf("unsupported model accepted: %s", model)
 		}
