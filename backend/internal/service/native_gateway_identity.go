@@ -28,14 +28,13 @@ const GatewayOpenRouterModel = "openai/gpt-5.4-mini"
 const GatewayOpenRouterNanoModel = "openai/gpt-5.4-nano"
 
 // NVIDIA Build is a separate API-key principal and a fixed upstream, not
-// an alias for DeepSeek/GLM direct plans or an OpenRouter credential.
+// an alias for other direct plans or an OpenRouter credential.
 const GatewayNVIDIABuildChatProfile = "nvidia-build-chat-apikey-v1"
 const GatewayNVIDIABuildBaseURL = "https://integrate.api.nvidia.com/v1"
-const GatewayNVIDIABuildAnchorModel = "deepseek-ai/deepseek-v4.1-flash"
-const GatewayNVIDIABuildGLMModel = "z-ai/glm-5.3-flash"
+const GatewayNVIDIABuildAnchorModel = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 
 func GatewayNVIDIABuildModelValid(model string) bool {
-	return model == GatewayNVIDIABuildAnchorModel || model == GatewayNVIDIABuildGLMModel
+	return model == GatewayNVIDIABuildAnchorModel
 }
 
 func GatewayOpenRouterModelValid(model string) bool {
