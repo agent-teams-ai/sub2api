@@ -81,12 +81,35 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			require.Contains(t, string(actual), `"model":"`+model+`"`)
 			require.Contains(t, string(actual), `"function":{"name":"echo_status"`)
 			require.NotContains(t, string(actual), "gcn1.")
+
+			// A real second Responses turn must replay the assistant call and
+			// the client tool result through the same native bridge. No
+			// previous_response_id, untrusted account affinity or secret reuse.
+			nextSSE := "data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic done\"},\"finish_reason\":null}]}\\n\\n" +
+				"data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\\n\\n" +
+				"data: [DONE]\\n\\n"
+			upstream.response = &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(nextSSE)),
+			}
+			nextPayload := []byte(`{"model":"` + model + `","input":[{"type":"function_call","name":"echo_status","call_id":"call_synthetic","arguments":"{\"item\":\"alpha\"}"},{"type":"function_call_output","call_id":"call_synthetic","output":"{\"status\":\"ok\"}"}],"store":false,"stream":true,"max_output_tokens":128,"tools":[{"type":"function","name":"echo_status","description":"synthetic","parameters":{"type":"object","properties":{"item":{"type":"string"}},"required":["item"]}}],"tool_choice":"auto"}`)
+			next, nextEntered, nextErr := call(nextPayload)
+			require.NoError(t, nextErr)
+			require.True(t, nextEntered)
+			require.Equal(t, 2, upstream.requests)
+			require.Contains(t, next.Body.String(), "response.completed")
+			require.Contains(t, next.Body.String(), "[DONE]")
+			secondWire, err := io.ReadAll(upstream.lastRequest.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(secondWire), `"tool_call_id":"call_synthetic"`)
+			require.Contains(t, string(secondWire), `"role":"tool"`)
 			for _, unsupported := range []string{"vendor/mismatched", GatewayNVIDIABuildGLMModel + ":free"} {
 				wrong := []byte(strings.Replace(string(payload), model, unsupported, 1))
 				_, entered, err := call(wrong)
 				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 				require.False(t, entered)
-				require.Equal(t, 1, upstream.requests)
+				require.Equal(t, 2, upstream.requests)
 			}
 		})
 	}
