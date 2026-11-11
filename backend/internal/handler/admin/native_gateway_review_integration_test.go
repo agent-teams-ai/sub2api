@@ -125,7 +125,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 	server := httptest.NewServer(router)
 	defer server.Close()
 	generation := "77777777-7777-4777-8777-777777777777"
-	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key":   nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/fixture"}
+	create := map[string]any{"generation": generation, "profile": profile.ID, "name": "candidate", "api_key": nativeReviewSyntheticKey(t), "owner_ref": "owner/fixture", "account_ref": "account/fixture"}
 	status, raw := nativeReviewHTTP(t, server.Client(), http.MethodPost, server.URL+"/private/native/v1/candidates", create)
 	require.Equal(t, http.StatusOK, status)
 	var candidate GatewayNativeCandidate
@@ -213,7 +213,7 @@ func TestGatewayNativeReviewPrivateHTTPPostgres(t *testing.T) {
 			fixture.URL+"/private/native/v1/candidates", map[string]any{
 				"generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 				"profile":    nvidia.ID, "name": "Synthetic NVIDIA sandbox",
-				"api_key": nativeReviewSyntheticKey(t),
+				"api_key":   nativeReviewSyntheticKey(t),
 				"owner_ref": "owner/fixture", "account_ref": "account/nvidia-fixture",
 			})
 		require.Equal(t, http.StatusOK, status)
