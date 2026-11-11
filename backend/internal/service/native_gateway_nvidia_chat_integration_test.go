@@ -85,9 +85,9 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			// A real second Responses turn must replay the assistant call and
 			// the client tool result through the same native bridge. No
 			// previous_response_id, untrusted account affinity or secret reuse.
-			nextSSE := "data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic done\"},\"finish_reason\":null}]}\\n\\n" +
-				"data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\\n\\n" +
-				"data: [DONE]\\n\\n"
+			nextSSE := "data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic done\"},\"finish_reason\":null}]}\n\n" +
+				"data: {\"id\":\"chat-next\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n"
 			upstream.response = &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
