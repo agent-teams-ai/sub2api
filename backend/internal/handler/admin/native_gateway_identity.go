@@ -83,7 +83,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	admit func(*gin.Context, service.GatewayNativeRoute) error,
 	settle func(*gin.Context, bool, error), custody *service.GatewayNativeCredentialCustody, openRouter ...GatewayNativeProfile) {
 	if group == nil || admin == nil || gateway == nil || authorize == nil || admit == nil || settle == nil || custody == nil ||
-		!gatewayNativeProfileValid(profile) || len(openRouter) > 4 {
+		!gatewayNativeProfileValid(profile) || len(openRouter) > 5 {
 		panic("invalid private native gateway composition")
 	}
 	// Every additional profile is a closed, separately qualified server preset.
@@ -91,7 +91,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 	profiles := map[string]GatewayNativeProfile{profile.ID: profile}
 	for _, candidate := range openRouter {
 		if _, exists := profiles[candidate.ID]; exists || !gatewayNativeProfileValid(candidate) ||
-			(candidate.ID != service.GatewayOpenRouterResponsesProfile && !service.GatewayNativeCodingPlanProfileIDValid(candidate.ID)) {
+			(candidate.ID != service.GatewayOpenRouterResponsesProfile && candidate.ID != service.GatewayNVIDIABuildChatProfile && !service.GatewayNativeCodingPlanProfileIDValid(candidate.ID)) {
 			panic("invalid private native gateway composition")
 		}
 		profiles[candidate.ID] = candidate
@@ -192,7 +192,7 @@ func RegisterGatewayNativeRoutes(group *gin.RouterGroup, admin service.AdminServ
 		// No stock idempotency coordinator: it retains vendor responses and permits
 		// expired/retryable reclaim. The DB unique generation is the final one-row guard.
 		mode, passthrough := "force_responses", true
-		if selected.ID == service.GatewayLegacyBridgeProfile {
+		if selected.ID == service.GatewayLegacyBridgeProfile || selected.ID == service.GatewayNVIDIABuildChatProfile {
 			mode, passthrough = "force_chat_completions", false
 		}
 		disabled := false

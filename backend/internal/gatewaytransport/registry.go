@@ -41,6 +41,7 @@ type Config struct {
 	VerifyEnrollment                           func(context.Context, Enrollment) error
 	Profile                                    QualifiedProfile
 	OpenRouter                                 *QualifiedProfile
+	NVIDIA                                     *QualifiedProfile
 	Codex                                      *QualifiedProfile
 	Claude                                     *QualifiedProfile
 	CodingPlans                                []QualifiedProfile
@@ -234,6 +235,15 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		}
 		cfg.OpenRouter = &second
 	}
+	if cfg.NVIDIA != nil {
+		nvidia := *cfg.NVIDIA
+		if nvidia.Profile != service.GatewayNVIDIABuildChatProfile ||
+			!service.GatewayNativeAPIKeyProfileValid(nvidia.Profile, nvidia.BaseURL, nvidia.Model) ||
+			!providerProfileBoundsValid(nvidia) {
+			return nil, errDenied
+		}
+		cfg.NVIDIA = &nvidia
+	}
 	if (cfg.Codex == nil) != (cfg.OAuth == nil) {
 		return nil, errDenied
 	}
@@ -302,6 +312,9 @@ func (h *Handler) profile(id string) (QualifiedProfile, bool) {
 	if id == service.GatewayOpenRouterResponsesProfile && h.cfg.OpenRouter != nil {
 		return *h.cfg.OpenRouter, true
 	}
+	if id == service.GatewayNVIDIABuildChatProfile && h.cfg.NVIDIA != nil {
+		return *h.cfg.NVIDIA, true
+	}
 	if id == service.GatewayCodexOAuthResponsesProfile && h.cfg.Codex != nil {
 		return *h.cfg.Codex, true
 	}
@@ -337,6 +350,14 @@ func (h *Handler) OpenRouterProfile() (QualifiedProfile, bool) {
 		return QualifiedProfile{}, false
 	}
 	return *h.cfg.OpenRouter, true
+}
+
+// NVIDIAProfile returns the separately qualified optional API-key source.
+func (h *Handler) NVIDIAProfile() (QualifiedProfile, bool) {
+	if h.cfg.NVIDIA == nil {
+		return QualifiedProfile{}, false
+	}
+	return *h.cfg.NVIDIA, true
 }
 
 // Reserve before callback/claim. The secondary request identity prevents a new

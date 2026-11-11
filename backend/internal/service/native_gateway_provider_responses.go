@@ -46,7 +46,7 @@ func GatewayNativeCodingPlanProfileIDValid(profile string) bool {
 
 func gatewayNativeProviderProfile(profile string) bool {
 	switch profile {
-	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile:
+	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile, GatewayNVIDIABuildChatProfile:
 		return true
 	}
 	return false
@@ -129,6 +129,10 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 		return deny()
 	}
 	switch profile {
+	case GatewayNVIDIABuildChatProfile:
+		if !GatewayNVIDIABuildModelValid(model) {
+			return deny()
+		}
 	case GatewayKimiCodeResponsesProfile:
 		if model != GatewayKimiCodeResponsesModel {
 			return deny()
@@ -316,7 +320,7 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 			// reasoning_text content part must be accepted there; without it
 			// every multi-turn review on such a model was refused at input
 			// admission. It stays opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile {
+			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile {
 				keys = append(keys, "content")
 			}
 			// OpenRouter tags every reasoning item with the format of its

@@ -22,6 +22,7 @@ func TestGatewayProviderResponsesOptionalDefaultTier(t *testing.T) {
 		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
 		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel},
 	} {
 		t.Run(tuple.profile, func(t *testing.T) {
 			payload := func(tier string) []byte {
@@ -55,6 +56,7 @@ func TestGatewayProviderResponsesUnsupportedReasoning(t *testing.T) {
 		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
 		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel},
 	} {
 		t.Run(tuple.profile, func(t *testing.T) {
 			payload := func(field string) []byte {
@@ -87,6 +89,7 @@ func TestGatewayProviderResponsesCodexMetadata(t *testing.T) {
 		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
 		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel},
 	} {
 		t.Run(tuple.profile, func(t *testing.T) {
 			payload := func(fields string) []byte {
@@ -138,6 +141,7 @@ func TestGatewayProviderResponsesCodexOutputSchema(t *testing.T) {
 		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
 		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel},
 	} {
 		t.Run(tuple.profile, func(t *testing.T) {
 			schema := `{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object"}},"revalidations":{"type":"array"}},"required":["findings","revalidations"],"additionalProperties":false}`
@@ -181,6 +185,7 @@ func TestGatewayProviderResponsesFunctionNamespaceRoundTrip(t *testing.T) {
 		{GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesModel},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel},
 		{GatewayGrokOAuthResponsesProfile, GatewayGrokOAuthModel},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel},
 	} {
 		t.Run(tuple.profile, func(t *testing.T) {
 			schema := map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string", "description": "preserve <>& schema"}}, "additionalProperties": false}
