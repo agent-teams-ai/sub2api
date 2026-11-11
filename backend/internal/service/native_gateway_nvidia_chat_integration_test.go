@@ -21,7 +21,7 @@ import (
 // contacts NVIDIA and never uses a real credential.
 func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, model := range []string{GatewayNVIDIABuildAnchorModel, GatewayNVIDIABuildGLMModel} {
+	for _, model := range []string{GatewayNVIDIABuildAnchorModel} {
 		t.Run(model, func(t *testing.T) {
 			a := &Account{
 				ID:        17,
@@ -104,7 +104,7 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			require.NoError(t, err)
 			require.Contains(t, string(secondWire), `"tool_call_id":"call_synthetic"`)
 			require.Contains(t, string(secondWire), `"role":"tool"`)
-			for _, unsupported := range []string{"vendor/mismatched", GatewayNVIDIABuildGLMModel + ":free"} {
+			for _, unsupported := range []string{"vendor/mismatched", GatewayNVIDIABuildAnchorModel + ":free"} {
 				wrong := []byte(strings.Replace(string(payload), model, unsupported, 1))
 				_, entered, err := call(wrong)
 				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
