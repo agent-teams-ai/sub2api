@@ -46,8 +46,8 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			nativeFixtureSealAccount(t, a)
 			route, err := GatewayNativeDescriptor(a)
 			require.NoError(t, err)
-			syntheticSSE := "data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + \",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_synthetic\",\"type\":\"function\",\"function\":{\"name\":\"echo_status\",\"arguments\":\"{\\\"item\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":null}]}\n\n" +
-				"data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + \",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+			syntheticSSE := "data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_synthetic\",\"type\":\"function\",\"function\":{\"name\":\"echo_status\",\"arguments\":\"{\\\"item\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":null}]}\n\n" +
+				"data: {\"id\":\"chat-synthetic\",\"model\":\"" + model + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 				"data: [DONE]\n\n"
 			upstream := &nativeDiagnosticHTTP{response: &http.Response{
 				StatusCode: 200,
