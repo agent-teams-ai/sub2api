@@ -124,7 +124,7 @@ BEGIN
      AND NEW.extra ->> 'openai_responses_mode' = 'force_chat_completions'
      AND NEW.extra -> 'openai_passthrough' = 'false'::jsonb
      AND NEW.credentials ->> 'base_url' = 'https://integrate.api.nvidia.com/v1'
-     AND NEW.extra ->> 'gateway_model_v1' = 'deepseek-ai/deepseek-v4.1-flash')
+     AND NEW.extra ->> 'gateway_model_v1' = 'nvidia/nemotron-3.5-super-vl-120b-a12b')
     OR (NEW.extra ->> 'gateway_profile_v1' = 'mimo-token-plan-responses-chat-bridge-v1'
      AND NEW.extra ->> 'openai_responses_mode' = 'force_chat_completions'
      AND NEW.extra -> 'openai_passthrough' = 'false'::jsonb)
