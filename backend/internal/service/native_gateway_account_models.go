@@ -171,8 +171,7 @@ func (s *GatewayAccountModelsReader) readNVIDIABuildAccountModels(
 	}
 	now := time.Now().UTC()
 	models := []GatewayAccountModel{
-		{ModelID: GatewayNVIDIABuildAnchorModel, Tools: GatewayAccountModelChoices{Allowed: []string{"none"}, Default: "none"}},
-		{ModelID: GatewayNVIDIABuildGLMModel, Tools: GatewayAccountModelChoices{Allowed: []string{"none"}, Default: "none"}},
+		{ModelID: GatewayNVIDIABuildAnchorModel, Tools: GatewayAccountModelChoices{Allowed: []string{"function"}, Default: "function"}},
 	}
 	return GatewayAccountModelsResult{
 		Status: "snapshot", Source: "nvidia", PhysicalGeneration: before.Generation,
