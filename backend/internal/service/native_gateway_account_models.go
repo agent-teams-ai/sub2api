@@ -145,8 +145,8 @@ func (s *GatewayAccountModelsReader) readNVIDIABuildAccountModels(
 ) GatewayAccountModelsResult {
 	unavailable := GatewayAccountModelsResult{Status: "unavailable"}
 	if s.openRouter == nil || s.openRouter.accountRepo == nil ||
-		before.Profile != GatewayNVIDIABuildChatProfile ||
-		!gatewayAccountLimitsRouteValid(before, in.GatewayAccountLimitsInput) ||
+		before.Profile != GatewayNVIDIABuildChatProfile || before.Profile != in.ProfileID ||
+		before.AccountID <= 0 || before.CreatedAt.IsZero() || before.CreatedAt.Nanosecond()%1000 != 0 ||
 		!GatewayNativeAPIKeyProfileValid(before.Profile, before.BaseURL, before.Model) {
 		return unavailable
 	}
