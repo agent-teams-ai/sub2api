@@ -2,7 +2,10 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -69,7 +72,7 @@ func gatewayNativeLegacyChoice(raw []byte, stream bool) (map[string]json.RawMess
 	if finish == nil || *finish == "" {
 		return choice, stream
 	}
-	return choice, *finish == "stop" || *finish == "tool_calls"
+	return choice, *finish == "stop" || *finish == "tool_calls" || *finish == "length"
 }
 
 func gatewayNativeLegacyChunk(raw []byte, chunk *apicompat.ChatCompletionsChunk) bool {
@@ -145,6 +148,9 @@ func gatewayNativeLegacyBuffered(raw []byte, response *apicompat.ChatCompletions
 			text += part.Text
 		}
 	}
+	if response.Choices[0].FinishReason == "length" {
+		return len(m.ToolCalls) == 0
+	}
 	if response.Choices[0].FinishReason == "stop" {
 		return len(m.ToolCalls) == 0 && (text != "" || strings.TrimSpace(m.ReasoningContent) != "" || strings.TrimSpace(m.Reasoning) != "")
 	}
@@ -163,6 +169,11 @@ func gatewayNativeLegacyBuffered(raw []byte, response *apicompat.ChatCompletions
 }
 
 func gatewayNativeLegacyFinal(state *apicompat.ChatCompletionsToResponsesStreamState) bool {
+	// The existing converter preserves this known terminal as incomplete.
+	// Never finalize a truncated tool call, even if its arguments parse.
+	if state.FinishReason == "length" {
+		return len(state.ToolCalls) == 0
+	}
 	if state.FinishReason == "stop" {
 		return len(state.ToolCalls) == 0 && (state.Text.Len() > 0 || strings.TrimSpace(state.Reasoning.String()) != "")
 	}
@@ -180,4 +191,17 @@ func gatewayNativeLegacyFinal(state *apicompat.ChatCompletionsToResponsesStreamS
 		ids[tool.ID] = true
 	}
 	return true
+}
+
+// Emit only an existing closed phase, never provider bytes or error text.
+func gatewayNativeLegacyFailure(ctx context.Context, phase gatewayNativeResponseFailurePhase) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		phase = gatewayNativeFailureDeadline
+	}
+	line, _ := json.Marshal(struct {
+		Event string                            `json:"event"`
+		Phase gatewayNativeResponseFailurePhase `json:"phase"`
+	}{"gateway_native_response_failure", phase})
+	_, _ = fmt.Fprintln(os.Stderr, string(line))
+	return ErrGatewayNativeEffectUnknown
 }

@@ -147,7 +147,8 @@ func TestGatewayNativeRepairLegacyBufferedQualification(t *testing.T) {
 		{"error only", `{"error":{"message":"fixture"}}`, false},
 		{"missing finish", strings.Replace(nativeRepairText, `,"finish_reason":"stop"`, "", 1), false},
 		{"null finish", strings.Replace(nativeRepairText, `"stop"`, `null`, 1), false},
-		{"length", strings.Replace(nativeRepairText, `"stop"`, `"length"`, 1), false},
+		{"length", strings.Replace(nativeRepairText, `"stop"`, `"length"`, 1), true},
+		{"tool length", strings.Replace(nativeRepairTools, `"finish_reason":"tool_calls"`, `"finish_reason":"length"`, 1), false},
 		{"filter", strings.Replace(nativeRepairText, `"stop"`, `"content_filter"`, 1), false},
 		{"unknown finish", strings.Replace(nativeRepairText, `"stop"`, `"other"`, 1), false},
 		{"missing message", `{"choices":[{"index":0,"finish_reason":"stop"}]}`, false},
@@ -178,7 +179,12 @@ func TestGatewayNativeRepairLegacyBufferedQualification(t *testing.T) {
 			if tc.success {
 				require.NoError(t, got.err)
 				require.NotNil(t, got.result)
-				require.Equal(t, "completed", gjson.Get(got.body, "status").String())
+				if tc.name == "length" {
+					require.Equal(t, "incomplete", gjson.Get(got.body, "status").String())
+					require.Equal(t, "max_output_tokens", gjson.Get(got.body, "incomplete_details.reason").String())
+				} else {
+					require.Equal(t, "completed", gjson.Get(got.body, "status").String())
+				}
 				require.Equal(t, "fixture", gjson.Get(got.body, "output.0.content.0.text").String())
 				if tc.wire == nativeRepairTools {
 					require.Equal(t, "call_fixture", gjson.Get(got.body, "output.1.call_id").String())

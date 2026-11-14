@@ -297,10 +297,13 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		writeEvents(events)
 	}, strictTerminal)
 	if strictTerminal && clientDisconnected {
-		return nil, ErrGatewayNativeEffectUnknown
+		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureWrite)
 	}
 
 	if scan.Err != nil {
+		if strictTerminal {
+			scan.Err = gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureIncomplete)
+		}
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
 			UpstreamHeaders:             resp.Header,
@@ -315,6 +318,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 			Duration:                    time.Since(startTime),
 			FirstTokenMs:                scan.FirstTokenMs,
 		}, fmt.Errorf("stream usage incomplete: %w", scan.Err)
+	}
+	if strictTerminal && !gatewayNativeLegacyFinal(state) {
+		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureFinal)
 	}
 	if err := state.ValidateToolCallArguments(); err != nil {
 		return &OpenAIForwardResult{
@@ -333,9 +339,6 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		}, fmt.Errorf("invalid tool call arguments from upstream: %w", err)
 	}
 
-	if strictTerminal && !gatewayNativeLegacyFinal(state) {
-		return nil, ErrGatewayNativeEffectUnknown
-	}
 	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
 	s.cacheReasoningItemsFromEvents(finalEvents, gatewayNativeReasoningScope(c))
 	writeEvents(finalEvents)
@@ -356,7 +359,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 	if strictTerminal && clientDisconnected {
 		_ = resp.Body.Close()
-		return nil, ErrGatewayNativeEffectUnknown
+		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureWrite)
 	}
 	if !scan.SawDone {
 		logCCStreamMissingDoneSentinel("openai responses chat fallback", requestID)
