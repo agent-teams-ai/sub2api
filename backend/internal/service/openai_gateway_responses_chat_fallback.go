@@ -296,6 +296,12 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		s.cacheReasoningItemsFromEvents(events, gatewayNativeReasoningScope(c))
 		writeEvents(events)
 	}, strictTerminal)
+	defer func() {
+		scan.NativeUsage.Finalized = true
+		if observe, ok := c.Request.Context().Value(gatewayNativeUsageObserverKey{}).(func(GatewayNativeUsage)); ok {
+			observe(scan.NativeUsage)
+		}
+	}()
 	if strictTerminal && clientDisconnected {
 		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureWrite)
 	}
@@ -363,6 +369,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 	if !scan.SawDone {
 		logCCStreamMissingDoneSentinel("openai responses chat fallback", requestID)
+	}
+	if scan.SawDone && scan.SawFinish && !clientDisconnected && scan.NativeUsage.InputTokens != nil && scan.NativeUsage.OutputTokens != nil {
+		scan.NativeUsage.State = "complete"
 	}
 
 	return &OpenAIForwardResult{

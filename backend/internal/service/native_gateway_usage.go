@@ -70,3 +70,23 @@ func gatewayNativeObserveUsage(output []byte, observation *GatewayNativeUsage, c
 		observation.State = "complete"
 	}
 }
+
+// Chat usage keeps absent counters absent; the typed compatibility usage has
+// zero-valued integers and cannot establish native accounting completeness.
+func gatewayNativeObserveChatUsage(output []byte, observation *GatewayNativeUsage) {
+	fields, ok := gatewayNativeCanonicalObject(output, "usage")
+	if !ok || fields["usage"] == nil {
+		return
+	}
+	usage, ok := gatewayNativeCanonicalObject(fields["usage"], "prompt_tokens", "completion_tokens", "prompt_tokens_details", "completion_tokens_details")
+	if !ok {
+		return
+	}
+	normalized, err := json.Marshal(map[string]any{"usage": map[string]json.RawMessage{
+		"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"],
+		"input_tokens_details": usage["prompt_tokens_details"], "output_tokens_details": usage["completion_tokens_details"],
+	}})
+	if err == nil {
+		gatewayNativeObserveUsage(normalized, observation, false)
+	}
+}
