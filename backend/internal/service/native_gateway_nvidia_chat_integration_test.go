@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -104,13 +106,58 @@ func TestGatewayNVIDIABuildProtectedChatModelsAndToolCall(t *testing.T) {
 			require.NoError(t, err)
 			require.Contains(t, string(secondWire), `"tool_call_id":"call_synthetic"`)
 			require.Contains(t, string(secondWire), `"role":"tool"`)
+			// A known token-limit terminal closes the provider request, but its
+			// response must remain incomplete and cannot qualify a lifecycle result.
+			for _, terminal := range []struct {
+				name, stream string
+				known        bool
+			}{
+				{"text length", strings.Replace(nextSSE, `"finish_reason":"stop"`, `"finish_reason":"length"`, 1), true},
+				{"empty length", strings.Replace(nativeReviewCCFinish, "stop", "length", 1) + nativeReviewDone, true},
+				{"missing terminal", nativeReviewCCDelta + nativeReviewDone, false},
+				{"tool length", strings.Replace(syntheticSSE, `"finish_reason":"tool_calls"`, `"finish_reason":"length"`, 1), false},
+				{"partial tool length", `data: {"id":"sandbox","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_truncated","type":"function","function":{"name":"echo_status","arguments":"{"}}]},"finish_reason":null}]}` + "\n\n" + strings.Replace(nativeReviewCCFinish, "stop", "length", 1) + nativeReviewDone, false},
+			} {
+				t.Run(terminal.name, func(t *testing.T) {
+					upstream.response.Body = io.NopCloser(strings.NewReader(terminal.stream))
+					rec, entered, err := call(payload)
+					require.True(t, entered)
+					if terminal.known {
+						require.NoError(t, err)
+						require.Contains(t, rec.Body.String(), `"status":"incomplete"`)
+						require.Contains(t, rec.Body.String(), `"reason":"max_output_tokens"`)
+						require.Contains(t, rec.Body.String(), "[DONE]")
+					} else {
+						require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
+						require.NotContains(t, rec.Body.String(), "response.completed")
+						require.NotContains(t, rec.Body.String(), "response.function_call_arguments.done")
+						require.NotContains(t, rec.Body.String(), "[DONE]")
+					}
+				})
+			}
+			// NVIDIA's streaming-only admission remains unchanged, independently
+			// of the historical bridge's buffered incomplete-result support.
+			_, bufferedEntered, bufferedErr := call([]byte(strings.Replace(string(payload), `"stream":true`, `"stream":false`, 1)))
+			require.False(t, bufferedEntered)
+			require.ErrorIs(t, bufferedErr, ErrGatewayNativeIdentity)
 			for _, unsupported := range []string{"vendor/mismatched", GatewayNVIDIABuildAnchorModel + ":free"} {
 				wrong := []byte(strings.Replace(string(payload), model, unsupported, 1))
 				_, entered, err := call(wrong)
 				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 				require.False(t, entered)
-				require.Equal(t, 2, upstream.requests)
+				require.Equal(t, 7, upstream.requests)
 			}
 		})
 	}
+}
+
+// Exercise the real protected NVIDIA failure path in a fresh process, where
+// native stderr is the existing bounded Gateway diagnostic input.
+func TestGatewayNVIDIABuildTerminalDiagnostics(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestGatewayNVIDIABuildProtectedChatModelsAndToolCall$")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), `{"event":"gateway_native_response_failure","phase":"invalid_final"}`)
+	require.NotContains(t, string(output), "nvidia-synthetic-credential")
+	require.NotContains(t, string(output), "call_truncated")
 }

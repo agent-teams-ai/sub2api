@@ -68,7 +68,10 @@ func TestGatewayNativeReviewLegacyStrictTerminal(t *testing.T) {
 		{"completed delivery failure", nativeReviewCCDelta + nativeReviewCCFinish + nativeReviewDone, "response.completed", false},
 		{"DONE delivery failure", nativeReviewCCDelta + nativeReviewCCFinish + nativeReviewDone, "[DONE]", false},
 		{"qualified finish and terminal", nativeReviewCCDelta + nativeReviewCCFinish + nativeReviewDone, "", true},
-		{"incomplete finish", strings.Replace(nativeReviewCCFinish, "stop", "length", 1) + nativeReviewDone, "", false},
+		{"empty length terminal", strings.Replace(nativeReviewCCFinish, "stop", "length", 1) + nativeReviewDone, "", true},
+		{"text length terminal", nativeReviewCCDelta + strings.Replace(nativeReviewCCFinish, "stop", "length", 1) + nativeReviewDone, "", true},
+		{"unknown terminal", nativeReviewCCDelta + strings.Replace(nativeReviewCCFinish, "stop", "content_filter", 1) + nativeReviewDone, "", false},
+		{"length without DONE", nativeReviewCCDelta + strings.Replace(nativeReviewCCFinish, "stop", "length", 1), "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,6 +102,12 @@ func TestGatewayNativeReviewLegacyStrictTerminal(t *testing.T) {
 				require.NoError(t, err)
 				require.Contains(t, rec.Body.String(), "response.completed")
 				require.Contains(t, rec.Body.String(), "[DONE]")
+				if strings.Contains(tc.name, "length terminal") {
+					require.Contains(t, rec.Body.String(), `"status":"incomplete"`)
+					require.Contains(t, rec.Body.String(), `"reason":"max_output_tokens"`)
+				} else {
+					require.NotContains(t, rec.Body.String(), `"status":"incomplete"`)
+				}
 			} else {
 				require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
 				// A failure writing DONE occurs after a genuinely qualified completed event.

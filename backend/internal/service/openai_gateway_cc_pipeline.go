@@ -392,7 +392,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 			}
 			if len(chunk.Choices) == 1 {
 				finish := chunk.Choices[0].FinishReason
-				st.SawFinish = finish != nil && (*finish == "stop" || *finish == "tool_calls")
+				st.SawFinish = finish != nil && (*finish == "stop" || *finish == "tool_calls" || *finish == "length")
 			}
 		}
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
