@@ -271,8 +271,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 type ccStreamScanState struct {
 	// Usage 为 include_usage chunk 中最近一次出现的用量（上游可能重复发送，
 	// 总是保留最新值）；终态事件中的用量由调用方在 finalize 阶段自行覆盖。
-	Usage       OpenAIUsage
-	NativeUsage GatewayNativeUsage
+	Usage            OpenAIUsage
+	NativeUsage      GatewayNativeUsage
+	NativeUsageFinal bool
 	// FirstTokenMs 为首个实际输出 chunk（排除 usage-only chunk）的到达时延。
 	FirstTokenMs *int
 	// SawDone 表示上游发出了 [DONE] 哨兵。
@@ -397,7 +398,9 @@ func (s *OpenAIGatewayService) scanCCStream(
 				st.SawFinish = finish != nil && (*finish == "stop" || *finish == "tool_calls" || *finish == "length")
 			}
 		}
-		gatewayNativeObserveChatUsage([]byte(payload), &st.NativeUsage)
+		if gatewayNativeObserveChatUsage([]byte(payload), &st.NativeUsage) && st.SawFinish {
+			st.NativeUsageFinal = true
+		}
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
 			st.FirstTokenMs = &ms

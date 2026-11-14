@@ -20,7 +20,7 @@ func TestGatewayNativeNVIDIAChatUsage(t *testing.T) {
 		input, output, cached, reasoning *int64
 		failure                          bool
 	}{
-		{"complete", `{"prompt_tokens":9,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2},"completion_tokens_details":{"reasoning_tokens":1}}`, "stop", nativeReviewDone, "complete", usageTestCount(9), usageTestCount(3), usageTestCount(2), usageTestCount(1), false},
+		{"complete", `{"total_tokens":12,"prompt_tokens":9,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2},"completion_tokens_details":{"reasoning_tokens":1}}`, "stop", nativeReviewDone, "complete", usageTestCount(9), usageTestCount(3), usageTestCount(2), usageTestCount(1), false},
 		{"input only", `{"prompt_tokens":9}`, "stop", nativeReviewDone, "partial", usageTestCount(9), nil, nil, nil, false},
 		{"output only", `{"completion_tokens":3}`, "stop", nativeReviewDone, "partial", nil, usageTestCount(3), nil, nil, false},
 		{"absent", ``, "stop", nativeReviewDone, "unknown", nil, nil, nil, nil, false},
@@ -28,6 +28,8 @@ func TestGatewayNativeNVIDIAChatUsage(t *testing.T) {
 		{"missing DONE", `{"prompt_tokens":9,"completion_tokens":3}`, "stop", "", "partial", usageTestCount(9), usageTestCount(3), nil, nil, true},
 		{"failed stream", `{"prompt_tokens":9,"completion_tokens":3}`, "stop", "data: {invalid\n\n", "partial", usageTestCount(9), usageTestCount(3), nil, nil, true},
 		{"downstream failure", `{"prompt_tokens":9,"completion_tokens":3}`, "stop", nativeReviewDone, "partial", usageTestCount(9), usageTestCount(3), nil, nil, true},
+		{"early usage only", `{"prompt_tokens":9,"completion_tokens":3}`, "stop", nativeReviewDone, "partial", usageTestCount(9), usageTestCount(3), nil, nil, false},
+		{"usage on finish", `{"prompt_tokens":9,"completion_tokens":3}`, "stop", nativeReviewDone, "complete", usageTestCount(9), usageTestCount(3), nil, nil, false},
 		{"known length", `{"prompt_tokens":9,"completion_tokens":3}`, "length", nativeReviewDone, "complete", usageTestCount(9), usageTestCount(3), nil, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -38,7 +40,11 @@ func TestGatewayNativeNVIDIAChatUsage(t *testing.T) {
 			route, err := GatewayNativeDescriptor(account)
 			require.NoError(t, err)
 			frames := strings.ReplaceAll(nativeReviewCCDelta+strings.Replace(nativeReviewCCFinish, `"stop"`, `"`+tc.finish+`"`, 1), "mimo-test", GatewayNVIDIABuildAnchorModel)
-			if tc.usage != "" {
+			if tc.name == "early usage only" {
+				frames = "data: {\"choices\":[],\"usage\":" + tc.usage + "}\n\n" + frames
+			} else if tc.name == "usage on finish" {
+				frames = strings.Replace(frames, `"finish_reason":"stop"}]}`, `"finish_reason":"stop"}],"usage":`+tc.usage+`}`, 1)
+			} else if tc.usage != "" {
 				frames += "data: {\"choices\":[],\"usage\":" + tc.usage + "}\n\n"
 			}
 			frames += tc.done

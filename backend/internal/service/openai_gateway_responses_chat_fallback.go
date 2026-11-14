@@ -370,7 +370,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	if !scan.SawDone {
 		logCCStreamMissingDoneSentinel("openai responses chat fallback", requestID)
 	}
-	if scan.SawDone && scan.SawFinish && !clientDisconnected && scan.NativeUsage.InputTokens != nil && scan.NativeUsage.OutputTokens != nil {
+	if scan.SawDone && scan.SawFinish && scan.NativeUsageFinal && !clientDisconnected && scan.NativeUsage.InputTokens != nil && scan.NativeUsage.OutputTokens != nil {
 		scan.NativeUsage.State = "complete"
 	}
 
