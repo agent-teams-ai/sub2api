@@ -175,7 +175,7 @@ func (r *ownerFixtureRepo) LockGatewayNativeAccount(_ context.Context, id int64)
 // One simultaneous catalog, real admit HTTP and TLS Responses entry for both
 // presets. Cross-tuples and each profile's own caps deny before callback/entry.
 func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
-	var entries, admits atomic.Int32
+	var entries, admits, glmCatalogue atomic.Int32
 	const dynamicOpenRouterModel = "unseen-vendor/new-model:free"
 	var driftAfterAdmit atomic.Bool
 	var quotaResponse atomic.Bool
@@ -202,8 +202,12 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 			models := map[string]string{"api.kimi.ai": "k3-256k", "api.z.ai": "glm-5.3-flash", "api.minimax.io": "MiniMax-M3.1-Flash"}
 			require.Equal(t, paths[r.Host], r.URL.Path)
 			if r.Host == "api.z.ai" {
-				// The GLM catalog carries the model through unchanged.
+				// The GLM catalog carries the model through unchanged; count the
+				// catalogue model separately so a swap in either direction is caught.
 				require.Contains(t, []any{models[r.Host], "glm-5.3"}, payload["model"])
+				if payload["model"] == "glm-5.3" {
+					glmCatalogue.Add(1)
+				}
 			} else {
 				require.Equal(t, models[r.Host], payload["model"])
 			}
@@ -407,6 +411,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 	require.NoError(t, glmResult.err)
 	require.Equal(t, http.StatusOK, glmResult.code)
 	require.Contains(t, string(glmResult.body), "controlled final")
+	require.EqualValues(t, 1, glmCatalogue.Load(), "exactly the catalogue request reaches the provider as glm-5.3")
 	require.EqualValues(t, 9, admits.Load())
 	require.EqualValues(t, 9, entries.Load())
 	for _, model := range []string{"glm-5.2", "GLM-5.3", "glm-5.3-extra"} {

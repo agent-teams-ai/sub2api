@@ -192,7 +192,11 @@ func TestGatewayGLMAccountModelsCatalog(t *testing.T) {
 				return route, nil
 			})
 			require.NoError(t, err)
-			result := reader.Read(nativeFixtureContext(t, context.Background()), input)
+			// The catalogue never decodes the key, so it must be readable with a
+			// context that carries the consumer but no credential custody at all.
+			ctx, err := WithGatewayNativeConsumer(context.Background(), custodyTestScope().Consumer)
+			require.NoError(t, err)
+			result := reader.Read(ctx, input)
 			switch change {
 			case "none":
 			case "profile":
@@ -222,6 +226,43 @@ func TestGatewayGLMAccountModelsCatalog(t *testing.T) {
 			require.NoError(t, err)
 			require.NotContains(t, string(wire), "sandbox-fixture")
 			require.NotContains(t, string(wire), "gcn1.")
+		})
+	}
+}
+
+// The locked entry boundary rechecks the outgoing body against the catalogue.
+// Every negative case below passes the earlier admission and must still stop
+// here, before the credential is decoded; the control shows nothing else refuses.
+func TestGatewayNativeGLMCatalogFinalEntryBoundary(t *testing.T) {
+	for _, tuple := range []struct {
+		name, requested, body string
+		ok                    bool
+	}{
+		{"catalogue model", GatewayGLMCodingResponsesModelFull, GatewayGLMCodingResponsesModelFull, true},
+		{"requested outside the catalogue", "glm-5.2", "glm-5.2", false},
+		{"body differs from the admitted model", GatewayGLMCodingResponsesModelFull, GatewayGLMCodingResponsesModel, false},
+		{"body outside the catalogue", GatewayGLMCodingResponsesModelFull, "glm-5.2", false},
+	} {
+		t.Run(tuple.name, func(t *testing.T) {
+			account := nativeReviewStreamAccount(t, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesProfile)
+			account.Extra[GatewayModelExtraKey] = GatewayGLMCodingResponsesModel
+			route, err := GatewayNativeDescriptor(account)
+			require.NoError(t, err)
+			gateway := &OpenAIGatewayService{accountRepo: &gatewayIdentityRepoFixture{row: account}}
+			state := &gatewayNativeDispatch{route: route, account: account, scope: nativeFixtureScope(account), custody: nativeFixtureCustody(t), requestedModel: tuple.requested}
+			ctx := context.WithValue(nativeFixtureContext(t, context.Background()), gatewayNativeContextKey{}, state)
+			target, err := gateway.gatewayNativeTargetURL(account)
+			require.NoError(t, err)
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(fmt.Sprintf(`{"model":%q,"input":"text"}`, tuple.body)))
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+account.GetCredential("api_key"))
+			release, err := gateway.checkGatewayNativeDispatch(request, account)
+			release()
+			if tuple.ok {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 		})
 	}
 }
