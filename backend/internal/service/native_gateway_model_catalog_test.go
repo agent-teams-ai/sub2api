@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,9 +21,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// The static lower bound is exact membership. Only GLM has a documented model
-// beside its anchor, and the enrollment anchor itself is never widened.
-func TestGatewayCodingPlanModelAdmission(t *testing.T) {
+// The static lower bound is exact membership (no prefix, alias or case folding).
+// Only GLM has a documented model beside its anchor, and the enrollment anchor
+// itself is never widened.
+func TestGatewayCatalogStaticModelAdmission(t *testing.T) {
 	for _, tuple := range []struct {
 		profile, model string
 		admitted       bool
@@ -37,15 +39,19 @@ func TestGatewayCodingPlanModelAdmission(t *testing.T) {
 		{GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesModelFull, false},
 		{GatewayMiniMaxMPlanResponsesProfile, GatewayMiniMaxMPlanResponsesModel, true},
 		{GatewayMiniMaxMPlanResponsesProfile, "MiniMax-M3", false},
-		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel, false},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel, true},
+		{GatewayNVIDIABuildChatProfile, GatewayNVIDIABuildAnchorModel + " ", false},
+		{GatewayNVIDIABuildChatProfile, "z-ai/glm-5.3-flash", false},
 		{"unknown-profile", GatewayGLMCodingResponsesModelFull, false},
 	} {
-		require.Equal(t, tuple.admitted, GatewayCodingPlanStaticModelAdmitted(tuple.profile, tuple.model), "%s %q", tuple.profile, tuple.model)
+		require.Equal(t, tuple.admitted, slices.Contains(gatewayCatalogStaticModelIDs(tuple.profile), tuple.model), "%s %q", tuple.profile, tuple.model)
 	}
-	require.True(t, GatewayCodingPlanCatalogProfile(GatewayGLMCodingResponsesProfile))
-	require.True(t, GatewayCodingPlanCatalogProfile(GatewayKimiCodeResponsesProfile))
-	require.True(t, GatewayCodingPlanCatalogProfile(GatewayMiniMaxMPlanResponsesProfile))
-	require.False(t, GatewayCodingPlanCatalogProfile(GatewayNVIDIABuildChatProfile))
+	for _, profile := range []string{GatewayGLMCodingResponsesProfile, GatewayKimiCodeResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayNVIDIABuildChatProfile} {
+		require.True(t, GatewayModelCatalogProfile(profile), profile)
+	}
+	for _, profile := range []string{GatewayOpenRouterResponsesProfile, GatewayCodexOAuthResponsesProfile, GatewayGrokOAuthResponsesProfile, GatewayMiMoResponsesProfile} {
+		require.False(t, GatewayModelCatalogProfile(profile), profile)
+	}
 	require.True(t, GatewayNativeCodingPlanProfileValid(GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesModel))
 	require.False(t, GatewayNativeCodingPlanProfileValid(GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesModelFull),
 		"the enrollment anchor stays the single birth model")
