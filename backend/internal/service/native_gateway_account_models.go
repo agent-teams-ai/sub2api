@@ -148,7 +148,9 @@ func (s *GatewayAccountModelsReader) Read(ctx context.Context, in GatewayAccount
 
 // Native alone qualifies a bounded static model set for one exact managed
 // API-key account (NVIDIA Build and the coding plans with a catalog). This is
-// NOT an upstream entitlement/credit observation, and it never decrypts the key.
+// NOT an upstream entitlement/credit observation. It does not decrypt the key
+// itself; a coding plan catalogue callback may read the provider list through the
+// read-only quota lease.
 // Owner, physical generation and current encrypted account are checked again.
 func (s *GatewayAccountModelsReader) readStaticCatalogAccountModels(
 	ctx context.Context, in GatewayAccountModelsInput, before GatewayNativeRoute,

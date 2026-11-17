@@ -23,19 +23,21 @@ import (
 // the provider decides, with the static catalogue as the lower bound. Dispatch
 // never reads the network and never takes this lease (see peek).
 const (
-	gatewayCodingPlanModelsMax        = 8 // the Gateway contract bounds a snapshot to 8 models
-	gatewayCodingPlanModelsFreshFor   = 5 * time.Minute
-	gatewayCodingPlanModelsAdmitFor   = 24 * time.Hour
-	gatewayCodingPlanModelsEntriesMax = 256
-	gatewayCodingPlanModelsFetchSlots = 2
-	gatewayCodingPlanModelsTimeout    = 2 * time.Second
+	gatewayCodingPlanModelsMax         = 8 // the Gateway contract bounds a snapshot to 8 models
+	gatewayCodingPlanModelsFreshFor    = 5 * time.Minute
+	gatewayCodingPlanModelsAdmitFor    = 24 * time.Hour
+	gatewayCodingPlanModelsEntriesMax  = 256
+	gatewayCodingPlanModelsFetchSlots  = 2
+	gatewayCodingPlanModelsTimeout     = 2 * time.Second
+	gatewayCodingPlanModelsFailBackoff = time.Minute // a failed read is not retried sooner, even when forced
 )
 
 // gatewayCodingPlanLiveEntry keeps the last SUCCESSFUL provider list; a failed
 // fetch never replaces it.
 type gatewayCodingPlanLiveEntry struct {
 	models  []string
-	fetched time.Time
+	fetched time.Time // last SUCCESSFUL read; zero when there never was one
+	failed  time.Time // last failed read; spaces out the next attempt
 }
 
 // GatewayCodingPlanLiveModels is a small in-memory store: one entry per
@@ -101,17 +103,23 @@ func (l *GatewayCodingPlanLiveModels) fresh(key string, force bool) ([]string, b
 	if !ok {
 		return nil, false
 	}
-	return slices.Clone(entry.models), !force && l.now().Sub(entry.fetched) < gatewayCodingPlanModelsFreshFor
+	now := l.now()
+	// A recent failure counts as fresh so that a broken endpoint is asked once a
+	// minute, not once per request, whether or not the caller forces a refresh.
+	recentFailure := !entry.failed.IsZero() && now.Sub(entry.failed) < gatewayCodingPlanModelsFailBackoff
+	recentSuccess := !entry.fetched.IsZero() && !force && now.Sub(entry.fetched) < gatewayCodingPlanModelsFreshFor
+	return slices.Clone(entry.models), recentFailure || recentSuccess
 }
 
-func (l *GatewayCodingPlanLiveModels) store(key string, models []string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if len(l.entries) >= gatewayCodingPlanModelsEntriesMax {
-		for old, entry := range l.entries {
-			if l.now().Sub(entry.fetched) >= gatewayCodingPlanModelsAdmitFor {
-				delete(l.entries, old)
-			}
+// evictLocked keeps the store bounded: expired entries first, then one arbitrary
+// entry (a dropped entry only narrows admission back to anchor and static).
+func (l *GatewayCodingPlanLiveModels) evictLocked(key string) {
+	if _, ok := l.entries[key]; ok || len(l.entries) < gatewayCodingPlanModelsEntriesMax {
+		return
+	}
+	for old, entry := range l.entries {
+		if l.now().Sub(entry.fetched) >= gatewayCodingPlanModelsAdmitFor && l.now().Sub(entry.failed) >= gatewayCodingPlanModelsFailBackoff {
+			delete(l.entries, old)
 		}
 	}
 	if len(l.entries) >= gatewayCodingPlanModelsEntriesMax {
@@ -120,49 +128,68 @@ func (l *GatewayCodingPlanLiveModels) store(key string, models []string) {
 			break
 		}
 	}
+}
+
+func (l *GatewayCodingPlanLiveModels) store(key string, models []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evictLocked(key)
 	l.entries[key] = gatewayCodingPlanLiveEntry{models: slices.Clone(models), fetched: l.now()}
 }
 
-// refresh updates the entry from the provider when it is not fresh. Failure,
-// a busy slot or a concurrent refresh keeps whatever was last stored.
+// fail records a failed read and keeps the last good list untouched.
+func (l *GatewayCodingPlanLiveModels) fail(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evictLocked(key)
+	entry := l.entries[key]
+	entry.failed = l.now()
+	l.entries[key] = entry
+}
+
+// refresh updates the entry from the provider when it is not fresh. A busy slot
+// or a concurrent refresh returns at once with whatever is stored; failure keeps
+// the last good list and is remembered so it is not retried per request.
 func (l *GatewayCodingPlanLiveModels) refresh(ctx context.Context, key string, force bool, fetch func(context.Context) ([]string, error)) {
 	if l == nil || fetch == nil {
 		return
 	}
-	for {
-		if _, fresh := l.fresh(key, force); fresh {
-			return
-		}
-		l.mu.Lock()
-		if wait := l.pending[key]; wait != nil {
-			l.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return
-			case <-wait:
-				force = false
-				continue
-			}
-		}
-		select {
-		case l.slots <- struct{}{}:
-		default:
-			l.mu.Unlock()
-			return
-		}
-		done := make(chan struct{})
-		l.pending[key] = done
+	if _, fresh := l.fresh(key, force); fresh {
+		return
+	}
+	l.mu.Lock()
+	if wait := l.pending[key]; wait != nil {
 		l.mu.Unlock()
-		models, err := fetch(ctx)
-		<-l.slots
-		if err == nil {
-			l.store(key, models)
+		select {
+		case <-ctx.Done():
+		case <-wait:
 		}
+		return
+	}
+	select {
+	case l.slots <- struct{}{}:
+	default:
+		l.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	l.pending[key] = done
+	l.mu.Unlock()
+	failed := true
+	defer func() {
+		<-l.slots
 		l.mu.Lock()
 		delete(l.pending, key)
 		l.mu.Unlock()
 		close(done)
-		return
+		if failed {
+			l.fail(key)
+		}
+	}()
+	models, err := fetch(ctx)
+	if err == nil {
+		l.store(key, models)
+		failed = false
 	}
 }
 
@@ -224,6 +251,9 @@ func (c *GatewayProviderQuotaCollector) FetchModels(ctx context.Context, profile
 		return nil, ErrGatewayProviderQuota
 	}
 	sort.Strings(valid)
+	if len(valid) > gatewayCodingPlanModelsMax {
+		valid = valid[:gatewayCodingPlanModelsMax]
+	}
 	return valid, nil
 }
 
@@ -258,10 +288,9 @@ func (s *OpenAIGatewayService) gatewayCodingPlanAdmitted(scope GatewayNativeCred
 	if !GatewayCodingPlanCatalogProfile(profile) || !GatewayAccountModelIDValid(model) {
 		return false
 	}
-	if GatewayCodingPlanStaticModelAdmitted(profile, model) {
-		return true
-	}
-	return slices.Contains(s.codingPlanLive().peek(gatewayCodingPlanLivePrincipal(scope, envelope)), model)
+	// Admit exactly what the account catalogue publishes: anchor, static, last good live list.
+	static := gatewayCodingPlanStaticModelIDs(profile)
+	return slices.Contains(gatewayCodingPlanCatalogue(profile, static[0], s.codingPlanLive().peek(gatewayCodingPlanLivePrincipal(scope, envelope))), model)
 }
 
 // codingPlanCatalogueModels builds the catalogue for one authorized account,
@@ -272,6 +301,9 @@ func (s *OpenAIGatewayService) codingPlanCatalogueModels(ctx context.Context, in
 	key := gatewayCodingPlanLivePrincipal(scope, envelope)
 	custody := gatewayNativeCustody(ctx)
 	live.refresh(ctx, key, in.ForceRefresh, func(fetchCtx context.Context) ([]string, error) {
+		// One bound for the whole read: waiting for the row lock counts too.
+		fetchCtx, cancel := context.WithTimeout(fetchCtx, gatewayCodingPlanModelsTimeout)
+		defer cancel()
 		var models []string
 		err := s.WithGatewayNativeQuotaCredential(fetchCtx, scope, route, custody, func(credential []byte, _ GatewayNativeOAuthPhysical) error {
 			var e error

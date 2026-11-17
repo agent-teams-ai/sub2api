@@ -20,8 +20,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// The catalog is exact membership. Only GLM has a model beside its anchor, and
-// the enrollment anchor itself is never widened.
+// The static lower bound is exact membership. Only GLM has a documented model
+// beside its anchor, and the enrollment anchor itself is never widened.
 func TestGatewayCodingPlanModelAdmission(t *testing.T) {
 	for _, tuple := range []struct {
 		profile, model string
@@ -184,7 +184,8 @@ func TestGatewayGLMAccountModelsCatalog(t *testing.T) {
 				return route, nil
 			})
 			require.NoError(t, err)
-			// The catalogue never decodes the key, so it must be readable with a
+			// Without credential custody the lease refuses before any network use, so the
+			// catalogue is the static lower bound; it must be readable with a
 			// context that carries the consumer but no credential custody at all.
 			ctx, err := WithGatewayNativeConsumer(context.Background(), custodyTestScope().Consumer)
 			require.NoError(t, err)
@@ -192,7 +193,7 @@ func TestGatewayGLMAccountModelsCatalog(t *testing.T) {
 			switch change {
 			case "none":
 			case "profile":
-				// Kimi has no catalogue; its stored route is a GLM route, so no snapshot.
+				// Kimi profile with a GLM route: the route does not match, so no snapshot.
 				require.NotEqual(t, "snapshot", result.Status)
 				return
 			default:

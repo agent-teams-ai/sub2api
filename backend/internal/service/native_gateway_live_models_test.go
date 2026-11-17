@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -74,6 +75,10 @@ func (f *liveModelsFixture) read(force bool) []string {
 	input := f.input
 	input.ForceRefresh = force
 	result := f.reader.Read(nativeFixtureContext(f.t, context.Background()), input)
+	wire, err := json.Marshal(result)
+	require.NoError(f.t, err)
+	require.NotContains(f.t, string(wire), "sandbox-fixture")
+	require.NotContains(f.t, string(wire), "gcn1.")
 	require.Equal(f.t, "snapshot", result.Status, "the catalogue is always a snapshot")
 	require.Equal(f.t, "native_catalog", result.Source)
 	ids := make([]string, 0, len(*result.Models))
@@ -142,6 +147,37 @@ func TestGatewayCodingPlanLiveModelsAreBoundedToTheContract(t *testing.T) {
 	got := f.read(false)
 	require.Len(t, got, gatewayCodingPlanModelsMax)
 	require.Equal(t, []string{GatewayGLMCodingResponsesModel, GatewayGLMCodingResponsesModelFull, "vendor/model-00", "vendor/model-01", "vendor/model-02", "vendor/model-03", "vendor/model-04", "vendor/model-05"}, got)
+	// Native admits exactly what it publishes, not the rest of the provider's list.
+	envelope := f.account.GetCredential("api_key")
+	require.True(t, f.gateway.gatewayCodingPlanAdmitted(f.scope, envelope, GatewayGLMCodingResponsesProfile, "vendor/model-05"))
+	require.False(t, f.gateway.gatewayCodingPlanAdmitted(f.scope, envelope, GatewayGLMCodingResponsesProfile, "vendor/model-29"))
+}
+
+// A broken endpoint is asked once, not once per request: concurrent reads share one
+// attempt, and the failure is remembered for a minute even when a refresh is forced.
+func TestGatewayCodingPlanLiveModelsFailureIsRememberedAndShared(t *testing.T) {
+	f := newLiveModelsFixture(t, GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesModel, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(gatewayCodingPlanModelsTimeout + 300*time.Millisecond)
+		w.WriteHeader(http.StatusGatewayTimeout)
+	})
+	static := []string{GatewayGLMCodingResponsesModel, GatewayGLMCodingResponsesModelFull}
+	started := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.Equal(t, static, f.read(false))
+		}()
+	}
+	wg.Wait()
+	require.EqualValues(t, 1, f.calls.Load(), "concurrent reads share a single provider attempt")
+	require.Less(t, time.Since(started), 2*gatewayCodingPlanModelsTimeout+time.Second, "waiters are not queued behind one another")
+	require.Equal(t, static, f.read(true))
+	require.EqualValues(t, 1, f.calls.Load(), "within the backoff even a forced read does not ask again")
+	f.advance(gatewayCodingPlanModelsFailBackoff + time.Second)
+	require.Equal(t, static, f.read(false))
+	require.EqualValues(t, 2, f.calls.Load(), "after the backoff the provider is asked again")
 }
 
 // Any failure of the provider read leaves exactly the static lower bound; the
@@ -154,7 +190,8 @@ func TestGatewayCodingPlanLiveModelsFailuresFallBackToStatic(t *testing.T) {
 		"server error": func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
 		"unauthorized": func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) },
 		"redirect": func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "https://elsewhere.invalid/models", http.StatusFound)
+			// Relative: if the client followed it, the peer would be called twice.
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
 		},
 		"empty list":     serveModels(modelsJSON()),
 		"malformed":      serveModels(`{"data":[`),
@@ -169,6 +206,9 @@ func TestGatewayCodingPlanLiveModelsFailuresFallBackToStatic(t *testing.T) {
 			f := newLiveModelsFixture(t, GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesModel, handler)
 			require.Equal(t, static, f.read(false))
 			require.NotZero(t, f.calls.Load())
+			if name == "redirect" {
+				require.EqualValues(t, 1, f.calls.Load(), "a redirect is never followed")
+			}
 		})
 	}
 }
@@ -258,6 +298,8 @@ func TestGatewayNativeLiveModelAdmissionAtDispatch(t *testing.T) {
 			f := newLiveModelsFixture(t, GatewayGLMCodingResponsesProfile, GatewayGLMCodingResponsesBaseURL, GatewayGLMCodingResponsesModel, func(http.ResponseWriter, *http.Request) {
 				t.Error("dispatch must never read the models endpoint")
 			})
+			locks := &lockCountingRepo{gatewayIdentityRepoFixture: gatewayIdentityRepoFixture{row: f.account}}
+			f.gateway.accountRepo = locks
 			var providerCalls atomic.Int32
 			var providerModel atomic.Value
 			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +326,7 @@ func TestGatewayNativeLiveModelAdmissionAtDispatch(t *testing.T) {
 				require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 				require.False(t, entered)
 				require.Zero(t, providerCalls.Load())
+				require.Zero(t, locks.locks.Load(), "an unlisted model is refused at admission, before the credential row lock")
 				return
 			}
 			require.NoError(t, err)
@@ -331,4 +374,15 @@ func TestGatewayNativeLiveModelFinalEntryBoundary(t *testing.T) {
 			require.Zero(t, f.calls.Load())
 		})
 	}
+}
+
+// lockCountingRepo counts how often the credential row lock is taken.
+type lockCountingRepo struct {
+	gatewayIdentityRepoFixture
+	locks atomic.Int32
+}
+
+func (r *lockCountingRepo) LockGatewayNativeAccount(ctx context.Context, id int64) (*Account, func(), error) {
+	r.locks.Add(1)
+	return r.gatewayIdentityRepoFixture.LockGatewayNativeAccount(ctx, id)
 }

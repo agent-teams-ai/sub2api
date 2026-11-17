@@ -402,7 +402,7 @@ func TestFiniteAPIKeyProfilesHTTPAdmissionAndForward(t *testing.T) {
 		require.Contains(t, string(result.body), "controlled final")
 	}
 	// The GLM catalog model beside the enrollment anchor passes the same
-	// transport; a model outside the catalog is rejected before admission.
+	// transport; a model outside the catalogue is claimed and refused in dispatch.
 	glm := inputs[3]
 	require.Equal(t, service.GatewayGLMCodingResponsesProfile, glm.Descriptor.Profile)
 	glm.RequestRef += "-catalog-model"
