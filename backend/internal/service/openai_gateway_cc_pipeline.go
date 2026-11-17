@@ -283,6 +283,12 @@ type ccStreamScanState struct {
 	// 非 nil 时调用方必须跳过 finalize 并返回 usage-incomplete 错误，避免
 	// 把上游截断伪装成正常收尾。
 	Err error
+	// StrictFailure is the closed diagnostic phase of a failed strict scan, and
+	// StrictReadErr the body read or request error behind an sse_read phase.
+	// A cancelled caller must not read as an incomplete provider stream. They
+	// only feed diagnostics and never reach the client.
+	StrictFailure gatewayNativeResponseFailurePhase
+	StrictReadErr error
 }
 
 // scanCCStream 驱动两条 CC 回退路径共享的 SSE 读循环：提取 data 行、在 [DONE]
@@ -307,6 +313,10 @@ func (s *OpenAIGatewayService) scanCCStream(
 		// Retain the configured line cap and count original LF/CRLF frame bytes.
 		scanner.Split(gatewayNativeRawSSELine)
 	}
+	failStrict := func(phase gatewayNativeResponseFailurePhase) ccStreamScanState {
+		st.Err, st.StrictFailure = ErrGatewayNativeEffectUnknown, phase
+		return st
+	}
 	var data strings.Builder
 	haveData, frameBytes := false, 0
 	for scanner.Scan() {
@@ -314,9 +324,14 @@ func (s *OpenAIGatewayService) scanCCStream(
 		var payload string
 		if strict {
 			frameBytes += len(line)
-			if frameBytes > gatewayNativeSSEFrameLimit || !utf8.ValidString(line) || !strings.HasSuffix(line, "\n") {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
+			switch {
+			case frameBytes > gatewayNativeSSEFrameLimit:
+				return failStrict(gatewayNativeFailureFrameLimit)
+			case !utf8.ValidString(line):
+				return failStrict(gatewayNativeFailureFrame)
+			case !strings.HasSuffix(line, "\n"):
+				// The body ended inside a line.
+				return failStrict(gatewayNativeFailureIncomplete)
 			}
 			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 			if line != "" {
@@ -351,15 +366,13 @@ func (s *OpenAIGatewayService) scanCCStream(
 		payload = strings.TrimSpace(payload)
 		if payload == "" {
 			if strict {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
+				return failStrict(gatewayNativeFailureEvent)
 			}
 			continue
 		}
 		if payload == "[DONE]" {
 			if strict && !st.SawFinish {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
+				return failStrict(gatewayNativeFailureFinal)
 			}
 			st.SawDone = true
 			break
@@ -379,8 +392,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 		var chunk apicompat.ChatCompletionsChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			if strict {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
+				return failStrict(gatewayNativeFailureEvent)
 			}
 			logger.L().Warn(logPrefix+": failed to parse chat stream chunk",
 				zap.Error(err),
@@ -390,8 +402,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 		}
 		if strict {
 			if !gatewayNativeLegacyChunk([]byte(payload), &chunk) || (st.SawFinish && len(chunk.Choices) > 0) {
-				st.Err = ErrGatewayNativeEffectUnknown
-				return st
+				return failStrict(gatewayNativeFailureEvent)
 			}
 			if len(chunk.Choices) == 1 {
 				finish := chunk.Choices[0].FinishReason
@@ -409,8 +420,18 @@ func (s *OpenAIGatewayService) scanCCStream(
 	}
 
 	if strict {
-		if scanner.Err() != nil || !st.SawDone || !st.SawFinish || c.Request.Context().Err() != nil {
-			st.Err = ErrGatewayNativeEffectUnknown
+		readErr := scanner.Err()
+		if readErr == nil {
+			readErr = c.Request.Context().Err()
+		}
+		switch {
+		case errors.Is(readErr, bufio.ErrTooLong):
+			return failStrict(gatewayNativeFailureFrameLimit)
+		case readErr != nil:
+			st.StrictReadErr = readErr
+			return failStrict(gatewayNativeFailureSSERead)
+		case !st.SawDone || !st.SawFinish:
+			return failStrict(gatewayNativeFailureIncomplete)
 		}
 		return st
 	}

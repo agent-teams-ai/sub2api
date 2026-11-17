@@ -195,13 +195,33 @@ func gatewayNativeLegacyFinal(state *apicompat.ChatCompletionsToResponsesStreamS
 
 // Emit only an existing closed phase, never provider bytes or error text.
 func gatewayNativeLegacyFailure(ctx context.Context, phase gatewayNativeResponseFailurePhase) error {
+	return gatewayNativeLegacyFailureWithReason(ctx, phase, "")
+}
+
+// Report the strict scan phase. A body read error or a cancelled request is
+// sse_read with the closed reason the Responses path uses, not sse_incomplete.
+func gatewayNativeLegacyStreamFailure(ctx context.Context, phase gatewayNativeResponseFailurePhase, readErr error) error {
+	switch phase {
+	case gatewayNativeFailureSSERead:
+		return gatewayNativeLegacyFailureWithReason(ctx, phase, gatewayNativeSSEReadErrorReason(readErr, nil))
+	case "":
+		phase = gatewayNativeFailureIncomplete
+	}
+	return gatewayNativeLegacyFailure(ctx, phase)
+}
+
+func gatewayNativeLegacyFailureWithReason(ctx context.Context, phase gatewayNativeResponseFailurePhase, readErrorReason string) error {
 	if ctx.Err() == context.DeadlineExceeded {
 		phase = gatewayNativeFailureDeadline
 	}
+	if phase != gatewayNativeFailureSSERead {
+		readErrorReason = ""
+	}
 	line, _ := json.Marshal(struct {
-		Event string                            `json:"event"`
-		Phase gatewayNativeResponseFailurePhase `json:"phase"`
-	}{"gateway_native_response_failure", phase})
+		Event           string                            `json:"event"`
+		Phase           gatewayNativeResponseFailurePhase `json:"phase"`
+		ReadErrorReason string                            `json:"read_error_reason,omitempty"`
+	}{"gateway_native_response_failure", phase, readErrorReason})
 	_, _ = fmt.Fprintln(os.Stderr, string(line))
 	return ErrGatewayNativeEffectUnknown
 }
