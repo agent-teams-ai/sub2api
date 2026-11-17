@@ -317,6 +317,14 @@ func (s *OpenAIGatewayService) scanCCStream(
 		st.Err, st.StrictFailure = ErrGatewayNativeEffectUnknown, phase
 		return st
 	}
+	// A read error is visible from inside the loop: the scanner hands out the
+	// unterminated tail with the error already set.
+	readFailure := func() error {
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		return c.Request.Context().Err()
+	}
 	var data strings.Builder
 	haveData, frameBytes := false, 0
 	for scanner.Scan() {
@@ -324,6 +332,14 @@ func (s *OpenAIGatewayService) scanCCStream(
 		var payload string
 		if strict {
 			frameBytes += len(line)
+			if !strings.HasSuffix(line, "\n") || !utf8.ValidString(line) {
+				// A line cut by a read error or a cancelled caller is a read
+				// failure, not a malformed or unfinished provider frame.
+				if readErr := readFailure(); readErr != nil {
+					st.StrictReadErr = readErr
+					return failStrict(gatewayNativeFailureSSERead)
+				}
+			}
 			switch {
 			case frameBytes > gatewayNativeSSEFrameLimit:
 				return failStrict(gatewayNativeFailureFrameLimit)
@@ -420,10 +436,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 	}
 
 	if strict {
-		readErr := scanner.Err()
-		if readErr == nil {
-			readErr = c.Request.Context().Err()
-		}
+		readErr := readFailure()
 		switch {
 		case errors.Is(readErr, bufio.ErrTooLong):
 			return failStrict(gatewayNativeFailureFrameLimit)
