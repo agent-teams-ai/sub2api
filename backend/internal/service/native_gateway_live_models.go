@@ -110,12 +110,12 @@ func (l *GatewayLiveModels) peek(key string) []string {
 	return slices.Clone(entry.models)
 }
 
-func (l *GatewayLiveModels) fresh(key string, force bool) ([]string, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// freshLocked reports whether the entry needs no provider read now. The caller
+// holds l.mu, so the check and the claim of the read are one step.
+func (l *GatewayLiveModels) freshLocked(key string, force bool) bool {
 	entry, ok := l.entries[key]
 	if !ok {
-		return nil, false
+		return false
 	}
 	now := l.now()
 	// A recent failure counts as fresh so that a broken endpoint is asked once a
@@ -126,7 +126,7 @@ func (l *GatewayLiveModels) fresh(key string, force bool) ([]string, bool) {
 	// fetch slots that every account uses.
 	age := now.Sub(entry.fetched)
 	recentSuccess := !entry.fetched.IsZero() && age < gatewayLiveModelsFreshFor && (!force || age < gatewayLiveModelsForceAfter)
-	return slices.Clone(entry.models), recentFailure || recentSuccess
+	return recentFailure || recentSuccess
 }
 
 // evictLocked keeps the store bounded: expired entries first, then one arbitrary
@@ -176,10 +176,11 @@ func (l *GatewayLiveModels) refresh(ctx context.Context, key string, force bool,
 	if l == nil || fetch == nil {
 		return
 	}
-	if _, fresh := l.fresh(key, force); fresh {
+	l.mu.Lock()
+	if l.freshLocked(key, force) {
+		l.mu.Unlock()
 		return
 	}
-	l.mu.Lock()
 	if wait := l.pending[key]; wait != nil {
 		l.mu.Unlock()
 		select {

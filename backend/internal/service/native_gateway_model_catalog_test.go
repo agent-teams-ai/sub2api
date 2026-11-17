@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,8 +21,9 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// The static lower bound is exact membership. Only GLM has a documented model
-// beside its anchor, and the enrollment anchor itself is never widened.
+// The static lower bound is exact membership (no prefix, alias or case folding).
+// Only GLM has a documented model beside its anchor, and the enrollment anchor
+// itself is never widened.
 func TestGatewayCatalogStaticModelAdmission(t *testing.T) {
 	for _, tuple := range []struct {
 		profile, model string
@@ -42,7 +44,7 @@ func TestGatewayCatalogStaticModelAdmission(t *testing.T) {
 		{GatewayNVIDIABuildChatProfile, "z-ai/glm-5.3-flash", false},
 		{"unknown-profile", GatewayGLMCodingResponsesModelFull, false},
 	} {
-		require.Equal(t, tuple.admitted, GatewayCatalogStaticModelAdmitted(tuple.profile, tuple.model), "%s %q", tuple.profile, tuple.model)
+		require.Equal(t, tuple.admitted, slices.Contains(gatewayCatalogStaticModelIDs(tuple.profile), tuple.model), "%s %q", tuple.profile, tuple.model)
 	}
 	for _, profile := range []string{GatewayGLMCodingResponsesProfile, GatewayKimiCodeResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayNVIDIABuildChatProfile} {
 		require.True(t, GatewayModelCatalogProfile(profile), profile)

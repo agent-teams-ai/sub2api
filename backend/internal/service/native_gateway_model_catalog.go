@@ -1,9 +1,6 @@
 package service
 
-import (
-	"slices"
-	"strings"
-)
+import "strings"
 
 // GatewayGLMCodingResponsesModelFull is the second model that the GLM Coding
 // Plan documents for every tier ("All plans support GLM-5.3"). The enrollment
@@ -44,13 +41,6 @@ func gatewayModelCatalogSource(profile string) string {
 		return "nvidia"
 	}
 	return "native_catalog"
-}
-
-// GatewayCatalogStaticModelAdmitted is exact string membership in the static
-// lower bound; there is no prefix, alias or case folding. Dispatch combines it
-// with the live list in gatewayModelCatalogueAdmitted.
-func GatewayCatalogStaticModelAdmitted(profile, model string) bool {
-	return slices.Contains(gatewayCatalogStaticModelIDs(profile), model)
 }
 
 // gatewayReviewModelID keeps a provider-listed model only when its ID is

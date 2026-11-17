@@ -379,10 +379,10 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	// here: no network, no lease, no waiting.
 	if GatewayModelCatalogProfile(route.Profile) {
 		state.requestedModel = gjson.GetBytes(body, "model").String()
-	}
-	if GatewayModelCatalogProfile(route.Profile) && !s.gatewayModelCatalogueAdmitted(scope, a.GetCredential("api_key"), route.Profile, state.requestedModel) {
-		gatewayNativeAdmissionDiagnostic(gatewayAdmissionPayload)
-		return nil, false, ErrGatewayNativeIdentity
+		if !s.gatewayModelCatalogueAdmitted(scope, a.GetCredential("api_key"), route.Profile, state.requestedModel) {
+			gatewayNativeAdmissionDiagnostic(gatewayAdmissionPayload)
+			return nil, false, ErrGatewayNativeIdentity
+		}
 	}
 	if route.Profile == GatewayOpenRouterResponsesProfile {
 		state.requestedModel = gjson.GetBytes(body, "model").String()
