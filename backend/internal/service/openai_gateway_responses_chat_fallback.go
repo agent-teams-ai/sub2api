@@ -308,7 +308,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 
 	if scan.Err != nil {
 		if strictTerminal {
-			scan.Err = gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureIncomplete)
+			scan.Err = gatewayNativeLegacyStreamFailure(c.Request.Context(), scan.StrictFailure, scan.StrictReadErr)
 		}
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
