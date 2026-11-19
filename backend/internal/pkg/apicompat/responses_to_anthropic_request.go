@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 )
+
+// ErrResponsesOutputFormat identifies a caller constraint that Anthropic's
+// structured-output protocol cannot represent; it is not an upstream failure.
+var ErrResponsesOutputFormat = errors.New("invalid or unsupported structured output format")
 
 // ResponsesToAnthropicRequest converts a Responses API request into an
 // Anthropic Messages request. This is the reverse of AnthropicToResponses and
@@ -169,7 +174,7 @@ func responsesTextToAnthropicOutputFormat(text *ResponsesText) (*AnthropicOutput
 		return nil, nil
 	}
 	if len(text.Format) > 64<<10 {
-		return nil, fmt.Errorf("invalid structured output format")
+		return nil, ErrResponsesOutputFormat
 	}
 	var format struct {
 		Type        string          `json:"type"`
@@ -181,14 +186,14 @@ func responsesTextToAnthropicOutputFormat(text *ResponsesText) (*AnthropicOutput
 	d := json.NewDecoder(bytes.NewReader(text.Format))
 	d.DisallowUnknownFields()
 	if d.Decode(&format) != nil || d.Decode(new(any)) != io.EOF {
-		return nil, fmt.Errorf("invalid structured output format")
+		return nil, ErrResponsesOutputFormat
 	}
 	if format.Type == "text" && len(format.Schema) == 0 && format.Name == "" && format.Description == "" && format.Strict == nil {
 		return nil, nil
 	}
 	schema := bytes.TrimSpace(format.Schema)
 	if format.Type != "json_schema" || len(schema) == 0 || schema[0] != '{' || !json.Valid(schema) {
-		return nil, fmt.Errorf("unsupported structured output format")
+		return nil, ErrResponsesOutputFormat
 	}
 	return &AnthropicOutputFormat{Type: "json_schema", Schema: append(json.RawMessage(nil), format.Schema...)}, nil
 }

@@ -432,7 +432,7 @@ func (s *GatewayNativeClaudeOAuth) HydrateAccountInfo(ctx context.Context, scope
 	if !ok {
 		return ErrGatewayNativeIdentity
 	}
-	return writer.StoreGatewayAccountInfo(ctx, p, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayClaudeOAuthMessagesProfile, b.ExpiresAt, b.ObservedAt)}, true)
+	return writer.StoreGatewayAccountInfo(ctx, p, true, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayClaudeOAuthMessagesProfile, b.ExpiresAt, b.ObservedAt)})
 }
 
 func (s *GatewayNativeClaudeOAuth) Descriptor(ctx context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthDescriptorResult, error) {
@@ -617,9 +617,11 @@ func (s *GatewayNativeClaudeOAuth) Maintain(ctx context.Context, scope GatewayNa
 	}
 	if time.Now().Add(5 * time.Minute).Before(previous.ExpiresAt) {
 		if !p.AccountInfoInitialized && !previous.ObservedAt.IsZero() {
-			// Initialize only an absent snapshot during the existing explicit
-			// maintenance mutation. Ordinary idle accounts do no extra SQL work.
-			_ = s.HydrateAccountInfo(ctx, scope, operation)
+			// The existing maintenance call initializes only an absent snapshot
+			// after releasing its lock. Initialized idle accounts do no extra SQL.
+			if err := s.HydrateAccountInfo(ctx, scope, operation); err != nil {
+				return out, err
+			}
 		}
 		if attempt != "" {
 			out.State = "completed"

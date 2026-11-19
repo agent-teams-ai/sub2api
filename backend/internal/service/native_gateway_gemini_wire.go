@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 )
 
@@ -61,13 +62,8 @@ func gatewayNativeGeminiExtraValid(raw []byte) bool {
 	}
 	google, ok := gatewayClaudeObject(extra["google"], "thought_signature")
 	var signature string
-	if !ok || len(google) != 1 || json.Unmarshal(google["thought_signature"], &signature) != nil || len(signature) == 0 || len(signature) > 64<<10 {
+	if !ok || len(google) != 1 || json.Unmarshal(google["thought_signature"], &signature) != nil {
 		return false
 	}
-	for _, c := range []byte(signature) {
-		if c < 0x21 || c > 0x7e {
-			return false
-		}
-	}
-	return true
+	return apicompat.GeminiThoughtSignatureValid(signature)
 }

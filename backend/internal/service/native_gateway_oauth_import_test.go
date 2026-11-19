@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -63,7 +64,9 @@ func TestGatewayNativeOAuthImportStrictEscapedIngressAndSeparateCodec(t *testing
 	envelope, err := s.sealImport(intent, refresh)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(envelope), GatewayOAuthImportEnvelopeLimit)
-	require.NotContains(t, envelope, refresh)
+	sealed, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(envelope, "gci1."))
+	require.NoError(t, err)
+	require.NotContains(t, string(sealed), refresh, "base64 decoding must not expose the submitted RT")
 	intent.Envelope = envelope
 	opened, err := s.openImport(intent)
 	require.NoError(t, err)

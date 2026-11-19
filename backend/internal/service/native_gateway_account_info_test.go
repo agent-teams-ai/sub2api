@@ -94,6 +94,7 @@ func TestGatewayAccountInfoReaderUsesCurrentSnapshotAndFinalAuthority(t *testing
 			require.NoError(t, err)
 			reader.now = func() time.Time { return at }
 			out := reader.Read(ctx, in)
+			require.Empty(t, reader.active, "owner slots are released on success and revoked authority")
 			if revoke {
 				require.Equal(t, GatewayAccountInfoResult{Info: GatewayAccountInfo{Status: "unavailable"}}, out)
 				return
@@ -102,7 +103,6 @@ func TestGatewayAccountInfoReaderUsesCurrentSnapshotAndFinalAuthority(t *testing
 			require.Equal(t, "2", out.Info.InfoRevision)
 			require.Equal(t, "unknown", out.Info.Fields.Subscription.Status)
 			require.Equal(t, route.Generation, out.PhysicalGeneration)
-			require.Empty(t, reader.active, "owner slots are released")
 		})
 	}
 }

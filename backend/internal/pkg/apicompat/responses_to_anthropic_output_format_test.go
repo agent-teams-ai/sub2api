@@ -43,7 +43,7 @@ func TestResponsesToAnthropicStructuredOutputRejectsUnsupportedEnvelope(t *testi
 		`{"type":"json_schema","schema":{},"description":"` + strings.Repeat("a", 64<<10) + `"}`,
 	} {
 		_, err := ResponsesToAnthropicRequest(&ResponsesRequest{Model: "claude-sonnet-4-6", Input: json.RawMessage(`"fixture"`), Text: &ResponsesText{Format: json.RawMessage(raw)}})
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrResponsesOutputFormat)
 		require.NotContains(t, err.Error(), raw)
 	}
 	for _, raw := range []string{"null", `{"type":"text"}`} {

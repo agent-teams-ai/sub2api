@@ -113,7 +113,10 @@ func TestGatewayNativeOfficialGeminiActualTLSContinuationAndSchema(t *testing.T)
 	second, entered, err := call(raw)
 	require.NoError(t, err)
 	require.True(t, entered)
-	require.Len(t, officialAPICompletedOutput(t, second.Body.String()), 1)
+	finalOutput := officialAPICompletedOutput(t, second.Body.String())
+	require.Len(t, finalOutput, 2, "reserved continuation slot plus final message")
+	require.NotContains(t, string(finalOutput[0]), "encrypted_content")
+	require.Contains(t, string(finalOutput[1]), `"type":"message"`)
 	require.Equal(t, 2, requests)
 	// A corrupted opaque proof is refused before another provider entry.
 	for i, item := range output {

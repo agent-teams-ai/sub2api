@@ -226,7 +226,9 @@ func (s *GatewayNativeOAuthDispatch) Descriptor(ctx context.Context, scope Gatew
 	if err != nil || issuer != physical.Issuer || subject != physical.Subject {
 		return out, ErrGatewayNativeIdentity
 	}
+	credentialInfo := gatewayCodexCredentialInfo(bundle, s.custody, time.Now())
 	provider, info, err := s.accountCheckInfo(bounded, bundle.AccessToken)
+	bundle = GatewayNativeOAuthBundle{}
 	if err != nil {
 		return out, nil
 	} // bounded ambiguity/failure remains staging
@@ -237,10 +239,9 @@ func (s *GatewayNativeOAuthDispatch) Descriptor(ctx context.Context, scope Gatew
 		physical.proof.info = []GatewayAccountInfoObservation{
 			{Source: "verified_claims", Order: infoOrder, CredentialRevision: version, ValidUntil: &identity.expiresAt, Fields: identity.info},
 			{Source: "account_check", Order: infoOrder, CredentialRevision: version, Fields: info},
-			{Source: "credential", Order: infoOrder, CredentialRevision: version, Fields: gatewayCodexCredentialInfo(bundle, s.custody, physical.QualifiedAt)},
+			{Source: "credential", Order: infoOrder, CredentialRevision: version, Fields: credentialInfo},
 		}
 	}
-	bundle = GatewayNativeOAuthBundle{}
 	if err = s.repository.QualifyGatewayNativeOAuthDispatch(bounded, physical, version); err != nil {
 		return out, ErrGatewayNativeIdentity
 	}

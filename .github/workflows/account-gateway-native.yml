@@ -82,8 +82,10 @@ jobs:
           set -o pipefail
           docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_info_test_ci
           docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_import_test_ci
-          go test -tags unit ./internal/pkg/apicompat ./internal/service -run 'TestGeminiContinuation|TestResponsesToAnthropic.*StructuredOutput|TestGatewayGeminiContinuation|TestGatewayAccountInfo|TestGatewayQuotaAndInfo|TestGatewayCodexInfo|TestGatewayAccountCapabilities|TestGatewayNativeOfficial|TestGatewayNativeAnthropicSchema' -count=1 -v | tee "$RUNNER_TEMP/native-account-info-unit.log"
+          go test -tags unit ./internal/pkg/apicompat ./internal/service -run 'TestGeminiContinuation|TestResponsesToAnthropic.*StructuredOutput|TestGatewayGeminiContinuation|TestGatewayAccountInfo|TestGatewayQuotaAndInfo|TestGatewayCodex(Info|RetainedInfo|Maintenance)|TestGatewayClaudeInfo|TestGatewayGrokInfo|TestGatewayOAuthInfo|TestGatewayAccountCapabilities|TestGatewayNativeGemini|TestGatewayNativeOfficial|TestGatewayNativeAnthropicSchema' -count=1 -v | tee "$RUNNER_TEMP/native-account-info-unit.log"
           ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-account-info-unit.log"
+          go test -tags unit ./internal/gatewaybootstrap ./internal/handler/admin -run 'TestNativeAccountCapabilities|TestNativeOfficialAPIConfig|TestGatewayAccountLimitsAuthorityHTTP|TestGatewayAccountInfoPrivateHTTPContract|TestGatewayNativeOAuthConnectHTTPImportStrictIngress' -count=1 -v | tee "$RUNNER_TEMP/native-account-info-http.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-account-info-http.log"
           for critical in TestGatewayNativeOfficialGeminiActualTLSContinuationAndSchema TestGatewayNativeOfficialAnthropicActualTLSHeadersToolsAndSchema TestGatewayGeminiContinuationBindsEveryAuthorityAndNativeIdentity TestGatewayAccountInfoReaderUsesCurrentSnapshotAndFinalAuthority; do
             test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-account-info-unit.log")" -eq 1
           done

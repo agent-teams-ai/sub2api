@@ -78,7 +78,7 @@ func DecodeGatewayNativeOAuthImport(raw []byte) (GatewayNativeOAuthImportInput, 
 		}
 	}
 	tok, err = d.Token()
-	if err != nil || tok != json.Delim('}') || len(seen) != 6 || !gatewayConnectImportMethod(in.Method) || in.Input == "" || len(in.Input) > GatewayOAuthImportInputLimit {
+	if err != nil || tok != json.Delim('}') || len(seen) != 6 || !GatewayNativeOAuthImportMethodValid(in.Method) || in.Input == "" || len(in.Input) > GatewayOAuthImportInputLimit {
 		return deny()
 	}
 	if _, err = d.Token(); err != io.EOF {
@@ -87,13 +87,15 @@ func DecodeGatewayNativeOAuthImport(raw []byte) (GatewayNativeOAuthImportInput, 
 	return in, true
 }
 
-func gatewayConnectImportMethod(method string) bool {
+// GatewayNativeOAuthImportMethodValid is the closed import method vocabulary
+// shared by parsing, envelopes and repository entry/claim guards.
+func GatewayNativeOAuthImportMethodValid(method string) bool {
 	return method == "refresh_token" || method == "auth_json"
 }
 
 func gatewayConnectMethodShapeValid(in GatewayNativeOAuthConnectIntent) bool {
 	method := connectMethod(in)
-	if gatewayConnectImportMethod(method) {
+	if GatewayNativeOAuthImportMethodValid(method) {
 		return in.Redirect == "" && gatewayImportMACValid(in.ImportInputMAC) && gatewayImportMACValid(in.ImportClaimMAC) && gatewayImportMACValid(in.ImportKeyCommitment) && in.DevicePhase == "" && in.DeviceRevision == 0 && in.DevicePollAfter.IsZero() && in.DeviceDeadline.IsZero()
 	}
 	return in.ImportInputMAC == "" && in.ImportClaimMAC == "" && in.ImportKeyCommitment == "" && ((method == "browser" && in.Redirect == GatewayOAuthConnectRedirect) || (method == "device_code" && in.Redirect == GatewayOAuthDeviceRedirect))
@@ -223,7 +225,7 @@ func (s *GatewayNativeOAuthConnect) importKeyCommitment() string {
 }
 
 func (s *GatewayNativeOAuthConnect) sealImport(in GatewayNativeOAuthConnectIntent, refresh string) (string, error) {
-	if !GatewayNativeOAuthConnectIntentValid(in) || !gatewayConnectImportMethod(in.Method) || !gatewayImportTokenValid(refresh) {
+	if !GatewayNativeOAuthConnectIntentValid(in) || !GatewayNativeOAuthImportMethodValid(in.Method) || !gatewayImportTokenValid(refresh) {
 		return "", ErrGatewayNativeIdentity
 	}
 	nonce := make([]byte, s.aead.NonceSize())
@@ -240,7 +242,7 @@ func (s *GatewayNativeOAuthConnect) sealImport(in GatewayNativeOAuthConnectInten
 }
 
 func (s *GatewayNativeOAuthConnect) openImport(in GatewayNativeOAuthConnectIntent) (string, error) {
-	if !GatewayNativeOAuthConnectIntentValid(in) || !gatewayConnectImportMethod(in.Method) || !strings.HasPrefix(in.Envelope, "gci1.") || len(in.Envelope) > GatewayOAuthImportEnvelopeLimit {
+	if !GatewayNativeOAuthConnectIntentValid(in) || !GatewayNativeOAuthImportMethodValid(in.Method) || !strings.HasPrefix(in.Envelope, "gci1.") || len(in.Envelope) > GatewayOAuthImportEnvelopeLimit {
 		return "", ErrGatewayNativeIdentity
 	}
 	sealed, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(in.Envelope, "gci1."))

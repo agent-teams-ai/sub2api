@@ -25,8 +25,8 @@ func NewGatewayNativeClaudeRepository(db *sql.DB) (service.GatewayNativeClaudeRe
 func (r *gatewayClaudeRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) (int64, error) {
 	return NewGatewayAccountInfoRepository(r.db).ReserveGatewayAccountInfoOrder(ctx)
 }
-func (r *gatewayClaudeRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
-	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, o, initialize)
+func (r *gatewayClaudeRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, initialize bool, observations ...service.GatewayAccountInfoObservation) error {
+	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, initialize, observations...)
 }
 func claudeArgs(s service.GatewayNativeCredentialScope, op string) []any {
 	return []any{s.Consumer, op, s.Owner, s.Account, s.Generation, s.Purpose}

@@ -41,7 +41,7 @@ func connectAuthorized(ctx context.Context, in service.GatewayNativeOAuthConnect
 }
 
 func (r *gatewayOAuthConnectRepository) PrepareConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent) (service.GatewayNativeOAuthConnectIntent, error) {
-	importMethod := in.Method == "refresh_token" || in.Method == "auth_json"
+	importMethod := service.GatewayNativeOAuthImportMethodValid(in.Method)
 	validEnvelope := !importMethod && len(in.Envelope) >= 60 && len(in.Envelope) <= 1024 && strings.HasPrefix(in.Envelope, "gcc1.") ||
 		importMethod && len(in.Envelope) >= 44 && len(in.Envelope) <= service.GatewayOAuthImportEnvelopeLimit && strings.HasPrefix(in.Envelope, "gci1.")
 	if !connectAuthorized(ctx, in) || in.State != "prepared" || !validEnvelope {
@@ -90,7 +90,7 @@ func (r *gatewayOAuthConnectRepository) EnterConnect(ctx context.Context, in ser
 	var exec interface {
 		ExecContext(context.Context, string, ...any) (sql.Result, error)
 	} = r.db
-	if in.Method == "refresh_token" || in.Method == "auth_json" {
+	if service.GatewayNativeOAuthImportMethodValid(in.Method) {
 		var err error
 		tx, err = r.db.BeginTx(ctx, nil)
 		if err != nil {

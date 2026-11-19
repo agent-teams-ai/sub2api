@@ -131,7 +131,10 @@ func collectPrivateQuotaInfo(ctx context.Context, db *sql.DB, p service.GatewayN
 	}
 	composite, ok := cache.(service.GatewayAccountQuotaInfoRepository)
 	var order int64
-	if ok {
+	if p.Route.Profile == service.GatewayGLMCodingResponsesProfile || p.Route.Profile == service.GatewayMiniMaxMPlanResponsesProfile {
+		if !ok {
+			return
+		}
 		order, err = composite.ReserveGatewayAccountInfoOrder(bounded)
 		if err != nil {
 			return

@@ -1,4 +1,4 @@
-.PHONY: build generate test test-unit test-integration test-e2e
+.PHONY: build generate generate-plan-catalog test test-unit test-integration test-e2e
 
 VERSION ?= $(shell ./scripts/resolve-version.sh)
 LDFLAGS ?= -s -w -X main.Version=$(VERSION)
@@ -9,6 +9,9 @@ build:
 generate:
 	go generate ./ent
 	go generate ./cmd/server
+
+generate-plan-catalog:
+	go run ./cmd/generate-plan-catalog > ../frontend/src/constants/openaiPlanTypes.builtin.json
 
 test:
 	go test ./...

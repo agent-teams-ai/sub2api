@@ -72,7 +72,7 @@ type GatewayAccountInfoCache interface {
 }
 type GatewayAccountInfoWriter interface {
 	ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
-	StoreGatewayAccountInfo(context.Context, GatewayNativeOAuthPhysical, GatewayAccountInfoObservation, bool) error
+	StoreGatewayAccountInfo(context.Context, GatewayNativeOAuthPhysical, bool, ...GatewayAccountInfoObservation) error
 }
 type GatewayAccountInfoReader struct {
 	cache     GatewayAccountInfoCache

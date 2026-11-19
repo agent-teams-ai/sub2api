@@ -30,11 +30,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// Only the explicit private native Responses profile uses this byte-preserving
-// path, except the validated default tier is omitted on MiMo provider wire.
-// Stock passthrough performs custom-tool conversion and error retries;
-// neither is appropriate for MiMo's officially documented native Responses lite.
-// Ordinary callers, the historical bridge and their handlers stay unchanged.
+// Resolve the exact upstream endpoint owned by each private native profile,
+// including Responses, Anthropic Messages and the Gemini Chat bridge.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
 	if a.Type == AccountTypeAPIKey && a.Extra[GatewayProfileExtraKey] == GatewayAnthropicAPIKeyProfile {
 		return GatewayAnthropicAPIBaseURL + "/messages", nil

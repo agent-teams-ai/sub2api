@@ -84,7 +84,7 @@ func (s *GatewayNativeOAuthRefresh) HydrateAccountInfo(ctx context.Context, scop
 	repository, ok := s.repository.(GatewayNativeOAuthDispatchRepository)
 	writer, writable := s.repository.(GatewayAccountInfoWriter)
 	if !ok || !writable {
-		return nil
+		return ErrGatewayNativeIdentity
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -110,10 +110,11 @@ func (s *GatewayNativeOAuthRefresh) HydrateAccountInfo(ctx context.Context, scop
 		return ErrGatewayNativeIdentity
 	}
 	p.CredentialRevision = version
-	for _, observation := range gatewayCodexRetainedInfo(p, bundle, s.custody) {
-		if err := writer.StoreGatewayAccountInfo(ctx, p, observation, true); err != nil {
-			return err
-		}
+	observations := gatewayCodexRetainedInfo(p, bundle, s.custody)
+	if len(observations) == 0 {
+		return nil
 	}
-	return nil
+	// The initialized hint must never suppress a missing second source after a
+	// partial write. Reuse the same physical transaction for the whole snapshot.
+	return writer.StoreGatewayAccountInfo(ctx, p, true, observations...)
 }

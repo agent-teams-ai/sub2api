@@ -74,11 +74,11 @@ func TestGatewayAccountInfoPostgresOrderingAtomicityAndReplacement(t *testing.T)
 	require.EqualValues(t, 1, stored.Revision)
 	require.Equal(t, "GLM Pro", stored.Sources["plan_quota"].Fields.Subscription.Value.Label)
 	removed := observation(second, "")
-	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, removed, false))
-	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, known, false), "late same-credential response is ignored")
+	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, false, removed))
+	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, false, known), "late same-credential response is ignored")
 	legacy := known
 	legacy.Order = 0
-	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, legacy, true), "old cached hydration cannot replace live omission")
+	require.NoError(t, info.StoreGatewayAccountInfo(ctx, p, true, legacy), "old cached hydration cannot replace live omission")
 	stored, e = info.ReadGatewayAccountInfo(ctx, input, route)
 	require.NoError(t, e)
 	require.EqualValues(t, 2, stored.Revision)
@@ -97,31 +97,38 @@ func TestGatewayAccountInfoPostgresOrderingAtomicityAndReplacement(t *testing.T)
 	_, e = info.ReadGatewayAccountInfo(ctx, foreign, route)
 	require.Error(t, e)
 
-	// A legitimate replacement with the same physical row must retire the old
-	// snapshot under the verified exclusive lock, not remain unavailable forever.
+	// Protected physical identity is immutable. Replacement creates a fresh
+	// candidate; no test or implementation may bypass the database birth guard.
 	scope.Generation = uuid.NewString()
 	newRoute := route
 	newRoute.Generation = scope.Generation
 	credentials, extra = accountData(scope)
 	_, e = db.ExecContext(ctx, `UPDATE accounts SET credentials=$2::jsonb,extra=$3::jsonb WHERE id=$1`, route.AccountID, credentials, extra)
+	require.Error(t, e, "in-place generation replacement is prohibited")
+	_, e = db.ExecContext(ctx, `UPDATE accounts SET deleted_at=clock_timestamp() WHERE id=$1`, route.AccountID)
 	require.NoError(t, e)
+	require.NoError(t, db.QueryRowContext(ctx, `INSERT INTO accounts(name,platform,type,status,schedulable,credentials,extra) VALUES('replacement info fixture','openai','apikey','disabled',false,$1::jsonb,$2::jsonb) RETURNING id,created_at`, credentials, extra).Scan(&newRoute.AccountID, &newRoute.CreatedAt))
+	require.NotEqual(t, route.AccountID, newRoute.AccountID)
 	_, e = info.ReadGatewayAccountInfo(ctx, input, route)
 	require.Error(t, e)
 	newPhysical := service.GatewayNativeOAuthPhysical{Scope: scope, Route: newRoute}
 	order, e := info.ReserveGatewayAccountInfoOrder(ctx)
 	require.NoError(t, e)
-	require.NoError(t, info.StoreGatewayAccountInfo(ctx, newPhysical, observation(order, "GLM New"), false))
+	require.NoError(t, info.StoreGatewayAccountInfo(ctx, newPhysical, false, observation(order, "GLM New")))
 	replaced, e := info.ReadGatewayAccountInfo(ctx, input, newRoute)
 	require.NoError(t, e)
 	require.NotEqual(t, stored.PrincipalVersion, replaced.PrincipalVersion)
 	require.EqualValues(t, 1, replaced.Revision)
 	require.Equal(t, "GLM New", replaced.Sources["plan_quota"].Fields.Subscription.Value.Label)
-	_, e = db.ExecContext(ctx, `UPDATE accounts SET deleted_at=clock_timestamp() WHERE id=$1`, route.AccountID)
+	_, e = db.ExecContext(ctx, `UPDATE accounts SET deleted_at=clock_timestamp() WHERE id=$1`, newRoute.AccountID)
 	require.NoError(t, e)
 	var rows int
-	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID).Scan(&rows))
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_account_info_snapshots WHERE account_id=$1`, newRoute.AccountID).Scan(&rows))
 	require.Zero(t, rows)
-	require.Error(t, info.StoreGatewayAccountInfo(ctx, newPhysical, observation(order+1, "late"), false))
+	require.Error(t, info.StoreGatewayAccountInfo(ctx, newPhysical, false, observation(order+1, "late")))
+	t.Run("Official API closed database profiles", func(t *testing.T) {
+		gatewayOfficialAPIProfilesPostgres(t, db)
+	})
 	t.Run("Codex authenticated hydration and atomic refresh", func(t *testing.T) {
 		gatewayCodexInfoPostgresLifecycle(t, db)
 	})

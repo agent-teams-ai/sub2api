@@ -69,3 +69,30 @@ func TestGatewayAccountCapabilitiesHavePerMethodSupportAndQualifiedAnchor(t *tes
 	_, ok = GatewayNativeAccountCapability("unmounted-profile", "model", true, false)
 	require.False(t, ok)
 }
+
+func TestGatewayAccountInfoInvalidSubscriptionDateDoesNotPoisonPlan(t *testing.T) {
+	for _, expiry := range []string{"0000-01-01T00:00:00Z", "0000-01-01", "2026-02-30", "not-a-date"} {
+		plan := gatewayInfoSubscription("plus", "personal", expiry)
+		require.NotNil(t, plan)
+		require.Equal(t, "Plus", plan.Label)
+		require.Nil(t, plan.EndsAt)
+	}
+}
+
+type accountInfoCancelBody struct {
+	io.Reader
+	cancel context.CancelFunc
+}
+
+func (b accountInfoCancelBody) Close() error { b.cancel(); return nil }
+
+func TestGatewayQuotaAndInfoRejectsObservationWhenContextClosesAfterRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	collector := NewGatewayProviderQuotaCollector(accountInfoRoundTripper(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: accountInfoCancelBody{Reader: strings.NewReader(`{"success":true,"data":{"level":"GLM Max","limits":[{"type":"TOKENS_LIMIT","unit":3,"percentage":25}]}}`), cancel: cancel}, Request: req}, nil
+	}))
+	observation, err := collector.FetchWithAccountInfo(ctx, "glm", []byte("synthetic-key"))
+	require.Error(t, err)
+	require.Equal(t, GatewayProviderQuotaObservation{}, observation, "no partial facts may escape an unsuccessful observation")
+}

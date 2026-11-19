@@ -25,8 +25,8 @@ func NewGatewayNativeGrokRepository(db *sql.DB) (service.GatewayNativeGrokReposi
 func (r *gatewayGrokRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) (int64, error) {
 	return NewGatewayAccountInfoRepository(r.db).ReserveGatewayAccountInfoOrder(ctx)
 }
-func (r *gatewayGrokRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
-	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, o, initialize)
+func (r *gatewayGrokRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, initialize bool, observations ...service.GatewayAccountInfoObservation) error {
+	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, initialize, observations...)
 }
 func grokArgs(s service.GatewayNativeCredentialScope, op string) []any {
 	return []any{s.Consumer, op, s.Owner, s.Account, s.Generation, s.Purpose}

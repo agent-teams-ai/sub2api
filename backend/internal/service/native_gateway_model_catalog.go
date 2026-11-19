@@ -11,8 +11,9 @@ const GatewayGLMCodingResponsesModelFull = "glm-5.3"
 // API-key profiles whose catalogue native owns: the enrollment anchor first,
 // then models the provider documents for the plan. It is returned as a fresh
 // slice so no caller can widen it. The provider's live list
-// (native_gateway_live_models.go) is added on top of it, never instead of it. A
-// profile that returns nil has no such catalogue.
+// (native_gateway_live_models.go) is added only for profiles with a live source.
+// Official Anthropic/Gemini profiles expose only their fixed qualified anchor.
+// A profile that returns nil has no such catalogue.
 func gatewayCatalogStaticModelIDs(profile string) []string {
 	switch profile {
 	case GatewayAnthropicAPIKeyProfile:
@@ -32,8 +33,8 @@ func gatewayCatalogStaticModelIDs(profile string) []string {
 }
 
 // GatewayModelCatalogProfile reports whether the profile serves a native model
-// catalogue (static lower bound plus the provider's live list): the API-key
-// coding plans and NVIDIA Build.
+// catalogue: coding plans/NVIDIA include their live list; official Anthropic
+// and Gemini use a static qualified anchor.
 func GatewayModelCatalogProfile(profile string) bool {
 	return gatewayCatalogStaticModelIDs(profile) != nil
 }
@@ -68,7 +69,8 @@ func gatewayReviewModelID(id string) bool {
 }
 
 // gatewayCatalogAccountModels projects the catalogue with the only controls
-// native supports for these profiles: function tools, no reasoning, no fast mode.
+// native supports for these profiles: no reasoning/fast controls, function tools,
+// and the existing function_and_custom contract for qualified official APIs.
 func gatewayCatalogAccountModels(profile, anchor string, live []string) []GatewayAccountModel {
 	ids := gatewayModelCatalogue(profile, anchor, live)
 	models := make([]GatewayAccountModel, 0, len(ids))

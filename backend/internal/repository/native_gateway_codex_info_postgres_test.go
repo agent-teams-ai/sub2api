@@ -92,6 +92,23 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 	require.NoError(t, refresh.SetEntryAuthorizer(func(context.Context, service.GatewayNativeCredentialScope, string) error { return nil }))
 	before := counted.calls.Load()
+	// Fail the second legacy source write. Both sources must roll back so the
+	// indexed initialized hint remains false and ordinary maintenance can retry.
+	_, err = db.ExecContext(ctx, `CREATE FUNCTION gateway_info_hydration_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.sources ? 'credential' THEN RAISE EXCEPTION 'synthetic second-source failure'; END IF; RETURN NEW; END $$;
+ CREATE TRIGGER gateway_info_hydration_reject BEFORE INSERT OR UPDATE ON gateway_account_info_snapshots FOR EACH ROW EXECUTE FUNCTION gateway_info_hydration_reject()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS gateway_info_hydration_reject ON gateway_account_info_snapshots; DROP FUNCTION IF EXISTS gateway_info_hydration_reject()`)
+	})
+	_, err = refresh.Maintain(owner, scope, operation)
+	require.Error(t, err)
+	var partialSnapshots int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID).Scan(&partialSnapshots))
+	require.Zero(t, partialSnapshots, "no source may commit independently of the initialized snapshot")
+	require.Equal(t, before, counted.calls.Load(), "failed retained hydration performs no HTTP")
+	_, err = db.ExecContext(ctx, `DROP TRIGGER gateway_info_hydration_reject ON gateway_account_info_snapshots; DROP FUNCTION gateway_info_hydration_reject()`)
+	require.NoError(t, err)
 	maintained, err := refresh.Maintain(owner, scope, operation)
 	require.NoError(t, err)
 	require.Equal(t, "idle", maintained.State)
@@ -116,7 +133,7 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	order, err := info.ReserveGatewayAccountInfoOrder(owner)
 	require.NoError(t, err)
 	omission := service.GatewayAccountInfoObservation{Source: "verified_claims", Order: order, CredentialRevision: 1, Fields: service.GatewayAccountInfoEmptyFields(route.Profile)}
-	require.NoError(t, info.StoreGatewayAccountInfo(owner, physical, omission, false))
+	require.NoError(t, info.StoreGatewayAccountInfo(owner, physical, false, omission))
 	require.NoError(t, refresh.HydrateAccountInfo(owner, scope, operation))
 	tombstone, err := info.ReadGatewayAccountInfo(owner, input, route)
 	require.NoError(t, err)
@@ -134,7 +151,7 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	require.Equal(t, "native1@example.test", *fresh.Sources["verified_claims"].Fields.Email.Value)
 	require.EqualValues(t, 2, fresh.Sources["credential"].CredentialRevision)
 	require.Equal(t, initial.PrincipalVersion, fresh.PrincipalVersion)
-	require.Error(t, info.StoreGatewayAccountInfo(owner, physical, omission, false), "old credential observation loses current revision CAS")
+	require.Error(t, info.StoreGatewayAccountInfo(owner, physical, false, omission), "old credential observation loses current revision CAS")
 	// Fail metadata publication after provider exchange. The same transaction
 	// must roll credential/version back and the original operation becomes unknown.
 	_, err = db.ExecContext(ctx, `CREATE FUNCTION gateway_info_test_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic info commit failure'; END $$;

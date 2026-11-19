@@ -26,16 +26,24 @@ type oauthInfoFixture struct {
 	order    int64
 	held     bool
 	stored   []GatewayAccountInfoObservation
+	storeErr error
 }
 
 func (r *oauthInfoFixture) ReserveGatewayAccountInfoOrder(context.Context) (int64, error) {
 	r.order++
 	return r.order, nil
 }
-func (r *oauthInfoFixture) StoreGatewayAccountInfo(ctx context.Context, p GatewayNativeOAuthPhysical, o GatewayAccountInfoObservation, initialize bool) error {
+func (r *oauthInfoFixture) StoreGatewayAccountInfo(ctx context.Context, p GatewayNativeOAuthPhysical, initialize bool, observations ...GatewayAccountInfoObservation) error {
+	if len(observations) != 1 {
+		return ErrGatewayNativeIdentity
+	}
+	o := observations[0]
 	deadline, bounded := ctx.Deadline()
 	if r.held || !bounded || time.Until(deadline) > 2*time.Second || p != r.physical || !initialize {
 		return ErrGatewayNativeIdentity
+	}
+	if r.storeErr != nil {
+		return r.storeErr
 	}
 	r.stored = append(r.stored, o)
 	r.physical.AccountInfoInitialized = true
@@ -187,6 +195,12 @@ func TestGatewayOAuthInfoHydrationKeepsOriginalObservationAndNeverCallsHTTP(t *t
 			original := time.Now().UTC().Add(-48 * time.Hour)
 			repo.envelope, err = seal(original)
 			require.NoError(t, err)
+			repo.storeErr = ErrGatewayNativeIdentity
+			_, err = maintain(ctx, scope, "connect")
+			require.ErrorIs(t, err, ErrGatewayNativeIdentity, "explicit maintenance must surface failed initialization")
+			require.Empty(t, repo.stored)
+			require.False(t, repo.physical.AccountInfoInitialized)
+			repo.storeErr = nil
 			maintained, err := maintain(ctx, scope, "connect")
 			require.NoError(t, err)
 			require.Equal(t, "idle", maintained.State)

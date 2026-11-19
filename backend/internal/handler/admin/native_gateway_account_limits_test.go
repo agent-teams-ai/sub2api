@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,74 @@ type cachedLimitsHandlerStore struct{ reads, writes int }
 func (s *cachedLimitsHandlerStore) ReadGatewayAccountLimits(context.Context, service.GatewayAccountLimitsInput, service.GatewayNativeRoute) (service.GatewayAccountLimitsStored, error) {
 	s.reads++
 	return service.GatewayAccountLimitsStored{PrincipalVersion: "fixture"}, nil
+}
+
+type cachedInfoHandlerStore struct{ reads int }
+
+func (s *cachedInfoHandlerStore) ReadGatewayAccountInfo(context.Context, service.GatewayAccountLimitsInput, service.GatewayNativeRoute) (service.GatewayAccountInfoStored, error) {
+	s.reads++
+	return service.GatewayAccountInfoStored{PrincipalVersion: "fixture", Sources: map[string]service.GatewayAccountInfoObservation{}}, nil
+}
+
+// Metadata shares the strict logical selector but has its own authenticated
+// route. Rejected bodies cannot touch the reader or invoke owner authority.
+func TestGatewayAccountInfoPrivateHTTPContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &cachedInfoHandlerStore{}
+	authorizations := 0
+	in := service.GatewayAccountLimitsInput{OwnerRef: "fixture-owner", AccountRef: "fixture-account", ProfileID: service.GatewayCodexOAuthResponsesProfile, ExpectedAuthorizationEpoch: 3}
+	route := service.GatewayNativeRoute{AccountID: 1, Generation: "00000000-0000-4000-8000-000000000001", CreatedAt: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC), Profile: service.GatewayCodexOAuthResponsesProfile, BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel}
+	reader, err := service.NewGatewayAccountInfoReader(store, func(_ context.Context, input service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+		require.Equal(t, in, input)
+		authorizations++
+		return route, nil
+	})
+	require.NoError(t, err)
+	router := gin.New()
+	require.NoError(t, RegisterGatewayAccountInfoRoutes(router.Group(""), reader, func(c *gin.Context) {
+		if c.GetHeader("Authorization") != "Bearer fixture-control" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		ctx, err := service.WithGatewayNativeConsumer(c.Request.Context(), "fixture-consumer")
+		require.NoError(t, err)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}))
+	request := func(body, authorization string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/private/native/v1/account-info/read", strings.NewReader(body))
+		req.Header.Set("Authorization", authorization)
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	input := `{"ownerRef":"fixture-owner","accountRef":"fixture-account","profileId":"openai-codex-oauth-responses-v1","expectedAuthorizationEpoch":3}`
+	require.Equal(t, http.StatusForbidden, request(input, "").Code)
+	for _, body := range []string{
+		strings.TrimSuffix(input, "}") + `,"nativeAccountId":1}`,
+		strings.TrimSuffix(input, "}") + `,"ownerRef":"foreign"}`,
+		strings.TrimSuffix(input, "}") + `,"owner\u0052ef":"foreign"}`,
+		strings.Replace(input, `"expectedAuthorizationEpoch":3`, `"expectedAuthorizationEpoch":null`, 1),
+		input + `{}`,
+		input + strings.Repeat(" ", 4097-len(input)),
+	} {
+		rejected := request(body, "Bearer fixture-control")
+		require.Equal(t, http.StatusBadRequest, rejected.Code)
+		require.JSONEq(t, `{"code":"account_info_unavailable"}`, rejected.Body.String())
+	}
+	require.Zero(t, authorizations)
+	require.Zero(t, store.reads)
+	accepted := request(input, "Bearer fixture-control")
+	require.Equal(t, http.StatusOK, accepted.Code)
+	require.Equal(t, "private, no-store", accepted.Header().Get("Cache-Control"))
+	var result service.GatewayAccountInfoResult
+	require.NoError(t, json.Unmarshal(accepted.Body.Bytes(), &result))
+	require.Equal(t, "available", result.Info.Status)
+	require.Equal(t, "0", result.Info.InfoRevision)
+	require.Equal(t, route.Generation, result.PhysicalGeneration)
+	require.Equal(t, "unknown", result.Info.Fields.Email.Status)
+	require.Equal(t, 2, authorizations)
+	require.Equal(t, 2, store.reads)
 }
 func (s *cachedLimitsHandlerStore) StoreGatewayAccountLimits(context.Context, service.GatewayNativeOAuthPhysical, service.GatewayCodexRawLimits, time.Time) error {
 	s.writes++

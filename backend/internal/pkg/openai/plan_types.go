@@ -7,6 +7,7 @@ import (
 
 // Native owns both display contexts. The admin UI consumes generated data from
 // this catalog instead of maintaining another subscription-label switch.
+// Regenerate admin data from backend with: make generate-plan-catalog.
 type PlanTypeDefinition struct {
 	Code      string `json:"code"`
 	Key       string `json:"key"`
@@ -25,13 +26,13 @@ func PlanCatalog() PlanTypeCatalog {
 
 func PlanTypes() []PlanTypeDefinition {
 	return []PlanTypeDefinition{
-		{"free", "free", "Free", "Free"}, {"go", "go", "Go", "Go"}, {"plus", "plus", "Plus", "Plus"},
-		{"prolite", "prolite", "Pro 100", "Pro 100"}, {"pro", "pro", "Pro 200", "Pro 200"}, {"promax", "promax", "Pro 500", "Pro 500"},
-		{"team", "team", "Business", "Business"}, {"self_serve_business_usage_based", "selfservebusinessusagebased", "Business", "Business"},
-		{"self_serve_business_prolite", "selfservebusinessprolite", "Business Premium", "Business"}, {"business", "business", "Enterprise", "Business"},
-		{"enterprise", "enterprise", "Enterprise", "Enterprise"}, {"ent26", "ent26", "Enterprise", "Enterprise"},
-		{"enterprise_cbp_usage_based", "enterprisecbpusagebased", "Enterprise", "Enterprise"}, {"enterprise_cbp_automation", "enterprisecbpautomation", "Enterprise (Automation)", "Enterprise"},
-		{"edu", "edu", "Edu", "Education"}, {"edu_plus", "eduplus", "Edu Plus", "Education"}, {"edu_pro", "edupro", "Edu Pro", "Education"}, {"unknown", "unknown", "Unknown", "Account"},
+		{Code: "free", Key: "free", Status: "Free", Analytics: "Free"}, {Code: "go", Key: "go", Status: "Go", Analytics: "Go"}, {Code: "plus", Key: "plus", Status: "Plus", Analytics: "Plus"},
+		{Code: "prolite", Key: "prolite", Status: "Pro 100", Analytics: "Pro 100"}, {Code: "pro", Key: "pro", Status: "Pro 200", Analytics: "Pro 200"}, {Code: "promax", Key: "promax", Status: "Pro 500", Analytics: "Pro 500"},
+		{Code: "team", Key: "team", Status: "Business", Analytics: "Business"}, {Code: "self_serve_business_usage_based", Key: "selfservebusinessusagebased", Status: "Business", Analytics: "Business"},
+		{Code: "self_serve_business_prolite", Key: "selfservebusinessprolite", Status: "Business Premium", Analytics: "Business"}, {Code: "business", Key: "business", Status: "Enterprise", Analytics: "Business"},
+		{Code: "enterprise", Key: "enterprise", Status: "Enterprise", Analytics: "Enterprise"}, {Code: "ent26", Key: "ent26", Status: "Enterprise", Analytics: "Enterprise"},
+		{Code: "enterprise_cbp_usage_based", Key: "enterprisecbpusagebased", Status: "Enterprise", Analytics: "Enterprise"}, {Code: "enterprise_cbp_automation", Key: "enterprisecbpautomation", Status: "Enterprise (Automation)", Analytics: "Enterprise"},
+		{Code: "edu", Key: "edu", Status: "Edu", Analytics: "Education"}, {Code: "edu_plus", Key: "eduplus", Status: "Edu Plus", Analytics: "Education"}, {Code: "edu_pro", Key: "edupro", Status: "Edu Pro", Analytics: "Education"}, {Code: "unknown", Key: "unknown", Status: "Unknown", Analytics: "Account"},
 	}
 }
 func PlanTypeKey(value string) string {

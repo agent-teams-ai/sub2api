@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -188,9 +189,12 @@ func NewGatewayNativeOAuthConnect(key []byte, transport http.RoundTripper, repos
 			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second,
 			ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16384, MaxConnsPerHost: 2, DisableKeepAlives: true}
 	}
+	// Derive MAC material separately from the existing AES-GCM envelope key.
+	importKey := hmac.New(sha256.New, key)
+	_, _ = importKey.Write([]byte("account-gateway/native/oauth-import-mac-key/v1"))
 	return &GatewayNativeOAuthConnect{aead: aead, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }},
-		repository: repository, enrollment: enrollment, readback: readback, now: time.Now, importKey: append([]byte(nil), key...)}, nil
+		repository: repository, enrollment: enrollment, readback: readback, now: time.Now, importKey: importKey.Sum(nil)}, nil
 }
 
 func GatewayNativeOAuthConnectIntentValid(in GatewayNativeOAuthConnectIntent) bool {
@@ -268,7 +272,7 @@ func connectStateHash(state string) string {
 
 func connectResult(in GatewayNativeOAuthConnectIntent) GatewayNativeOAuthConnectResult {
 	method := in.Method
-	if gatewayConnectImportMethod(method) {
+	if GatewayNativeOAuthImportMethodValid(method) {
 		method = "" // Existing receipt contract intentionally has no import enum.
 	}
 	return GatewayNativeOAuthConnectResult{Operation: in.Operation, Account: in.Scope.Account, State: in.State, Outcome: in.Outcome.State, Method: method}

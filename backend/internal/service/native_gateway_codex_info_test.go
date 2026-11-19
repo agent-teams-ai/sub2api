@@ -64,12 +64,17 @@ func (r *codexInfoMaintenanceFixture) ResolveGatewayNativeOAuthRefresh(context.C
 func (r *codexInfoMaintenanceFixture) ReserveGatewayAccountInfoOrder(context.Context) (int64, error) {
 	return 0, ErrGatewayNativeIdentity // cached hydration must not mint a live order
 }
-func (r *codexInfoMaintenanceFixture) StoreGatewayAccountInfo(ctx context.Context, p GatewayNativeOAuthPhysical, observation GatewayAccountInfoObservation, initialize bool) error {
+func (r *codexInfoMaintenanceFixture) StoreGatewayAccountInfo(ctx context.Context, p GatewayNativeOAuthPhysical, initialize bool, observations ...GatewayAccountInfoObservation) error {
 	deadline, bounded := ctx.Deadline()
-	if !bounded || time.Until(deadline) > 2*time.Second || r.locks != r.releases || p.CredentialRevision != 1 || !initialize || observation.Order != 0 {
+	if !bounded || time.Until(deadline) > 2*time.Second || r.locks != r.releases || p.CredentialRevision != 1 || !initialize || len(observations) != 2 {
 		return ErrGatewayNativeIdentity
 	}
-	r.stored = append(r.stored, observation)
+	for _, observation := range observations {
+		if observation.Order != 0 {
+			return ErrGatewayNativeIdentity
+		}
+	}
+	r.stored = append(r.stored, observations...)
 	r.initialized = true
 	return nil
 }

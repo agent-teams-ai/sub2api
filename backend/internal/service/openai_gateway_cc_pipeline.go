@@ -155,7 +155,7 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 // openAIChatCompletionsTargetURL 解析账号的（非 Grok）Chat Completions 上游端点。
 func (s *OpenAIGatewayService) openAIChatCompletionsTargetURL(account *Account) (string, error) {
 	if HasGatewayNativeIdentity(account) && account.Extra[GatewayProfileExtraKey] == GatewayGeminiAPIKeyProfile {
-		return GatewayGeminiAPIBaseURL + "/chat/completions", nil
+		return s.gatewayNativeTargetURL(account)
 	}
 	baseURL := account.GetOpenAIBaseURL()
 	if baseURL == "" {

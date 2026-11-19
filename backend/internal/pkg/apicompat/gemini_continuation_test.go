@@ -243,6 +243,39 @@ func TestGeminiContinuationRejectsSignatureWithoutStreamedOutput(t *testing.T) {
 	require.ErrorIs(t, err, ErrGeminiContinuation)
 	require.Empty(t, events)
 	require.False(t, state.CompletedSent)
+	state.Reasoning.WriteString(" \t\n")
+	events, err = stream.Finalize(state, codec)
+	require.ErrorIs(t, err, ErrGeminiContinuation)
+	require.Empty(t, events)
+	require.False(t, state.CompletedSent, "whitespace cannot manufacture a message for an orphan signature")
+}
+
+func TestGeminiContinuationStringUserItemsRemainConversationBoundaries(t *testing.T) {
+	codec := newGeminiFixtureCodec(t, "fixture")
+	out := geminiFixtureOutput(t, geminiFixtureSource(t, `{"choices":[{"message":{"role":"assistant","content":"Done","extra_content":{"google":{"thought_signature":"text-proof"}}}}]}`), codec, nil)
+	var items []json.RawMessage
+	require.NoError(t, json.Unmarshal(geminiFixtureInput(t, out), &items))
+	items[0] = json.RawMessage(`"Review this source"`)
+	raw, err := json.Marshal(items)
+	require.NoError(t, err)
+	chat := geminiFixtureRestore(t, raw, codec)
+	require.Equal(t, "text-proof", chat.Messages[1].ExtraContent.Google.ThoughtSignature)
+	items = append(items[:2], append([]json.RawMessage{json.RawMessage(`"Different user turn"`)}, items[2:]...)...)
+	raw, err = json.Marshal(items)
+	require.NoError(t, err)
+	chat, err = ResponsesToChatCompletionsRequest(&ResponsesRequest{Input: raw})
+	require.NoError(t, err)
+	require.ErrorIs(t, RestoreGeminiContinuation(raw, chat, codec), ErrGeminiContinuation)
+}
+
+func TestGeminiContinuationEmptyTextDoesNotSignPriorToolOnlyMessage(t *testing.T) {
+	codec := newGeminiFixtureCodec(t, "fixture")
+	first := geminiFixtureOutput(t, geminiFixtureSource(t, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-one","function":{"name":"read","arguments":"{}"},"extra_content":{"google":{"thought_signature":"call-proof"}}}]}}]}`), codec, nil)
+	second := geminiFixtureOutput(t, geminiFixtureSource(t, `{"choices":[{"message":{"role":"assistant","content":"","extra_content":{"google":{"thought_signature":"empty-text-proof"}}}}]}`), codec, nil)
+	chat := geminiFixtureRestore(t, geminiFixtureInput(t, first, second), codec)
+	require.Nil(t, chat.Messages[1].ExtraContent)
+	require.Equal(t, "call-proof", chat.Messages[1].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
+	require.Equal(t, "empty-text-proof", chat.Messages[3].ExtraContent.Google.ThoughtSignature)
 }
 
 func TestGeminiContinuationRepeatedTextKeepsExactStepAssociationWithoutIDs(t *testing.T) {

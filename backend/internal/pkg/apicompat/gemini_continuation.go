@@ -45,15 +45,24 @@ func geminiSignature(extra *ChatExtraContent) (string, error) {
 		return "", nil
 	}
 	sig := extra.Google.ThoughtSignature
-	if len(sig) == 0 || len(sig) > geminiSignatureMaxBytes {
+	if !GeminiThoughtSignatureValid(sig) {
 		return "", ErrGeminiContinuation
 	}
-	for _, c := range []byte(sig) {
+	return sig, nil
+}
+
+// GeminiThoughtSignatureValid is shared by strict wire parsing and the opaque
+// continuation codec. Signatures are bounded printable provider-owned bytes.
+func GeminiThoughtSignatureValid(signature string) bool {
+	if len(signature) == 0 || len(signature) > geminiSignatureMaxBytes {
+		return false
+	}
+	for _, c := range []byte(signature) {
 		if c < 0x21 || c > 0x7e {
-			return "", ErrGeminiContinuation
+			return false
 		}
 	}
-	return sig, nil
+	return true
 }
 
 func geminiExtra(signature string) *ChatExtraContent {
@@ -200,6 +209,12 @@ func RestoreGeminiContinuation(input json.RawMessage, chat *ChatCompletionsReque
 	}
 	carriers := []inputCarrier{}
 	for index, raw := range rawItems {
+		// The existing Responses converter accepts array string elements as
+		// user messages. Keep their position as a boundary, never as proof data.
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) > 0 && trimmed[0] == '"' {
+			continue
+		}
 		var header struct {
 			Type             string `json:"type"`
 			Role             string `json:"role"`
@@ -327,6 +342,9 @@ func restoreGeminiItem(chat *ChatCompletionsRequest, item ResponsesOutput, signa
 			continue
 		}
 		if item.Type == "message" {
+			if len(message.ToolCalls) > 0 && (len(bytes.TrimSpace(message.Content)) == 0 || bytes.Equal(bytes.TrimSpace(message.Content), []byte("null"))) {
+				continue
+			}
 			text := ""
 			for _, part := range item.Content {
 				text += part.Text
@@ -436,12 +454,12 @@ func (s *GeminiContinuationStream) Finalize(state *ChatCompletionsToResponsesStr
 	if s == nil || state == nil || state != s.state || state.CompletedSent || len(state.ToolCalls) > geminiContinuationMaxCalls {
 		return nil, ErrGeminiContinuation
 	}
-	if state.MessageItemID == "" && state.Reasoning.Len() == 0 && len(state.ToolCalls) == 0 {
+	if state.MessageItemID == "" && strings.TrimSpace(state.Reasoning.String()) == "" && len(state.ToolCalls) == 0 {
 		return nil, ErrGeminiContinuation
 	}
 	// A signature without an output item cannot be returned by the real client
 	// on its next turn. Reject it before emitting an orphan continuation carrier.
-	if s.message != "" && state.MessageItemID == "" && (state.Reasoning.Len() == 0 || len(state.ToolCalls) > 0) {
+	if s.message != "" && state.MessageItemID == "" && (strings.TrimSpace(state.Reasoning.String()) == "" || len(state.ToolCalls) > 0) {
 		return nil, ErrGeminiContinuation
 	}
 	message := ChatMessage{Role: "assistant", ExtraContent: geminiExtra(s.message)}

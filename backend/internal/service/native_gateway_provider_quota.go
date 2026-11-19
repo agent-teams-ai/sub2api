@@ -42,7 +42,10 @@ func (c *GatewayProviderQuotaCollector) FetchWithAccountInfo(ctx context.Context
 			info = &fields
 		}
 	})
-	return GatewayProviderQuotaObservation{Limits: limits, ObservedAt: at, Info: info}, err
+	if err != nil {
+		return GatewayProviderQuotaObservation{}, err
+	}
+	return GatewayProviderQuotaObservation{Limits: limits, ObservedAt: at, Info: info}, nil
 }
 
 func NewGatewayProviderQuotaCollector(transport http.RoundTripper) *GatewayProviderQuotaCollector {

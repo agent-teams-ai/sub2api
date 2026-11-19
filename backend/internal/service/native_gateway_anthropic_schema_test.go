@@ -15,6 +15,10 @@ import (
 )
 
 func TestGatewayNativeAnthropicSchemaPreservesOriginalConstraints(t *testing.T) {
+	caseSensitive := json.RawMessage(`{"type":"object","properties":{"Foo":{"type":"string"},"foo":{"type":"string"}},"required":["Foo","foo"],"additionalProperties":false}`)
+	_, checkCase, err := gatewayAnthropicOutputSchema(caseSensitive)
+	require.NoError(t, err)
+	require.True(t, checkCase([]apicompat.ResponsesOutput{{Type: "message", Role: "assistant", Content: []apicompat.ResponsesContentPart{{Type: "output_text", Text: `{"Foo":"upper","foo":"lower"}`}}}}))
 	original := json.RawMessage(`{"type":"object","properties":{"confidence":{"type":"number","minimum":0,"maximum":1},"minimum":{"type":["string","null"]}},"required":["confidence","minimum"],"additionalProperties":false}`)
 	lowered, validate, err := gatewayAnthropicOutputSchema(original)
 	require.NoError(t, err)

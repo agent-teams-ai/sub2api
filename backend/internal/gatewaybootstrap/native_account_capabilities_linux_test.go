@@ -66,4 +66,19 @@ func TestNativeOfficialAPIConfigUsesExistingClosedFD6Profiles(t *testing.T) {
 	decoded.AnthropicAPI.Model = "unqualified-model"
 	_, err = decoded.validate()
 	require.Error(t, err)
+	for _, name := range []string{"anthropicApi", "geminiApi"} {
+		for _, field := range []string{"tokens", "providerTokenUpperBound", "unknown"} {
+			var config map[string]any
+			require.NoError(t, json.Unmarshal(raw, &config))
+			config[name].(map[string]any)[field] = 65537
+			changed, err := json.Marshal(config)
+			require.NoError(t, err)
+			var invalid Config
+			err = decodeStrict(changed, &invalid)
+			if err == nil {
+				_, err = invalid.validate()
+			}
+			require.Error(t, err, "%s.%s must be bounded and closed", name, field)
+		}
+	}
 }

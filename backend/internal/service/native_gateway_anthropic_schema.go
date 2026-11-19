@@ -21,7 +21,7 @@ func gatewayAnthropicOutputSchema(raw json.RawMessage) (json.RawMessage, func([]
 	if len(raw) == 0 || len(raw) > 64<<10 {
 		return deny()
 	}
-	if _, err := gatewayOAuthJSON(raw); err != nil {
+	if !gatewayOAuthUnicodeValid(raw) || !gatewayClaudeNativeJSON(raw) {
 		return deny()
 	}
 	var schema jsonschema.Schema

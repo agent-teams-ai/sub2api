@@ -116,16 +116,23 @@ func (r *accountRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) 
 	}
 	return NewGatewayAccountInfoRepository(db).ReserveGatewayAccountInfoOrder(ctx)
 }
-func (r *accountRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
+func (r *accountRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, initialize bool, observations ...service.GatewayAccountInfoObservation) error {
 	db, ok := r.sql.(*sql.DB)
 	if !ok {
 		return service.ErrGatewayNativeIdentity
 	}
-	return NewGatewayAccountInfoRepository(db).StoreGatewayAccountInfo(ctx, p, o, initialize)
+	return NewGatewayAccountInfoRepository(db).StoreGatewayAccountInfo(ctx, p, initialize, observations...)
 }
-func (r *gatewayAccountInfoRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
-	if !service.GatewayAccountInfoObservationValid(p.Route.Profile, o) || o.CredentialRevision != p.CredentialRevision || !initialize && o.Order < 1 {
+func (r *gatewayAccountInfoRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, initialize bool, observations ...service.GatewayAccountInfoObservation) error {
+	if len(observations) < 1 || len(observations) > 4 {
 		return service.ErrGatewayNativeIdentity
+	}
+	sources := make(map[string]bool, len(observations))
+	for _, o := range observations {
+		if sources[o.Source] || !service.GatewayAccountInfoObservationValid(p.Route.Profile, o) || o.CredentialRevision != p.CredentialRevision || !initialize && o.Order < 1 {
+			return service.ErrGatewayNativeIdentity
+		}
+		sources[o.Source] = true
 	}
 	tx, current, err := r.physicalTx(ctx, p.Scope, p.Route, true)
 	if err != nil {
@@ -135,8 +142,10 @@ func (r *gatewayAccountInfoRepository) StoreGatewayAccountInfo(ctx context.Conte
 	if service.GatewayAccountInfoPrincipal(current) != service.GatewayAccountInfoPrincipal(p) || current.CredentialRevision != p.CredentialRevision || current.Operation != p.Operation {
 		return service.ErrGatewayNativeIdentity
 	}
-	if err = storeGatewayAccountInfoTx(ctx, tx, current, o, initialize); err != nil {
-		return err
+	for _, o := range observations {
+		if err = storeGatewayAccountInfoTx(ctx, tx, current, o, initialize); err != nil {
+			return err
+		}
 	}
 	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity

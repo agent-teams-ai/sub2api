@@ -37,6 +37,8 @@ var ErrGatewayOAuthConflict = errors.New("gateway oauth enrollment conflict")
 
 // Only Verify produces a nonzero identity. This upstream principal is not RR
 // owner authority, an account-check ID, a workspace, or dispatch qualification.
+// The private info field is a display-only projection of verified claims;
+// it grants no principal, ownership, model or dispatch authority.
 type GatewayNativeOAuthIdentity struct {
 	issuer, subject string
 	expiresAt       time.Time

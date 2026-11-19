@@ -151,6 +151,7 @@ type connectHTTPFixture struct {
 	deviceStarts   atomic.Int32
 	devicePolls    atomic.Int32
 	device         bool
+	importRefresh  string
 	destination    atomic.Int32
 	response       string
 	redirect       bool
@@ -219,17 +220,24 @@ func newConnectHTTPFixture(t *testing.T) *connectHTTPFixture {
 			require.Empty(t, r.Header.Get(h))
 		}
 		require.NoError(t, r.ParseForm())
-		require.Len(t, r.PostForm, 5)
 		require.Equal(t, openai.ClientID, r.PostForm.Get("client_id"))
-		expectedRedirect := service.GatewayOAuthConnectRedirect
-		if f.device {
-			expectedRedirect = service.GatewayOAuthDeviceRedirect
+		if f.importRefresh != "" {
+			require.Len(t, r.PostForm, 4)
+			require.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
+			require.Equal(t, f.importRefresh, r.PostForm.Get("refresh_token"))
+			require.Equal(t, openai.RefreshScopes, r.PostForm.Get("scope"))
+		} else {
+			require.Len(t, r.PostForm, 5)
+			expectedRedirect := service.GatewayOAuthConnectRedirect
+			if f.device {
+				expectedRedirect = service.GatewayOAuthDeviceRedirect
+			}
+			require.Equal(t, expectedRedirect, r.PostForm.Get("redirect_uri"))
+			require.Equal(t, "authorization_code", r.PostForm.Get("grant_type"))
+			require.True(t, r.PostForm.Get("code") == "fixture-code")
+			require.Len(t, r.PostForm.Get("code_verifier"), 128)
+			require.True(t, openai.GenerateCodeChallenge(r.PostForm.Get("code_verifier")) == f.challenge)
 		}
-		require.Equal(t, expectedRedirect, r.PostForm.Get("redirect_uri"))
-		require.Equal(t, "authorization_code", r.PostForm.Get("grant_type"))
-		require.True(t, r.PostForm.Get("code") == "fixture-code")
-		require.Len(t, r.PostForm.Get("code_verifier"), 128)
-		require.True(t, openai.GenerateCodeChallenge(r.PostForm.Get("code_verifier")) == f.challenge)
 		if f.redirect {
 			http.Redirect(w, r, destination.URL+"/stolen", http.StatusFound)
 			return
@@ -328,6 +336,78 @@ func (f *connectHTTPFixture) begin(t *testing.T) string {
 	require.Equal(t, openai.DefaultScopes, u.Query().Get("scope"))
 	f.challenge = u.Query().Get("code_challenge")
 	return u.Query().Get("state")
+}
+
+// The import uses the same signed provider verification, sealed enrollment and
+// receipt as browser/device OAuth. Only the transient ingress method differs.
+func TestGatewayNativeOAuthConnectHTTPImportStrictIngress(t *testing.T) {
+	for _, method := range []string{"refresh_token", "auth_json"} {
+		t.Run(method, func(t *testing.T) {
+			f := newConnectHTTPFixture(t)
+			f.importRefresh = "fixture-import-refresh"
+			f.secrets = append(f.secrets, f.importRefresh, "untrusted-import-access", "untrusted-import-id")
+			var response map[string]any
+			require.NoError(t, json.Unmarshal([]byte(f.response), &response))
+			response["scope"] = openai.RefreshScopes
+			raw, err := json.Marshal(response)
+			require.NoError(t, err)
+			f.response = string(raw)
+			entryCalls := 0
+			require.NoError(t, f.connect.SetEntryAuthorizer(func(_ context.Context, scope service.GatewayNativeCredentialScope, operation string) error {
+				require.Equal(t, f.scope, scope)
+				require.Equal(t, "operation", operation)
+				entryCalls++
+				return nil
+			}))
+			input := f.importRefresh
+			if method == "auth_json" {
+				input = `{"auth_mode":"chatgpt","tokens":{"refresh_token":"` + f.importRefresh + `","access_token":"untrusted-import-access","id_token":"untrusted-import-id"}}`
+			}
+			encoded, err := json.Marshal(input)
+			require.NoError(t, err)
+			body := strings.TrimSuffix(f.input(), "}") + `,"method":"` + method + `","input":` + string(encoded) + `}`
+			path := "/private/native/v1/oauth/connect/import"
+			require.Equal(t, http.StatusNotFound, f.request(t, path, body, false).Code)
+			require.Equal(t, http.StatusNotFound, f.request(t, path+"?unexpected=1", body, true).Code)
+			for _, invalid := range []string{
+				strings.Replace(body, `"owner_ref":"owner"`, `"owner_ref":"foreign"`, 1),
+				strings.TrimSuffix(body, "}") + `,"input":"other"}`,
+				strings.TrimSuffix(body, "}") + `,"\u0069nput":"other"}`,
+				strings.TrimSuffix(body, "}") + `,"proxy":"https://foreign.invalid"}`,
+				strings.Replace(body, `"method":"`+method+`"`, `"method":"pat"`, 1),
+				strings.Replace(body, string(encoded), `null`, 1),
+				body + `{}`,
+				body + strings.Repeat(" ", service.GatewayOAuthImportBodyLimit+1-len(body)),
+			} {
+				result := f.request(t, path, invalid, true)
+				require.Equal(t, http.StatusNotFound, result.Code)
+				require.JSONEq(t, `{"code":"native_connect_unavailable"}`, result.Body.String())
+			}
+			require.Zero(t, entryCalls)
+			require.Empty(t, f.store.row.Operation)
+			require.Zero(t, f.tokens.Load())
+			require.Zero(t, f.enrolled.calls)
+			accepted := f.request(t, path, body, true)
+			require.Equal(t, http.StatusOK, accepted.Code)
+			require.Equal(t, "no-store", accepted.Header().Get("Cache-Control"))
+			var out service.GatewayNativeOAuthConnectResult
+			require.NoError(t, json.Unmarshal(accepted.Body.Bytes(), &out))
+			require.Equal(t, "completed", out.State)
+			require.Equal(t, "staged", out.Outcome)
+			require.Empty(t, out.Method, "public legacy receipt does not gain an import enum")
+			require.Empty(t, f.store.row.Envelope)
+			replay := f.request(t, path, body, true)
+			require.Equal(t, http.StatusOK, replay.Code)
+			require.JSONEq(t, accepted.Body.String(), replay.Body.String())
+			require.Equal(t, 1, entryCalls)
+			require.Equal(t, int32(1), f.tokens.Load())
+			require.Equal(t, int32(1), f.checks.Load())
+			require.Equal(t, 1, f.enrolled.calls)
+			for _, secret := range f.secrets {
+				require.NotContains(t, accepted.Body.String()+replay.Body.String()+f.logs.String()+f.enrolled.reservation.Envelope, secret)
+			}
+		})
+	}
 }
 
 // Failure: owner handoff could cross operation/scope, accept ambiguous or

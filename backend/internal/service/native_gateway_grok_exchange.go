@@ -179,7 +179,7 @@ func (s *GatewayNativeGrokOAuth) HydrateAccountInfo(ctx context.Context, scope G
 	if !ok {
 		return ErrGatewayNativeIdentity
 	}
-	return writer.StoreGatewayAccountInfo(ctx, p, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayGrokOAuthResponsesProfile, b.ExpiresAt, b.ObservedAt)}, true)
+	return writer.StoreGatewayAccountInfo(ctx, p, true, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayGrokOAuthResponsesProfile, b.ExpiresAt, b.ObservedAt)})
 }
 
 func (s *GatewayNativeGrokOAuth) ResolveApproved(ctx context.Context, route GatewayNativeRoute, account string) (GatewayNativeCredentialScope, string, error) {

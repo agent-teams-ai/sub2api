@@ -266,6 +266,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		continuation = apicompat.NewGeminiContinuationStream(state)
 	}
 	clientDisconnected := false
+	invalidContinuation := false
 	strictTerminal := gatewayNativeReasoningScope(c) != ""
 	deliveryFailed := func() {
 		clientDisconnected = true
@@ -315,7 +316,8 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
 		if continuation != nil && continuation.Observe(chunk) != nil {
-			deliveryFailed()
+			invalidContinuation = true
+			_ = resp.Body.Close()
 			return
 		}
 		if strictTerminal && !gatewayNativeLegacyToolDelta(chunk, state) {
@@ -334,6 +336,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 			observe(scan.NativeUsage)
 		}
 	}()
+	if invalidContinuation {
+		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureFrame)
+	}
 	if strictTerminal && clientDisconnected {
 		return nil, gatewayNativeLegacyFailure(c.Request.Context(), gatewayNativeFailureWrite)
 	}

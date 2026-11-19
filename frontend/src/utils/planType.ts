@@ -8,7 +8,8 @@ export function normalizePlanType(value?: string | null): string {
 /** Canonical comparison key; labels may be shared by distinct SKUs. */
 export function openAIPlanTypeKey(value?: string | null): string {
   const key = normalizePlanType(value)
-  return (catalog.aliases as Record<string, string>)[key] ?? key
+  const aliases = catalog.aliases as Record<string, string>
+  return Object.prototype.hasOwnProperty.call(aliases, key) ? aliases[key]! : key
 }
 
 export const openAIPlanTypes: readonly string[] = catalog.plans.map((plan) => plan.code)
