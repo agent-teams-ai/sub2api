@@ -20,8 +20,13 @@ func gatewayInfoSubscription(code, scope, expiry string) *GatewayAccountSubscrip
 	}
 	v := &GatewayAccountSubscription{Code: code, Label: label, Scope: scope}
 	if expiry != "" {
-		if at, err := time.Parse(time.RFC3339Nano, expiry); err == nil && at.Year() >= 1 && at.Year() <= 9999 {
-			v.EndsAt = &GatewayAccountInfoDate{Kind: "instant", Value: at.UTC().Format(time.RFC3339Nano)}
+		if at, err := time.Parse(time.RFC3339Nano, expiry); err == nil {
+			// Normalize before validation: an otherwise positive local year can
+			// cross into year zero (or 10000) when its offset becomes UTC.
+			value := at.UTC().Format(time.RFC3339Nano)
+			if gatewayInfoInstant(value) {
+				v.EndsAt = &GatewayAccountInfoDate{Kind: "instant", Value: value}
+			}
 		} else if date, err := time.Parse("2006-01-02", expiry); err == nil && date.Year() >= 1 && date.Format("2006-01-02") == expiry {
 			v.EndsAt = &GatewayAccountInfoDate{Kind: "date", Value: expiry}
 		}

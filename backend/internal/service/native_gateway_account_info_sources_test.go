@@ -71,7 +71,7 @@ func TestGatewayAccountCapabilitiesHavePerMethodSupportAndQualifiedAnchor(t *tes
 }
 
 func TestGatewayAccountInfoInvalidSubscriptionDateDoesNotPoisonPlan(t *testing.T) {
-	for _, expiry := range []string{"0000-01-01T00:00:00Z", "0000-01-01", "2026-02-30", "not-a-date"} {
+	for _, expiry := range []string{"0000-01-01T00:00:00Z", "0001-01-01T00:00:00+01:00", "9999-12-31T23:00:00-02:00", "0000-01-01", "2026-02-30", "not-a-date"} {
 		plan := gatewayInfoSubscription("plus", "personal", expiry)
 		require.NotNil(t, plan)
 		require.Equal(t, "Plus", plan.Label)
