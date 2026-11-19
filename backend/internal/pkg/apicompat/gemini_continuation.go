@@ -367,10 +367,19 @@ type GeminiContinuationStream struct {
 	message string
 	calls   map[int]string
 	bytes   int
+	state   *ChatCompletionsToResponsesStreamState
+	itemID  string
 }
 
-func NewGeminiContinuationStream() *GeminiContinuationStream {
-	return &GeminiContinuationStream{calls: map[int]string{}}
+func NewGeminiContinuationStream(state *ChatCompletionsToResponsesStreamState) *GeminiContinuationStream {
+	if state == nil || state.CreatedSent || state.nextOutputIndex != 0 {
+		return nil
+	}
+	// Reserve the first reasoning item before any ordinary item is opened.
+	// A late signature must precede tools in both done-event history and the
+	// completed response array without changing previously emitted indices.
+	state.nextOutputIndex++
+	return &GeminiContinuationStream{calls: map[int]string{}, state: state, itemID: generateItemID()}
 }
 
 func (s *GeminiContinuationStream) Observe(chunk *ChatCompletionsChunk) error {
@@ -424,7 +433,10 @@ func (s *GeminiContinuationStream) Observe(chunk *ChatCompletionsChunk) error {
 }
 
 func (s *GeminiContinuationStream) Finalize(state *ChatCompletionsToResponsesStreamState, codec GeminiContinuationCodec) ([]ResponsesStreamEvent, error) {
-	if s == nil || state == nil || state.CompletedSent || len(state.ToolCalls) > geminiContinuationMaxCalls {
+	if s == nil || state == nil || state != s.state || state.CompletedSent || len(state.ToolCalls) > geminiContinuationMaxCalls {
+		return nil, ErrGeminiContinuation
+	}
+	if state.MessageItemID == "" && state.Reasoning.Len() == 0 && len(state.ToolCalls) == 0 {
 		return nil, ErrGeminiContinuation
 	}
 	// A signature without an output item cannot be returned by the real client
@@ -452,15 +464,19 @@ func (s *GeminiContinuationStream) Finalize(state *ChatCompletionsToResponsesStr
 	if err := attachGeminiContinuation(response, message, codec, "before"); err != nil {
 		return nil, err
 	}
-	if len(response.Output) == before {
-		return events, nil
+	carrier := ResponsesOutput{Type: "reasoning", ID: s.itemID, Status: "completed", Summary: []ResponsesSummary{}}
+	if len(response.Output) > before {
+		carrier = response.Output[before]
+		carrier.ID = s.itemID
 	}
-	carrier := response.Output[before]
+	// With no signatures the reserved slot closes as an empty reasoning item.
+	// It carries no private bytes and Restore ignores it. All indices stay valid.
+	response.Output = append([]ResponsesOutput{carrier}, response.Output[:before]...)
 	added := carrier
 	added.Status, added.EncryptedContent = "in_progress", ""
 	proof := []ResponsesStreamEvent{
-		{Type: "response.output_item.added", OutputIndex: before, Item: &added},
-		{Type: "response.output_item.done", OutputIndex: before, Item: &carrier},
+		{Type: "response.output_item.added", OutputIndex: 0, Item: &added},
+		{Type: "response.output_item.done", OutputIndex: 0, Item: &carrier},
 	}
 	// Prepend to the terminal batch: tools can be dispatched as soon as their
 	// done event arrives, so their authenticated continuation must arrive first.

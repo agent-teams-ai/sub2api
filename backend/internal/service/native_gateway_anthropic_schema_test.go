@@ -60,9 +60,9 @@ func TestGatewayNativeAnthropicSchemaPreservesOriginalConstraints(t *testing.T) 
 func TestGatewayNativeOfficialAnthropicOriginalSchemaBeforeSuccess(t *testing.T) {
 	const schema = `{"type":"object","properties":{"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["confidence"],"additionalProperties":false}`
 	for _, tc := range []struct {
-		name, text string
-		ok         bool
-	}{{"within range", `{"confidence":0.8}`, true}, {"out of range", `{"confidence":1.1}`, false}} {
+		name, text, stop string
+		ok               bool
+	}{{"within range", `{"confidence":0.8}`, "end_turn", true}, {"out of range", `{"confidence":1.1}`, "end_turn", false}, {"false tool terminal", `{"confidence":1.1}`, "tool_use", false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			requests := 0
 			_, _, call := officialAPIWireFixture(t, GatewayAnthropicAPIKeyProfile, GatewayAnthropicAPIBaseURL, GatewayAnthropicAPIModel, func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +79,7 @@ func TestGatewayNativeOfficialAnthropicOriginalSchemaBeforeSuccess(t *testing.T)
 					map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}},
 					map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": tc.text}},
 					map[string]any{"type": "content_block_stop", "index": 0},
-					map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]int{"output_tokens": 3}},
+					map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": tc.stop}, "usage": map[string]int{"output_tokens": 3}},
 					map[string]any{"type": "message_stop"},
 				} {
 					raw, err := json.Marshal(event)

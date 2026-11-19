@@ -152,8 +152,8 @@ func TestGeminiContinuationRejectsMissingChangedForeignAndDuplicateProof(t *test
 
 func TestGeminiContinuationAcceptsLateSignatureAndEmitsProofBeforeToolDone(t *testing.T) {
 	codec := newGeminiFixtureCodec(t, "fixture")
-	signatures := NewGeminiContinuationStream()
 	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	signatures := NewGeminiContinuationStream(state)
 	for _, raw := range []string{
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read","arguments":"{"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}},{"index":1,"id":"call-b","function":{"name":"read","arguments":"{}"}}]}}]}`,
@@ -175,6 +175,16 @@ func TestGeminiContinuationAcceptsLateSignatureAndEmitsProofBeforeToolDone(t *te
 	out := events[len(events)-1].Response
 	require.Equal(t, 13, out.Usage.TotalTokens)
 	chat := geminiFixtureRestore(t, geminiStreamFixtureInput(t, events), codec)
+	buffered := geminiFixtureRestore(t, geminiFixtureInput(t, out), codec)
+	require.Equal(t, chat, buffered, "stream-event and completed-array clients must recover identical history")
+	for _, event := range events {
+		if event.Type == "response.output_item.done" && event.Item != nil {
+			require.Equal(t, event.Item.Type, out.Output[event.OutputIndex].Type)
+			if event.Item.Type == "reasoning" {
+				require.Equal(t, *event.Item, out.Output[event.OutputIndex])
+			}
+		}
+	}
 	require.Equal(t, "late-signature", chat.Messages[1].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
 	require.Nil(t, chat.Messages[1].ToolCalls[1].ExtraContent)
 }
@@ -187,8 +197,8 @@ func TestGeminiContinuationRetainsMessageSignatureAndLeavesOrdinaryConverterUnch
 	out := geminiFixtureOutput(t, source, codec, nil)
 	chat := geminiFixtureRestore(t, geminiFixtureInput(t, out), codec)
 	require.Equal(t, "text-signature", chat.Messages[1].ExtraContent.Google.ThoughtSignature)
-	stream := NewGeminiContinuationStream()
 	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	stream := NewGeminiContinuationStream(state)
 	text := "Review done"
 	for _, chunk := range []*ChatCompletionsChunk{
 		{Choices: []ChatChunkChoice{{Delta: ChatDelta{Content: &text}}}},
@@ -201,12 +211,31 @@ func TestGeminiContinuationRetainsMessageSignatureAndLeavesOrdinaryConverterUnch
 	require.NoError(t, err)
 	chat = geminiFixtureRestore(t, geminiStreamFixtureInput(t, events), codec)
 	require.Equal(t, "text-signature", chat.Messages[1].ExtraContent.Google.ThoughtSignature)
+	require.Equal(t, chat, geminiFixtureRestore(t, geminiFixtureInput(t, events[len(events)-1].Response), codec))
+}
+
+func TestGeminiContinuationClosesUnsignedReservedSlotWithoutPrivateContent(t *testing.T) {
+	codec := newGeminiFixtureCodec(t, "fixture")
+	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	stream := NewGeminiContinuationStream(state)
+	text := "Review done"
+	chunk := &ChatCompletionsChunk{Choices: []ChatChunkChoice{{Delta: ChatDelta{Content: &text}}}}
+	require.NoError(t, stream.Observe(chunk))
+	ChatCompletionsChunkToResponsesEvents(chunk, state)
+	events, err := stream.Finalize(state, codec)
+	require.NoError(t, err)
+	output := events[len(events)-1].Response
+	require.Len(t, output.Output, 2)
+	require.Equal(t, "reasoning", output.Output[0].Type)
+	require.Empty(t, output.Output[0].EncryptedContent)
+	require.Equal(t, 0, events[1].OutputIndex)
+	require.Equal(t, geminiFixtureRestore(t, geminiStreamFixtureInput(t, events), codec), geminiFixtureRestore(t, geminiFixtureInput(t, output), codec))
 }
 
 func TestGeminiContinuationRejectsSignatureWithoutStreamedOutput(t *testing.T) {
 	codec := newGeminiFixtureCodec(t, "fixture")
-	stream := NewGeminiContinuationStream()
 	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	stream := NewGeminiContinuationStream(state)
 	chunk := &ChatCompletionsChunk{Choices: []ChatChunkChoice{{Delta: ChatDelta{ExtraContent: geminiExtra("orphan-signature")}}}}
 	require.NoError(t, stream.Observe(chunk))
 	ChatCompletionsChunkToResponsesEvents(chunk, state)
@@ -243,8 +272,8 @@ func TestGeminiContinuationRepeatedTextKeepsExactStepAssociationWithoutIDs(t *te
 
 func TestGeminiContinuationStreamingUnsignedTextSharesSignedToolStep(t *testing.T) {
 	codec := newGeminiFixtureCodec(t, "fixture")
-	stream := NewGeminiContinuationStream()
 	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	stream := NewGeminiContinuationStream(state)
 	for _, raw := range []string{
 		`{"choices":[{"index":0,"delta":{"content":"Checking"}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-text","function":{"name":"read","arguments":"{}"},"extra_content":{"google":{"thought_signature":"tool-proof"}}}]}}]}`,
@@ -269,14 +298,14 @@ func TestGeminiContinuationBoundsAndConflictsFailClosed(t *testing.T) {
 		out := ChatCompletionsResponseToResponses(source, "fixture", nil, nil, false, nil)
 		require.ErrorIs(t, AttachGeminiContinuation(out, source.Choices[0].Message, codec), ErrGeminiContinuation)
 	}
-	stream := NewGeminiContinuationStream()
+	stream := NewGeminiContinuationStream(NewChatCompletionsToResponsesStreamState("gemini-fixture"))
 	index := 0
 	chunk := &ChatCompletionsChunk{Choices: []ChatChunkChoice{{Delta: ChatDelta{ToolCalls: []ChatToolCall{{Index: &index, ExtraContent: geminiExtra("first")}}}}}}
 	require.NoError(t, stream.Observe(chunk))
 	chunk.Choices[0].Delta.ToolCalls[0].ExtraContent = geminiExtra("changed")
 	require.ErrorIs(t, stream.Observe(chunk), ErrGeminiContinuation)
 	index = geminiContinuationMaxCalls
-	require.ErrorIs(t, NewGeminiContinuationStream().Observe(chunk), ErrGeminiContinuation)
+	require.ErrorIs(t, NewGeminiContinuationStream(NewChatCompletionsToResponsesStreamState("gemini-fixture")).Observe(chunk), ErrGeminiContinuation)
 	unknown, err := codec.Seal([]byte(`{"version":2,"items":[]}`))
 	require.NoError(t, err)
 	input := geminiFixtureInput(t, &ResponsesResponse{Output: []ResponsesOutput{{Type: "reasoning", EncryptedContent: GeminiContinuationPrefix + unknown}}})

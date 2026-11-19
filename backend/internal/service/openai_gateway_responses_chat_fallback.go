@@ -263,7 +263,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 	var continuation *apicompat.GeminiContinuationStream
 	if gemini != nil {
-		continuation = apicompat.NewGeminiContinuationStream()
+		continuation = apicompat.NewGeminiContinuationStream(state)
 	}
 	clientDisconnected := false
 	strictTerminal := gatewayNativeReasoningScope(c) != ""

@@ -641,8 +641,14 @@ func gatewayNativeAnthropicResponse(ctx context.Context, c *gin.Context, respons
 			encodedFrames = []string{frame.String()}
 		} else {
 			convertedEvents := apicompat.AnthropicEventToResponsesEvents(&event, state)
-			if event.Type == "message_stop" && validateFinal != nil && state.StopReason != "tool_use" && !validateFinal(state.Outputs) {
-				return nil, ErrGatewayNativeEffectUnknown
+			if event.Type == "message_stop" && validateFinal != nil {
+				toolTurn := false
+				for _, item := range state.Outputs {
+					toolTurn = toolTurn || item.Type == "function_call"
+				}
+				if state.StopReason == "tool_use" && !toolTurn || state.StopReason != "tool_use" && !validateFinal(state.Outputs) {
+					return nil, ErrGatewayNativeEffectUnknown
+				}
 			}
 			for _, converted := range convertedEvents {
 				convertedEvents := []apicompat.ResponsesStreamEvent{converted}

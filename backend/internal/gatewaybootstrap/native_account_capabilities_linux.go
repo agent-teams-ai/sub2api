@@ -10,8 +10,9 @@ import (
 func privateAccountCapabilities(profile ProfileConfig, transport *gatewaytransport.Handler, oauth *privateOAuth) service.GatewayAccountCapabilities {
 	out := service.GatewayAccountCapabilities{Contract: "native-account-capabilities/v1", Profiles: []service.GatewayAccountCapability{}}
 	info := oauth != nil && oauth.info != nil
+	imports := oauth != nil && oauth.connect != nil && oauth.dispatch != nil
 	add := func(id, model string) {
-		if p, ok := service.GatewayNativeAccountCapability(id, model, info, false); ok {
+		if p, ok := service.GatewayNativeAccountCapability(id, model, info, imports); ok {
 			out.Profiles = append(out.Profiles, p)
 		}
 	}
