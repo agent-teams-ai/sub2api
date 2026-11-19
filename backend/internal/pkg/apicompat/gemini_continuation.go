@@ -427,6 +427,11 @@ func (s *GeminiContinuationStream) Finalize(state *ChatCompletionsToResponsesStr
 	if s == nil || state == nil || state.CompletedSent || len(state.ToolCalls) > geminiContinuationMaxCalls {
 		return nil, ErrGeminiContinuation
 	}
+	// A signature without an output item cannot be returned by the real client
+	// on its next turn. Reject it before emitting an orphan continuation carrier.
+	if s.message != "" && state.MessageItemID == "" && (state.Reasoning.Len() == 0 || len(state.ToolCalls) > 0) {
+		return nil, ErrGeminiContinuation
+	}
 	message := ChatMessage{Role: "assistant", ExtraContent: geminiExtra(s.message)}
 	for i := 0; i < len(state.ToolCalls); i++ {
 		call := state.ToolCalls[i]

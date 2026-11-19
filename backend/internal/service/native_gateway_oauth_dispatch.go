@@ -37,15 +37,17 @@ type GatewayNativeOAuthRefreshFence interface {
 
 type GatewayNativeOAuthPhysical struct {
 	CredentialRevision int64
-	Scope              GatewayNativeCredentialScope
-	Operation          string
-	Route              GatewayNativeRoute
-	Issuer             string
-	Subject            string
-	ProviderAccount    string
-	QualifiedAt        time.Time
-	proof              *gatewayOAuthQualificationProof
-	RefreshFence       GatewayNativeOAuthRefreshFence
+	// Computed by the existing maintenance read; never a stored mirror flag.
+	AccountInfoInitialized bool `json:"-"`
+	Scope                  GatewayNativeCredentialScope
+	Operation              string
+	Route                  GatewayNativeRoute
+	Issuer                 string
+	Subject                string
+	ProviderAccount        string
+	QualifiedAt            time.Time
+	proof                  *gatewayOAuthQualificationProof
+	RefreshFence           GatewayNativeOAuthRefreshFence
 }
 
 type GatewayNativeOAuthDispatchRepository interface {

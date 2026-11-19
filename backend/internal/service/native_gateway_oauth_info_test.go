@@ -38,6 +38,7 @@ func (r *oauthInfoFixture) StoreGatewayAccountInfo(ctx context.Context, p Gatewa
 		return ErrGatewayNativeIdentity
 	}
 	r.stored = append(r.stored, o)
+	r.physical.AccountInfoInitialized = true
 	return nil
 }
 func (r *oauthInfoFixture) lock(scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthPhysical, string, func(), error) {
@@ -52,6 +53,14 @@ func (r *oauthInfoFixture) LockGatewayClaudePhysical(_ context.Context, scope Ga
 }
 func (r *oauthInfoFixture) LockGatewayGrokPhysical(_ context.Context, scope GatewayNativeCredentialScope, operation string, _ *GatewayNativeRoute) (GatewayNativeOAuthPhysical, string, func(), error) {
 	return r.lock(scope, operation)
+}
+func (r *oauthInfoFixture) LockGatewayClaudeMaintenance(_ context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthPhysical, string, string, string, func(), error) {
+	p, envelope, release, err := r.lock(scope, operation)
+	return p, envelope, "completed", "", release, err
+}
+func (r *oauthInfoFixture) LockGatewayGrokMaintenance(_ context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthPhysical, string, string, string, func(), error) {
+	p, envelope, release, err := r.lock(scope, operation)
+	return p, envelope, "completed", "", release, err
 }
 
 func TestGatewayClaudeInfoOnlyUsesAuthenticatedAccountAndPreservesPartialRefresh(t *testing.T) {
@@ -145,12 +154,16 @@ func TestGatewayOAuthInfoHydrationKeepsOriginalObservationAndNeverCallsHTTP(t *t
 			expiry := time.Now().UTC().Add(time.Hour)
 			var seal func(time.Time) (string, error)
 			var hydrate func(context.Context, GatewayNativeCredentialScope, string) error
+			var maintain func(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthMaintenanceOutcome, error)
+			allow := func(context.Context, GatewayNativeCredentialScope, string) error { return nil }
 			if provider == "claude" {
 				repo.physical.Issuer, repo.physical.Subject, repo.physical.ProviderAccount = GatewayClaudeOAuthIssuer, uuid.NewString(), uuid.NewString()
 				repo.physical.Route.Profile, repo.physical.Route.BaseURL, repo.physical.Route.Model = GatewayClaudeOAuthMessagesProfile, GatewayClaudeOAuthBaseURL, GatewayClaudeOAuthModel
 				s, err := NewGatewayNativeClaudeOAuth(repo, nativeFixtureCustody(t), transport)
 				require.NoError(t, err)
 				hydrate = s.HydrateAccountInfo
+				maintain = s.Maintain
+				require.NoError(t, s.SetEntryAuthorizers(allow, allow))
 				seal = func(at time.Time) (string, error) {
 					return s.seal(scope, gatewayClaudeBundle{Kind: "claude-oauth/v1", Revision: 1, AccessToken: "private-access", RefreshToken: "private-refresh", Account: repo.physical.Subject, Organization: repo.physical.ProviderAccount, ExpiresAt: expiry, ObservedAt: at})
 				}
@@ -160,6 +173,8 @@ func TestGatewayOAuthInfoHydrationKeepsOriginalObservationAndNeverCallsHTTP(t *t
 				s, err := NewGatewayNativeGrokOAuth(repo, nativeFixtureCustody(t), transport, GatewayNativeGrokOAuthQualification{ClientID: "qualified-client", RedirectURI: xai.DefaultRedirectURI, DeploymentQualified: true})
 				require.NoError(t, err)
 				hydrate = s.HydrateAccountInfo
+				maintain = s.Maintain
+				require.NoError(t, s.SetEntryAuthorizers(allow, allow))
 				seal = func(at time.Time) (string, error) {
 					return s.seal(scope, gatewayGrokBundle{Kind: "grok-oauth/v1", Revision: 1, AccessToken: "private-access", RefreshToken: "private-refresh", Subject: repo.physical.Subject, Team: repo.physical.ProviderAccount, ExpiresAt: expiry, ObservedAt: at, Nonce: strings.Repeat("n", 43), ClientID: "qualified-client"})
 				}
@@ -172,7 +187,9 @@ func TestGatewayOAuthInfoHydrationKeepsOriginalObservationAndNeverCallsHTTP(t *t
 			original := time.Now().UTC().Add(-48 * time.Hour)
 			repo.envelope, err = seal(original)
 			require.NoError(t, err)
-			require.NoError(t, hydrate(ctx, scope, "connect"))
+			maintained, err := maintain(ctx, scope, "connect")
+			require.NoError(t, err)
+			require.Equal(t, "idle", maintained.State)
 			require.False(t, repo.held, "release custody before acquiring the snapshot write fence")
 			require.Len(t, repo.stored, 1)
 			o := repo.stored[0]
@@ -181,6 +198,9 @@ func TestGatewayOAuthInfoHydrationKeepsOriginalObservationAndNeverCallsHTTP(t *t
 			require.True(t, ok)
 			require.Equal(t, "stale", fields.CredentialExpiresAt.Freshness)
 			require.Equal(t, "unknown", fields.Email.Status)
+			_, err = maintain(ctx, scope, "connect")
+			require.NoError(t, err)
+			require.Len(t, repo.stored, 1, "an initialized idle account does not acquire a snapshot write transaction")
 			foreign := scope
 			foreign.Owner = "foreign"
 			require.Error(t, hydrate(ctx, foreign, "connect"))

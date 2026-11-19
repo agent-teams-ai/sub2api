@@ -122,4 +122,7 @@ func TestGatewayAccountInfoPostgresOrderingAtomicityAndReplacement(t *testing.T)
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID).Scan(&rows))
 	require.Zero(t, rows)
 	require.Error(t, info.StoreGatewayAccountInfo(ctx, newPhysical, observation(order+1, "late"), false))
+	t.Run("Codex authenticated hydration and atomic refresh", func(t *testing.T) {
+		gatewayCodexInfoPostgresLifecycle(t, db)
+	})
 }

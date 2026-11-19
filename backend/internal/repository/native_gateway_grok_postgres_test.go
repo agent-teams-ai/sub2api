@@ -192,6 +192,13 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	route := *descriptor.Native
 	infoStore := NewGatewayAccountInfoRepository(db)
 	infoInput := service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: route.Profile}
+	initialized := func() bool {
+		p, _, _, _, release, e := source.LockGatewayGrokMaintenance(ownerCtx, scope, op)
+		require.NoError(t, e)
+		release()
+		return p.AccountInfoInitialized
+	}
+	require.True(t, initialized())
 	initialInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
 	require.NoError(t, err)
 	require.Len(t, initialInfo.Sources, 2, "verified enrollment publishes facts in its own transaction")
@@ -205,7 +212,9 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	require.EqualValues(t, 1, exchanges.Load(), "metadata hydration adds no OAuth effects")
 	_, err = db.ExecContext(ctx, `DELETE FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID)
 	require.NoError(t, err)
+	require.False(t, initialized())
 	require.NoError(t, grok.HydrateAccountInfo(ownerCtx, scope, op))
+	require.True(t, initialized())
 	hydratedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
 	require.NoError(t, err)
 	require.Len(t, hydratedInfo.Sources, 1)

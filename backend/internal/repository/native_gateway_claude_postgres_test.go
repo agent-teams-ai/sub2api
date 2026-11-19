@@ -137,6 +137,13 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 	route := *descriptor.Native
 	infoStore := NewGatewayAccountInfoRepository(db)
 	infoInput := service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: route.Profile}
+	initialized := func() bool {
+		p, _, _, _, release, e := source.LockGatewayClaudeMaintenance(ownerCtx, scope, op)
+		require.NoError(t, e)
+		release()
+		return p.AccountInfoInitialized
+	}
+	require.True(t, initialized())
 	initialInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
 	require.NoError(t, err)
 	require.Len(t, initialInfo.Sources, 2, "enrollment and metadata commit together")
@@ -152,7 +159,9 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 	// without fabricating or duplicating the account facts discarded by custody.
 	_, err = db.ExecContext(ctx, `DELETE FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID)
 	require.NoError(t, err)
+	require.False(t, initialized())
 	require.NoError(t, claude.HydrateAccountInfo(ownerCtx, scope, op))
+	require.True(t, initialized())
 	hydratedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
 	require.NoError(t, err)
 	require.Len(t, hydratedInfo.Sources, 1)

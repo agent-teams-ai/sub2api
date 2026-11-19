@@ -203,6 +203,19 @@ func TestGeminiContinuationRetainsMessageSignatureAndLeavesOrdinaryConverterUnch
 	require.Equal(t, "text-signature", chat.Messages[1].ExtraContent.Google.ThoughtSignature)
 }
 
+func TestGeminiContinuationRejectsSignatureWithoutStreamedOutput(t *testing.T) {
+	codec := newGeminiFixtureCodec(t, "fixture")
+	stream := NewGeminiContinuationStream()
+	state := NewChatCompletionsToResponsesStreamState("gemini-fixture")
+	chunk := &ChatCompletionsChunk{Choices: []ChatChunkChoice{{Delta: ChatDelta{ExtraContent: geminiExtra("orphan-signature")}}}}
+	require.NoError(t, stream.Observe(chunk))
+	ChatCompletionsChunkToResponsesEvents(chunk, state)
+	events, err := stream.Finalize(state, codec)
+	require.ErrorIs(t, err, ErrGeminiContinuation)
+	require.Empty(t, events)
+	require.False(t, state.CompletedSent)
+}
+
 func TestGeminiContinuationRepeatedTextKeepsExactStepAssociationWithoutIDs(t *testing.T) {
 	codec := newGeminiFixtureCodec(t, "fixture")
 	first := geminiFixtureOutput(t, geminiFixtureSource(t, `{"choices":[{"message":{"role":"assistant","content":"Done","extra_content":{"google":{"thought_signature":"sig-first"}}}}]}`), codec, nil)

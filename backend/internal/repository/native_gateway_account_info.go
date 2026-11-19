@@ -116,6 +116,13 @@ func (r *accountRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) 
 	}
 	return NewGatewayAccountInfoRepository(db).ReserveGatewayAccountInfoOrder(ctx)
 }
+func (r *accountRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
+	db, ok := r.sql.(*sql.DB)
+	if !ok {
+		return service.ErrGatewayNativeIdentity
+	}
+	return NewGatewayAccountInfoRepository(db).StoreGatewayAccountInfo(ctx, p, o, initialize)
+}
 func (r *gatewayAccountInfoRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
 	if !service.GatewayAccountInfoObservationValid(p.Route.Profile, o) || o.CredentialRevision != p.CredentialRevision || !initialize && o.Order < 1 {
 		return service.ErrGatewayNativeIdentity
@@ -154,8 +161,15 @@ func storeGatewayAccountInfoTx(ctx context.Context, tx *sql.Tx, p service.Gatewa
 	if err != nil {
 		return err
 	}
-	if initialize && len(stored.Sources) > 0 {
-		return nil
+	if initialize {
+		// Legacy sources have no live order. They may fill separate untouched
+		// source slots, but any real observation (including an omission) blocks
+		// all later cached hydration for this physical principal.
+		for _, prior := range stored.Sources {
+			if prior.Order > 0 {
+				return nil
+			}
+		}
 	}
 	if prior, ok := stored.Sources[o.Source]; ok {
 		if o.Order < prior.Order {

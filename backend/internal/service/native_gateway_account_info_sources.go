@@ -115,8 +115,12 @@ func gatewayCodexCredentialInfo(bundle GatewayNativeOAuthBundle, custody *Gatewa
 		return f
 	}
 	var timing gatewayOAuthTiming
-	if json.Unmarshal(fields[gatewayOAuthTimingMember], &timing) == nil && gatewayInfoInstant(timing.AccessExpires) {
-		f.CredentialExpiresAt = gatewayKnownFact(timing.AccessExpires, "provider_api", at)
+	if json.Unmarshal(fields[gatewayOAuthTimingMember], &timing) == nil {
+		expiry, e1 := time.Parse(time.RFC3339Nano, timing.AccessExpires)
+		observed, e2 := time.Parse(time.RFC3339Nano, timing.RequestStarted)
+		if e1 == nil && e2 == nil {
+			return gatewayOAuthCredentialExpiryInfo(GatewayCodexOAuthResponsesProfile, expiry, observed)
+		}
 	}
 	return f
 }

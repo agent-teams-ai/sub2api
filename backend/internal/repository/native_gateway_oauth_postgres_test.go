@@ -1048,15 +1048,20 @@ func (r *oauthRefreshLostACK) CompleteGatewayNativeOAuthRefresh(ctx context.Cont
 	}
 	return out, err
 }
-func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http.Request, func(string) service.GatewayNativeOAuthBundle), accountCheck func(http.ResponseWriter, *http.Request)) (*service.GatewayNativeOAuthVerifier, http.RoundTripper, func(string) service.GatewayNativeOAuthBundle) {
+func oauthPGRefreshFixture(t *testing.T, handler func(http.ResponseWriter, *http.Request, func(string) service.GatewayNativeOAuthBundle), accountCheck func(http.ResponseWriter, *http.Request), additionalClaims ...func(map[string]any)) (*service.GatewayNativeOAuthVerifier, http.RoundTripper, func(string) service.GatewayNativeOAuthBundle) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 	subjectSuffix := "-" + uuid.NewString()
 	bundleFor := func(subject string) service.GatewayNativeOAuthBundle {
 		subject += subjectSuffix
-		claims := fmt.Sprintf(`{"iss":%q,"sub":%q,"aud":"app_EMoamEEZ73f0CkXaXp7hrann","exp":%d}`, service.GatewayOAuthIssuer, subject, time.Now().Add(time.Hour).Unix())
-		body := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"fixture"}`)) + "." + base64.RawURLEncoding.EncodeToString([]byte(claims))
+		claims := map[string]any{"iss": service.GatewayOAuthIssuer, "sub": subject, "aud": "app_EMoamEEZ73f0CkXaXp7hrann", "exp": time.Now().Add(time.Hour).Unix()}
+		for _, add := range additionalClaims {
+			add(claims)
+		}
+		claimBytes, err := json.Marshal(claims)
+		require.NoError(t, err)
+		body := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"fixture"}`)) + "." + base64.RawURLEncoding.EncodeToString(claimBytes)
 		digest := sha256.Sum256([]byte(body))
 		signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
 		require.NoError(t, err)

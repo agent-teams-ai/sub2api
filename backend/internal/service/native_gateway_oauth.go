@@ -388,6 +388,7 @@ type GatewayNativeOAuthBundle struct {
 	SensitiveMetadata json.RawMessage `json:"sensitive_metadata"`
 	// Only a fresh fixed-origin token exchange sets this; never part of replay bytes.
 	requestStarted time.Time
+	info           []GatewayAccountInfoObservation
 }
 
 func (b GatewayNativeOAuthBundle) bytes() ([]byte, error) {

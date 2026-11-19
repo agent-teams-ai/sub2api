@@ -534,6 +534,11 @@ func (s *GatewayNativeGrokOAuth) Maintain(ctx context.Context, scope GatewayNati
 		return out, err
 	}
 	if time.Now().Add(5 * time.Minute).Before(previous.ExpiresAt) {
+		if !p.AccountInfoInitialized && !previous.ObservedAt.IsZero() {
+			// Initialize only an absent snapshot during the existing explicit
+			// maintenance mutation. Ordinary idle accounts do no extra SQL work.
+			_ = s.HydrateAccountInfo(ctx, scope, operation)
+		}
 		if attempt != "" {
 			out.State = "completed"
 			out.RefreshRef = attempt

@@ -409,7 +409,10 @@ func (r *gatewayGrokRepository) LockGatewayGrokMaintenance(ctx context.Context, 
 		return p, "", "", "", nil, err
 	}
 	var state, attempt string
-	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,'') FROM gateway_grok_connect_intents`+grokWhere, grokArgs(s, op)...).Scan(&state, &attempt)
+	args := append(grokArgs(s, op), p.Route.AccountID, p.Route.CreatedAt, p.Route.Generation, service.GatewayAccountInfoPrincipal(p))
+	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,''),EXISTS(
+ SELECT 1 FROM gateway_account_info_snapshots WHERE account_id=$7 AND native_created_at=$8 AND generation=$9 AND principal_version=$10)
+ FROM gateway_grok_connect_intents`+grokWhere, args...).Scan(&state, &attempt, &p.AccountInfoInitialized)
 	if err != nil {
 		_ = tx.Rollback()
 		return p, "", "", "", nil, service.ErrGatewayNativeIdentity

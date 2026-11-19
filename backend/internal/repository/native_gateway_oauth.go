@@ -376,6 +376,27 @@ func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Contex
 	if err != nil || n != 1 {
 		return empty, service.ErrGatewayOAuthConflict
 	}
+	if observations := in.AccountInfoObservations(); len(observations) > 0 {
+		// Qualification may not exist yet. Its later native account check will
+		// seed facts; refresh never creates or changes that dispatch authority.
+		var operation string
+		err := tx.QueryRowContext(ctx, `SELECT operation_ref FROM gateway_oauth_profile_qualifications WHERE account_id=$1 AND native_created_at=$2`, in.AccountID, in.CreatedAt).Scan(&operation)
+		if err != nil && err != sql.ErrNoRows {
+			return empty, service.ErrGatewayNativeIdentity
+		}
+		if err == nil {
+			_, p, err := gatewayOAuthPhysicalRead(ctx, tx, in.Scope, operation, in.AccountID)
+			if err != nil {
+				return empty, service.ErrGatewayNativeIdentity
+			}
+			p.CredentialRevision = in.ExpectedVersion + 1
+			for _, observation := range observations {
+				if err := storeGatewayAccountInfoTx(ctx, tx, p, observation, false); err != nil {
+					return empty, err
+				}
+			}
+		}
+	}
 	if tx.Commit() != nil {
 		return empty, service.ErrGatewayNativeIdentity
 	}
@@ -449,7 +470,11 @@ func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context
 	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, id).Scan(&locked) != nil {
 		return deny()
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.created_at,gateway_oauth_credential_version(a.credentials),a.credentials->>'oauth_bundle'
+	var issuer, subject, providerAccount, infoPrincipal string
+	var qualifiedAt sql.NullTime
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.created_at,gateway_oauth_credential_version(a.credentials),a.credentials->>'oauth_bundle',
+ r.issuer,r.subject,COALESCE(q.provider_account_id,''),q.qualified_at,COALESCE((SELECT i.principal_version
+ FROM gateway_account_info_snapshots i WHERE i.account_id=a.id AND i.native_created_at=a.created_at AND i.generation=c.generation),'')
  FROM accounts a JOIN gateway_oauth_identity_reservations r ON r.account_id=a.id
  JOIN gateway_oauth_connect_intents c ON c.consumer=r.consumer AND c.owner_ref=r.owner_ref
  AND c.account_ref=r.account_ref AND c.generation=r.generation
@@ -478,13 +503,18 @@ func (r *accountRepository) ResolveGatewayNativeOAuthRefresh(ctx context.Context
 	if err != nil {
 		return deny()
 	}
-	if !rows.Next() || rows.Scan(&out.AccountID, &out.CreatedAt, &out.Version, &out.Envelope) != nil || rows.Next() || rows.Err() != nil {
+	if !rows.Next() || rows.Scan(&out.AccountID, &out.CreatedAt, &out.Version, &out.Envelope, &issuer, &subject, &providerAccount, &qualifiedAt, &infoPrincipal) != nil || rows.Next() || rows.Err() != nil {
 		_ = rows.Close()
 		return deny()
 	}
 	if rows.Close() != nil {
 		return deny()
 	}
+	out.Qualified = qualifiedAt.Valid
+	physical := service.GatewayNativeOAuthPhysical{Scope: scope, Operation: operation, Issuer: issuer, Subject: subject, ProviderAccount: providerAccount,
+		Route: service.GatewayNativeRoute{AccountID: out.AccountID, CreatedAt: out.CreatedAt, Generation: scope.Generation,
+			Profile: service.GatewayCodexOAuthResponsesProfile, BaseURL: service.GatewayCodexOAuthBaseURL, Model: service.GatewayCodexOAuthModel}}
+	out.AccountInfoInitialized = out.Qualified && infoPrincipal == service.GatewayAccountInfoPrincipal(physical)
 	// UNIQUE(account_id,expected_version) is authoritative, including an old
 	// reference whose completion ACK was lost and whose current version is newer.
 	attempt := service.GatewayNativeOAuthRefreshIntent{}
