@@ -218,7 +218,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// 记录本次实际选择的协议端点，供错误日志和用量日志在没有
 	// OpenAIForwardResult（例如 503/传输失败）时使用。每次发送都覆盖，
 	// 避免 Gin context 在账号 failover 尝试之间残留旧端点。
-	SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
+	SetActualOpenAIUpstreamEndpoint(c, upstreamReq.URL.Path)
 	upstreamReq = upstreamReq.WithContext(WithHTTPUpstreamProfile(upstreamReq.Context(), HTTPUpstreamProfileOpenAI))
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("Authorization", "Bearer "+bearerToken)

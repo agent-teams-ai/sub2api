@@ -5,7 +5,6 @@ package repository
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,13 +28,18 @@ func (c *codexInfoCountHTTP) RoundTrip(r *http.Request) (*http.Response, error) 
 	return c.RoundTripper.RoundTrip(r)
 }
 
-// Reuses the already migrated isolated M1 database. The actual token/JWKS and
-// account-check transports, custody, connect FSM, refresh writer and snapshot
-// repository all run; only the upstream account is a signed synthetic fixture.
-func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+// The actual token/JWKS and account-check transports, custody, connect FSM,
+// refresh writer and snapshot repository all run against a separate migrated
+// database; only the upstream account is a signed synthetic fixture.
+func TestGatewayAccountInfoCodexPostgresHydrationAndRefresh(t *testing.T) {
+	dsn := custodyPGDSN(t, "GATEWAY_NATIVE_CODEX_INFO_TEST_DSN", "gateway_info_test_codex_")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	db, err := openOAuthDispatchFixtureDB(dsn)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	require.NoError(t, requireOAuthDispatchEmptyObjects(ctx, db))
+	require.NoError(t, ApplyMigrations(ctx, db))
 	var phase atomic.Int32
 	providerID := uuid.NewString()
 	_, transport, _ := oauthPGRefreshFixture(t, func(w http.ResponseWriter, r *http.Request, bundleFor func(string) service.GatewayNativeOAuthBundle) {
@@ -53,7 +57,7 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	counted := &codexInfoCountHTTP{RoundTripper: transport}
 	verifier := service.NewGatewayNativeOAuthVerifier(counted)
 	key := make([]byte, 32)
-	_, err := rand.Read(key)
+	_, err = rand.Read(key)
 	require.NoError(t, err)
 	custody, err := service.NewGatewayNativeCredentialCustody("info-codex", map[string][]byte{"info-codex": key})
 	require.NoError(t, err)
@@ -152,9 +156,10 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	require.EqualValues(t, 2, fresh.Sources["credential"].CredentialRevision)
 	require.Equal(t, initial.PrincipalVersion, fresh.PrincipalVersion)
 	require.Error(t, info.StoreGatewayAccountInfo(owner, physical, false, omission), "old credential observation loses current revision CAS")
-	// Fail metadata publication after provider exchange. The same transaction
-	// must roll credential/version back and the original operation becomes unknown.
-	_, err = db.ExecContext(ctx, `CREATE FUNCTION gateway_info_test_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic info commit failure'; END $$;
+	// Fail only the second metadata source after the first source has written.
+	// The whole optional batch rolls back while credentials and receipt commit.
+	_, err = db.ExecContext(ctx, `CREATE FUNCTION gateway_info_test_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF (NEW.sources->'credential'->>'credentialRevision')::bigint=3 THEN RAISE EXCEPTION 'synthetic second-source failure'; END IF; RETURN NEW; END $$;
  CREATE TRIGGER gateway_info_test_reject BEFORE INSERT OR UPDATE ON gateway_account_info_snapshots FOR EACH ROW EXECUTE FUNCTION gateway_info_test_reject()`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -163,11 +168,34 @@ func gatewayCodexInfoPostgresLifecycle(t *testing.T, db *sql.DB) {
 	phase.Store(2)
 	intent.ExpectedVersion, intent.Operation, intent.Intent = 2, "info-codex-rotate-two", "info-codex-rotation-two"
 	out, err = refresh.Refresh(owner, intent)
-	require.Error(t, err)
-	require.Equal(t, "unknown", out.State)
-	var credentialVersion, infoRevision int64
+	require.NoError(t, err)
+	require.Equal(t, "completed", out.State)
+	require.EqualValues(t, 3, out.Version)
+	var credentialVersion, resultVersion int64
+	var attemptState string
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT gateway_oauth_credential_version(credentials) FROM accounts WHERE id=$1`, route.AccountID).Scan(&credentialVersion))
-	require.NoError(t, db.QueryRowContext(ctx, `SELECT revision FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID).Scan(&infoRevision))
-	require.EqualValues(t, 2, credentialVersion)
-	require.Equal(t, fresh.Revision, infoRevision)
+	require.EqualValues(t, 3, credentialVersion)
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT state,result_version FROM gateway_oauth_refresh_attempts WHERE consumer=$1 AND operation_ref=$2`, scope.Consumer, intent.Operation).Scan(&attemptState, &resultVersion))
+	require.Equal(t, "completed", attemptState)
+	require.EqualValues(t, 3, resultVersion)
+	unchanged, err := info.ReadGatewayAccountInfo(owner, input, route)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, unchanged.CredentialRevision)
+	require.Equal(t, fresh.Revision, unchanged.Revision)
+	require.Equal(t, fresh.Sources, unchanged.Sources, "no first-source write may escape the failed metadata batch")
+	fields, valid := service.GatewayAccountInfoProject(route.Profile, unchanged, time.Now())
+	require.True(t, valid)
+	require.Equal(t, "unknown", fields.CredentialExpiresAt.Status, "old expiry cannot describe the rotated credential")
+	require.Equal(t, "native1@example.test", *fields.Email.Value)
+	require.Equal(t, fresh.Sources["verified_claims"].Fields.Email.ObservedAt, fields.Email.ObservedAt)
+	callsAfterRotation := counted.calls.Load()
+	replayed, err := refresh.Refresh(owner, intent)
+	require.NoError(t, err)
+	require.Equal(t, out, replayed)
+	require.Equal(t, callsAfterRotation, counted.calls.Load(), "completed refresh replay must not exchange again")
+	stale := intent
+	stale.Operation, stale.Intent = "info-codex-rotate-stale", "info-codex-rotation-stale"
+	_, err = refresh.Refresh(owner, stale)
+	require.Error(t, err, "optional metadata isolation cannot relax the credential version CAS")
+	require.Equal(t, callsAfterRotation, counted.calls.Load())
 }

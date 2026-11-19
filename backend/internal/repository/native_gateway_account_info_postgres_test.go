@@ -129,7 +129,4 @@ func TestGatewayAccountInfoPostgresOrderingAtomicityAndReplacement(t *testing.T)
 	t.Run("Official API closed database profiles", func(t *testing.T) {
 		gatewayOfficialAPIProfilesPostgres(t, db)
 	})
-	t.Run("Codex authenticated hydration and atomic refresh", func(t *testing.T) {
-		gatewayCodexInfoPostgresLifecycle(t, db)
-	})
 }

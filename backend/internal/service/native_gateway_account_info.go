@@ -341,10 +341,16 @@ func GatewayAccountInfoObservationValid(profile string, o GatewayAccountInfoObse
 	case "verified_claims", "account_check", "credential":
 		return profile == GatewayCodexOAuthResponsesProfile || profile == GatewayClaudeOAuthMessagesProfile || profile == GatewayGrokOAuthResponsesProfile
 	case "plan_quota":
-		return profile == GatewayGLMCodingResponsesProfile || profile == GatewayMiniMaxMPlanResponsesProfile
+		return GatewayAccountInfoPlanQuotaProfile(profile)
 	}
 	return false
 }
+// GatewayAccountInfoPlanQuotaProfile is the closed source policy shared by
+// observation validation and pre-HTTP quota/info order reservation.
+func GatewayAccountInfoPlanQuotaProfile(profile string) bool {
+	return profile == GatewayGLMCodingResponsesProfile || profile == GatewayMiniMaxMPlanResponsesProfile
+}
+
 func gatewayKnownFact[T any](value T, source string, at time.Time) GatewayAccountFact[T] {
 	return GatewayAccountFact[T]{Status: "known", Value: &value, Source: source, ObservedAt: at.UTC().Format(time.RFC3339Nano), Freshness: "current"}
 }

@@ -390,10 +390,8 @@ func (r *accountRepository) CompleteGatewayNativeOAuthRefresh(ctx context.Contex
 				return empty, service.ErrGatewayNativeIdentity
 			}
 			p.CredentialRevision = in.ExpectedVersion + 1
-			for _, observation := range observations {
-				if err := storeGatewayAccountInfoTx(ctx, tx, p, observation, false); err != nil {
-					return empty, err
-				}
+			if err := storeGatewayRefreshAccountInfoTx(ctx, tx, p, observations); err != nil {
+				return empty, err
 			}
 		}
 	}

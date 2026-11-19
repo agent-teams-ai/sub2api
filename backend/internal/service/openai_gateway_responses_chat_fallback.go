@@ -315,6 +315,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
+		if invalidContinuation {
+			return // The scanner may still hold buffered lines after Body.Close.
+		}
 		if continuation != nil && continuation.Observe(chunk) != nil {
 			invalidContinuation = true
 			_ = resp.Body.Close()

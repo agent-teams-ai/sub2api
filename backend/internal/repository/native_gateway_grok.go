@@ -254,11 +254,8 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokRefresh(ctx context.Context, 
 		return service.ErrGatewayNativeIdentity
 	}
 	current.CredentialRevision++
-	for _, observation := range info {
-		observation.CredentialRevision = current.CredentialRevision
-		if storeGatewayAccountInfoTx(ctx, tx, current, observation, false) != nil {
-			return service.ErrGatewayNativeIdentity
-		}
+	if err := storeGatewayRefreshAccountInfoTx(ctx, tx, current, info); err != nil {
+		return err
 	}
 	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity

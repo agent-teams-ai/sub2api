@@ -215,5 +215,30 @@ func storeGatewayAccountInfoTx(ctx context.Context, tx *sql.Tx, p service.Gatewa
 	return nil
 }
 
+// Refresh has already locked and verified the physical principal, version and
+// attempt. Optional facts share its transaction but cannot discard a successfully
+// rotated credential when the whole metadata batch can be rolled back safely.
+func storeGatewayRefreshAccountInfoTx(ctx context.Context, tx *sql.Tx, p service.GatewayNativeOAuthPhysical, observations []service.GatewayAccountInfoObservation) error {
+	if len(observations) == 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT gateway_refresh_account_info`); err != nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	for _, observation := range observations {
+		observation.CredentialRevision = p.CredentialRevision
+		if err := storeGatewayAccountInfoTx(ctx, tx, p, observation, false); err != nil {
+			if _, rollbackErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT gateway_refresh_account_info`); rollbackErr != nil {
+				return service.ErrGatewayNativeIdentity
+			}
+			break
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT gateway_refresh_account_info`); err != nil {
+		return service.ErrGatewayNativeIdentity
+	}
+	return nil
+}
+
 var _ service.GatewayAccountInfoCache = (*gatewayAccountInfoRepository)(nil)
 var _ service.GatewayAccountInfoWriter = (*gatewayAccountInfoRepository)(nil)

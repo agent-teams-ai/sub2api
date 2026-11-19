@@ -59,14 +59,14 @@ type codexInfoMaintenanceFixture struct {
 }
 
 func (r *codexInfoMaintenanceFixture) ResolveGatewayNativeOAuthRefresh(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthRefreshResolution, error) {
-	return GatewayNativeOAuthRefreshResolution{AccountID: r.row.ID, CreatedAt: r.row.CreatedAt, Version: 1, Envelope: r.row.GetCredential("oauth_bundle"), Qualified: true, AccountInfoInitialized: r.initialized}, nil
+	return GatewayNativeOAuthRefreshResolution{AccountID: r.row.ID, CreatedAt: r.row.CreatedAt, Version: 2, Envelope: r.row.GetCredential("oauth_bundle"), Qualified: true, AccountInfoInitialized: r.initialized}, nil
 }
 func (r *codexInfoMaintenanceFixture) ReserveGatewayAccountInfoOrder(context.Context) (int64, error) {
 	return 0, ErrGatewayNativeIdentity // cached hydration must not mint a live order
 }
 func (r *codexInfoMaintenanceFixture) StoreGatewayAccountInfo(ctx context.Context, p GatewayNativeOAuthPhysical, initialize bool, observations ...GatewayAccountInfoObservation) error {
 	deadline, bounded := ctx.Deadline()
-	if !bounded || time.Until(deadline) > 2*time.Second || r.locks != r.releases || p.CredentialRevision != 1 || !initialize || len(observations) != 2 {
+	if !bounded || time.Until(deadline) > 2*time.Second || r.locks != r.releases || p.CredentialRevision != 2 || !initialize || len(observations) != 2 {
 		return ErrGatewayNativeIdentity
 	}
 	for _, observation := range observations {
@@ -87,9 +87,9 @@ func TestGatewayCodexMaintenanceHydratesOnceWithoutProviderHTTP(t *testing.T) {
 	observed := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
 	bundle, err := gatewayOAuthTimedBundle(f.bundle, observed, identity, f.dispatch.custody)
 	require.NoError(t, err)
-	envelope, err := f.dispatch.custody.sealOAuthVersion(f.scope, 1, bundle)
+	envelope, err := f.dispatch.custody.sealOAuthVersion(f.scope, 2, bundle)
 	require.NoError(t, err)
-	f.store.row.Credentials = map[string]any{"oauth_bundle": envelope, "credential_version": "1"}
+	f.store.row.Credentials = map[string]any{"oauth_bundle": envelope, "credential_version": "2"}
 	repository := &codexInfoMaintenanceFixture{oauthDispatchStore: f.store}
 	refresh, err := NewGatewayNativeOAuthRefresh(repository, f.dispatch.custody, f.dispatch.verifier, f.dispatch.client.Transport)
 	require.NoError(t, err)

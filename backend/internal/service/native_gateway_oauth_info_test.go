@@ -64,11 +64,11 @@ func (r *oauthInfoFixture) LockGatewayGrokPhysical(_ context.Context, scope Gate
 }
 func (r *oauthInfoFixture) LockGatewayClaudeMaintenance(_ context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthPhysical, string, string, string, func(), error) {
 	p, envelope, release, err := r.lock(scope, operation)
-	return p, envelope, "completed", "", release, err
+	return p, envelope, "idle", "", release, err
 }
 func (r *oauthInfoFixture) LockGatewayGrokMaintenance(_ context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthPhysical, string, string, string, func(), error) {
 	p, envelope, release, err := r.lock(scope, operation)
-	return p, envelope, "completed", "", release, err
+	return p, envelope, "idle", "", release, err
 }
 
 func TestGatewayClaudeInfoOnlyUsesAuthenticatedAccountAndPreservesPartialRefresh(t *testing.T) {

@@ -45,6 +45,9 @@ func officialAPIWireFixture(t *testing.T, profile, base, model string, handler h
 		c.Request = httptest.NewRequest(http.MethodPost, "/private/native/v1/responses", bytes.NewReader(body))
 		c.Request.Header.Set("Authorization", "Bearer caller-must-not-reach-provider")
 		_, entered, err := s.ForwardGatewayRoute(nativeFixtureContext(t, context.Background()), c, route, body)
+		if profile == GatewayGeminiAPIKeyProfile && entered {
+			require.Equal(t, "/v1beta/openai/chat/completions", GetActualOpenAIUpstreamEndpoint(c))
+		}
 		return rec, entered, err
 	}
 	return s, route, call
@@ -137,6 +140,31 @@ func TestGatewayNativeOfficialGeminiActualTLSContinuationAndSchema(t *testing.T)
 	require.ErrorIs(t, err, ErrGatewayNativeIdentity)
 	require.False(t, entered)
 	require.Equal(t, 2, requests)
+}
+
+func TestGatewayNativeOfficialGeminiRejectsBufferedChunksAfterInvalidSignature(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	_, _, call := officialAPIWireFixture(t, GatewayGeminiAPIKeyProfile, GatewayGeminiAPIBaseURL, GatewayGeminiAPIModel, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Keep every line in one small write, so the scanner has later chunks
+		// buffered when the second, conflicting signature closes the body.
+		chunks := []string{
+			`{"id":"first","choices":[{"index":0,"delta":{"role":"assistant","content":"before","extra_content":{"google":{"thought_signature":"first-signature"}}},"finish_reason":null}]}`,
+			`{"id":"first","choices":[{"index":0,"delta":{"extra_content":{"google":{"thought_signature":"conflicting-signature"}}},"finish_reason":null}]}`,
+			`{"id":"first","choices":[{"index":0,"delta":{"content":"buffered-after-invalid-signature"},"finish_reason":null}]}`,
+			`{"id":"first","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		}
+		io.WriteString(w, "data: "+strings.Join(chunks, "\n\ndata: ")+"\n\n")
+	})
+	body, err := json.Marshal(map[string]any{"model": GatewayGeminiAPIModel, "input": "Review", "store": false, "stream": true, "max_output_tokens": 512})
+	require.NoError(t, err)
+	rec, entered, err := call(body)
+	require.True(t, entered)
+	require.ErrorIs(t, err, ErrGatewayNativeEffectUnknown)
+	require.Contains(t, rec.Body.String(), "before")
+	require.NotContains(t, rec.Body.String(), "buffered-after-invalid-signature")
+	require.NotContains(t, rec.Body.String(), "response.completed")
 }
 
 func TestGatewayNativeOfficialAnthropicActualTLSHeadersToolsAndSchema(t *testing.T) {
