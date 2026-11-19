@@ -2200,7 +2200,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsCustom[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:   "custom_tool_call",
-				ID:     generateItemID(),
+				ID:     state.ToolItemIDs[i],
 				CallID: toolCall.ID,
 				Name:   customNameForStreamTool(state, toolCall.Function.Name),
 				Input:  extractCustomToolCallInput(arguments),
@@ -2211,7 +2211,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsToolSearch[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:      "tool_search_call",
-				ID:        generateItemID(),
+				ID:        state.ToolItemIDs[i],
 				CallID:    toolCall.ID,
 				Arguments: arguments,
 				Status:    "completed",
@@ -2224,7 +2224,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		}
 		outputs = append(outputs, ResponsesOutput{
 			Type:      "function_call",
-			ID:        generateItemID(),
+			ID:        state.ToolItemIDs[i],
 			CallID:    toolCall.ID,
 			Name:      name,
 			Namespace: namespace,

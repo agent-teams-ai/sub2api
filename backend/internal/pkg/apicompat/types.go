@@ -433,12 +433,16 @@ type ResponsesOutput struct {
 	Action *WebSearchAction `json:"action,omitempty"`
 }
 
-// MarshalJSON 处理 tool_search_call 项的线上形态（复用 CallID/Arguments 字段）：
-// execution 固定为 "client"（codex 的必填字段，非 client 的调用会被静默忽略），
-// arguments 是 JSON 对象而非 function_call 语义下的字符串。其余类型走默认结构体
-// 序列化，输出逐字节不变。
+// MarshalJSON preserves required reasoning summary arrays and tool-search
+// arguments/execution fields. Other output types keep the default encoding.
 func (o ResponsesOutput) MarshalJSON() ([]byte, error) {
 	type responsesOutputAlias ResponsesOutput
+	if o.Type == "reasoning" {
+		return json.Marshal(struct {
+			responsesOutputAlias
+			Summary []map[string]any `json:"summary"`
+		}{responsesOutputAlias(o), reasoningSummaryWire(o.Summary)})
+	}
 	if o.Type != "tool_search_call" {
 		return json.Marshal(responsesOutputAlias(o))
 	}

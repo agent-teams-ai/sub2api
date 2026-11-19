@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -187,6 +188,73 @@ func TestGeminiContinuationAcceptsLateSignatureAndEmitsProofBeforeToolDone(t *te
 	}
 	require.Equal(t, "late-signature", chat.Messages[1].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
 	require.Nil(t, chat.Messages[1].ToolCalls[1].ExtraContent)
+}
+
+func TestGeminiContinuationWireMatchesCompletedHistory(t *testing.T) {
+	codec := newGeminiFixtureCodec(t, "fixture")
+	state := NewChatCompletionsToResponsesStreamState("gemini-3.1-pro-preview")
+	continuation := NewGeminiContinuationStream(state)
+	var wire strings.Builder
+	emit := func(events []ResponsesStreamEvent) {
+		for _, event := range events {
+			sse, err := ResponsesEventToSSE(event)
+			require.NoError(t, err)
+			wire.WriteString(sse)
+		}
+	}
+	// The joined native fixture sends the signature after the function call.
+	for _, raw := range []string{
+		`{"id":"joined-official","object":"chat.completion.chunk","created":1,"model":"gemini-3.1-pro-preview","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"joined-call-1","type":"function","function":{"name":"joined_lookup","arguments":"{}"}}]},"finish_reason":null}]}`,
+		`{"id":"joined-official","object":"chat.completion.chunk","created":1,"model":"gemini-3.1-pro-preview","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"joined-gemini-signature"}}}]},"finish_reason":null}]}`,
+		`{"id":"joined-official","object":"chat.completion.chunk","created":1,"model":"gemini-3.1-pro-preview","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`,
+	} {
+		var chunk ChatCompletionsChunk
+		require.NoError(t, json.Unmarshal([]byte(raw), &chunk))
+		require.NoError(t, continuation.Observe(&chunk))
+		emit(ChatCompletionsChunkToResponsesEvents(&chunk, state))
+	}
+	final, err := continuation.Finalize(state, codec)
+	require.NoError(t, err)
+	emit(final)
+
+	var done, completed []json.RawMessage
+	for _, line := range strings.Split(wire.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var event struct {
+			Type     string          `json:"type"`
+			Item     json.RawMessage `json:"item"`
+			Response struct {
+				Output []json.RawMessage `json:"output"`
+			} `json:"response"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(data), &event))
+		switch event.Type {
+		case "response.output_item.done":
+			done = append(done, event.Item)
+		case "response.completed":
+			completed = event.Response.Output
+		}
+	}
+	require.Len(t, done, 2)
+	require.Len(t, completed, len(done))
+	for i := range done {
+		assert.JSONEq(t, string(done[i]), string(completed[i]), "wire history item %d", i)
+	}
+	input := func(items []json.RawMessage) json.RawMessage {
+		raw, err := json.Marshal(items)
+		require.NoError(t, err)
+		var output []ResponsesOutput
+		require.NoError(t, json.Unmarshal(raw, &output))
+		return geminiFixtureInput(t, &ResponsesResponse{Output: output})
+	}
+	streamed := geminiFixtureRestore(t, input(done), codec)
+	buffered := geminiFixtureRestore(t, input(completed), codec)
+	require.Equal(t, streamed, buffered)
+	require.Equal(t, "joined-call-1", streamed.Messages[1].ToolCalls[0].ID)
+	require.Equal(t, "joined-gemini-signature", streamed.Messages[1].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
 }
 
 func TestGeminiContinuationRetainsMessageSignatureAndLeavesOrdinaryConverterUnchanged(t *testing.T) {
