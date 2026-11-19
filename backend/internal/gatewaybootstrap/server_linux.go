@@ -227,6 +227,18 @@ func Run(ctx context.Context, options Options) error {
 			return ErrDenied
 		}
 	}
+	if oauth == nil {
+		owners := options.OAuthOwnerAuthority
+		if owners == nil {
+			owners = a
+		}
+		oauth = &privateOAuth{owners: owners}
+	}
+	if _, available := oauth.owners.(NativeAccountInfoAuthority); available {
+		if composePrivateAccountInfo(oauth, db, oauth.owners) != nil {
+			return ErrDenied
+		}
+	}
 	a.compose(&tcfg)
 	transport, err := gatewaytransport.New(ctx, tcfg)
 	if err != nil || ctx.Err() != nil {
@@ -363,6 +375,11 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 	if oauth != nil && oauth.limitsV2 != nil {
 		if admin.RegisterGatewayAccountLimitsRoutesV2(router.Group(""), oauth.limitsV2, authorizeCandidate) != nil {
 			panic("invalid private limits v2 composition")
+		}
+	}
+	if oauth != nil && oauth.info != nil {
+		if admin.RegisterGatewayAccountInfoRoutes(router.Group(""), oauth.info, authorizeCandidate) != nil {
+			panic("invalid private account info composition")
 		}
 	}
 	if oauth != nil {
@@ -578,7 +595,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 				return
 			}
 			management.ServeHTTP(w, r)
-		case oauth != nil && (oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh" || oauth.models != nil && r.URL.Path == "/private/native/v1/account-models/read" || oauth.limits != nil && (r.URL.Path == "/private/native/v1/account-limits/read" || r.URL.Path == "/private/native/v1/account-admission/read") || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
+		case oauth != nil && (oauth.info != nil && r.URL.Path == "/private/native/v1/account-info/read" || oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh" || oauth.models != nil && r.URL.Path == "/private/native/v1/account-models/read" || oauth.limits != nil && (r.URL.Path == "/private/native/v1/account-limits/read" || r.URL.Path == "/private/native/v1/account-admission/read") || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/read"):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
@@ -783,6 +800,7 @@ type privateOAuth struct {
 	claude        *service.GatewayNativeClaudeOAuth
 	grok          *service.GatewayNativeGrokOAuth
 	limitsV2      *service.GatewayAccountLimitsReaderV2
+	info          *service.GatewayAccountInfoReader
 }
 
 func composePrivateOAuth(repo service.AccountRepository, db *sql.DB, custody *service.GatewayNativeCredentialCustody, cfg *OAuthConfig, owners NativeOAuthOwnerAuthority) (*privateOAuth, error) {

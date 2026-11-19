@@ -60,7 +60,19 @@ func (r *gatewayAccountLimitsRepositoryV2) physicalTx(ctx context.Context, s ser
 	if s.Purpose != service.GatewayCredentialPurpose {
 		return nil, p, service.ErrGatewayNativeIdentity
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	return gatewayProtectedKeyPhysicalTx(ctx, r.db, s, route, exclusive)
+}
+
+// Shared physical custody proof. The caller still validates its own read or
+// write capability; this helper does not infer quota support from key support.
+func gatewayProtectedKeyPhysicalTx(ctx context.Context, db *sql.DB, s service.GatewayNativeCredentialScope, route service.GatewayNativeRoute, exclusive bool) (*sql.Tx, service.GatewayNativeOAuthPhysical, error) {
+	p := service.GatewayNativeOAuthPhysical{Scope: s, Route: route}
+	auth := s
+	auth.Purpose = service.GatewayOAuthBundlePurpose
+	if db == nil || s.Purpose != service.GatewayCredentialPurpose || s.Generation != route.Generation || !service.GatewayNativeOAuthScopeAuthorized(ctx, auth) || !service.GatewayNativeAPIKeyProfileValid(route.Profile, route.BaseURL, route.Model) {
+		return nil, p, service.ErrGatewayNativeIdentity
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, p, service.ErrGatewayNativeIdentity
 	}

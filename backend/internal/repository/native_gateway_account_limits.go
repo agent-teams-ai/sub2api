@@ -40,6 +40,9 @@ const gatewayLimitsPhysicalSQL = `SELECT q.issuer,q.subject,q.provider_account_i
  FOR SHARE OF a,r,c,q`
 
 func (r *accountRepository) gatewayLimitsTransaction(ctx context.Context, scope service.GatewayNativeCredentialScope, route service.GatewayNativeRoute) (*sql.Tx, service.GatewayNativeOAuthPhysical, error) {
+	return r.gatewayLimitsTransactionMode(ctx, scope, route, false)
+}
+func (r *accountRepository) gatewayLimitsTransactionMode(ctx context.Context, scope service.GatewayNativeCredentialScope, route service.GatewayNativeRoute, exclusive bool) (*sql.Tx, service.GatewayNativeOAuthPhysical, error) {
 	p := service.GatewayNativeOAuthPhysical{Scope: scope, Route: route}
 	if !service.GatewayNativeOAuthScopeAuthorized(ctx, scope) || route.Generation != scope.Generation || route.AccountID <= 0 || route.CreatedAt.IsZero() || route.CreatedAt.Nanosecond()%1000 != 0 ||
 		route.Profile != service.GatewayCodexOAuthResponsesProfile || route.BaseURL != service.GatewayCodexOAuthBaseURL || route.Model != service.GatewayCodexOAuthModel {
@@ -58,7 +61,11 @@ func (r *accountRepository) gatewayLimitsTransaction(ctx context.Context, scope 
 	// Acquire physical birth first. The provenance SELECT below starts a fresh
 	// READ COMMITTED statement after any concurrent delete/refresh lock wait.
 	var locked int64
-	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 AND created_at=$2 AND deleted_at IS NULL FOR SHARE`, route.AccountID, route.CreatedAt).Scan(&locked) != nil {
+	lock := " FOR SHARE"
+	if exclusive {
+		lock = " FOR UPDATE"
+	}
+	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 AND created_at=$2 AND deleted_at IS NULL`+lock, route.AccountID, route.CreatedAt).Scan(&locked) != nil {
 		_ = tx.Rollback()
 		return nil, p, service.ErrGatewayNativeIdentity
 	}
