@@ -22,14 +22,14 @@ func NewGatewayNativeOAuthConnectRepository(db *sql.DB) (service.GatewayNativeOA
 
 const connectColumns = `consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,state,
  COALESCE(outcome_operation,''),COALESCE(outcome_account_id,0),COALESCE(outcome_generation,''),COALESCE(outcome_state,''),
- enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied,method,device_phase,device_revision,COALESCE(device_poll_after,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(device_deadline,'0001-01-01 00:00:00+00'::timestamptz)`
+ enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied,method,device_phase,device_revision,COALESCE(device_poll_after,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(device_deadline,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(import_input_mac,''),COALESCE(import_claim_mac,'')`
 
 func scanConnect(row *sql.Row) (service.GatewayNativeOAuthConnectIntent, error) {
 	var in service.GatewayNativeOAuthConnectIntent
 	err := row.Scan(&in.Scope.Consumer, &in.Scope.Owner, &in.Scope.Account, &in.Scope.Generation, &in.Scope.Purpose,
 		&in.Operation, &in.ClientID, &in.Redirect, &in.Deadline, &in.StateHash, &in.Envelope, &in.State,
 		&in.Outcome.Operation, &in.Outcome.AccountID, &in.Outcome.Generation, &in.Outcome.State,
-		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied, &in.Method, &in.DevicePhase, &in.DeviceRevision, &in.DevicePollAfter, &in.DeviceDeadline)
+		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied, &in.Method, &in.DevicePhase, &in.DeviceRevision, &in.DevicePollAfter, &in.DeviceDeadline, &in.ImportInputMAC, &in.ImportClaimMAC)
 	if err != nil || !service.GatewayNativeOAuthConnectIntentValid(in) {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -41,14 +41,17 @@ func connectAuthorized(ctx context.Context, in service.GatewayNativeOAuthConnect
 }
 
 func (r *gatewayOAuthConnectRepository) PrepareConnect(ctx context.Context, in service.GatewayNativeOAuthConnectIntent) (service.GatewayNativeOAuthConnectIntent, error) {
-	if !connectAuthorized(ctx, in) || in.State != "prepared" || len(in.Envelope) < 60 || len(in.Envelope) > 1024 || !strings.HasPrefix(in.Envelope, "gcc1.") {
+	importMethod := in.Method == "refresh_token" || in.Method == "auth_json"
+	validEnvelope := !importMethod && len(in.Envelope) >= 60 && len(in.Envelope) <= 1024 && strings.HasPrefix(in.Envelope, "gcc1.") ||
+		importMethod && len(in.Envelope) >= 44 && len(in.Envelope) <= service.GatewayOAuthImportEnvelopeLimit && strings.HasPrefix(in.Envelope, "gci1.")
+	if !connectAuthorized(ctx, in) || in.State != "prepared" || !validEnvelope {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
 	// ON CONFLICT never updates the accepted scope, capability, birth or TTL.
 	_, err := r.db.ExecContext(ctx, `INSERT INTO gateway_oauth_connect_intents
- (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation,method)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
-		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation, connectStoredMethod(in))
+ (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation,method,import_input_mac,import_claim_mac)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),NULLIF($15,'')) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
+		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation, connectStoredMethod(in), in.ImportInputMAC, in.ImportClaimMAC)
 	if err != nil {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}

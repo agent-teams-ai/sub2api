@@ -399,14 +399,21 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			path := strings.Replace(c.Request.URL.Path, "/private/native/v1/claude/oauth", "/private/native/v1/oauth", 1)
 			path = strings.Replace(path, "/private/native/v1/grok/oauth", "/private/native/v1/oauth", 1)
 			completion := path == "/private/native/v1/oauth/connect/complete"
+			importing := c.Request.URL.Path == "/private/native/v1/oauth/connect/import"
 			bodyLimit := 4096
 			if completion {
 				bodyLimit = admin.GatewayNativeOAuthConnectCompletionBodyLimit
+			} else if importing {
+				bodyLimit = service.GatewayOAuthImportBodyLimit
 			}
 			data, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(bodyLimit+1)))
 			var tuple nativeOAuthOwnerTuple
 			valid := false
-			if completion {
+			if importing {
+				req, ok := service.DecodeGatewayNativeOAuthImport(data)
+				tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
+				valid = ok
+			} else if completion {
 				if c.Request.URL.Path == "/private/native/v1/grok/oauth/connect/complete" {
 					req, ok := admin.DecodeGatewayNativeGrokConnectCompletion(data)
 					tuple = nativeOAuthOwnerTuple{req.Operation, req.Owner, req.Account, req.Generation}
@@ -641,17 +648,21 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			bounded, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 			defer cancel()
 			management.ServeHTTP(w, r.WithContext(bounded))
-		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/poll" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
+		case oauth != nil && (r.URL.Path == "/private/native/v1/oauth/connect" || r.URL.Path == "/private/native/v1/oauth/connect/import" || r.URL.Path == "/private/native/v1/oauth/connect/read" || r.URL.Path == "/private/native/v1/oauth/connect/poll" || r.URL.Path == "/private/native/v1/oauth/connect/complete" || r.URL.Path == "/private/native/v1/oauth/connect/descriptor" || r.URL.Path == "/private/native/v1/oauth/connect/custody" || (oauth.refresh != nil && r.URL.Path == "/private/native/v1/oauth/refresh")):
 			if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
 			}
 			controller := http.NewResponseController(w)
-			if controller.SetReadDeadline(time.Now().Add(5*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(5*time.Second)) != nil {
+			timeout := 5 * time.Second
+			if r.URL.Path == "/private/native/v1/oauth/connect/import" {
+				timeout = 25 * time.Second
+			}
+			if controller.SetReadDeadline(time.Now().Add(5*time.Second)) != nil || controller.SetWriteDeadline(time.Now().Add(timeout)) != nil {
 				http.Error(w, "private native bootstrap denied", http.StatusServiceUnavailable)
 				return
 			}
-			bounded, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			bounded, cancel := context.WithTimeout(r.Context(), timeout)
 			defer cancel()
 			management.ServeHTTP(w, r.WithContext(bounded))
 		case r.URL.Path == "/private/native/v1/candidates" || strings.HasPrefix(r.URL.Path, "/private/native/v1/candidates/"):

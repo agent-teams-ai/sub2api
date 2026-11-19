@@ -69,42 +69,8 @@ func NewGatewayNativeOAuthVerifier(transport http.RoundTripper) *GatewayNativeOA
 // Reject duplicate decoded names, case aliases and invalid UTF-8 before the
 // maintained JWT parser sees claims. The same rule protects nested metadata.
 func gatewayOAuthJSON(raw []byte) (map[string]json.RawMessage, error) {
-	if len(raw) > gatewayOAuthBundleLimit || !utf8.Valid(raw) {
+	if len(raw) > gatewayOAuthBundleLimit || !gatewayOAuthUnicodeValid(raw) {
 		return nil, ErrGatewayNativeIdentity
-	}
-	// encoding/json replaces unpaired UTF-16 surrogates. Reject them instead of
-	// projecting a different signed subject/critical name into identity authority.
-	for i := 0; i < len(raw); i++ {
-		if raw[i] != '\\' {
-			continue
-		}
-		i++
-		if i >= len(raw) {
-			return nil, ErrGatewayNativeIdentity
-		}
-		if raw[i] != 'u' {
-			continue
-		}
-		if i+4 >= len(raw) {
-			return nil, ErrGatewayNativeIdentity
-		}
-		n, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
-		if err != nil {
-			return nil, ErrGatewayNativeIdentity
-		}
-		i += 4
-		if n >= 0xd800 && n <= 0xdbff {
-			if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
-				return nil, ErrGatewayNativeIdentity
-			}
-			low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
-			if err != nil || low < 0xdc00 || low > 0xdfff {
-				return nil, ErrGatewayNativeIdentity
-			}
-			i += 6
-		} else if n >= 0xdc00 && n <= 0xdfff {
-			return nil, ErrGatewayNativeIdentity
-		}
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
@@ -165,6 +131,46 @@ func gatewayOAuthJSON(raw []byte) (map[string]json.RawMessage, error) {
 		return nil, ErrGatewayNativeIdentity
 	}
 	return result, nil
+}
+func gatewayOAuthUnicodeValid(raw []byte) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	// encoding/json replaces unpaired UTF-16 surrogates. Reject them instead of
+	// projecting a different signed subject/critical name into identity authority.
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		n, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if n >= 0xd800 && n <= 0xdbff {
+			if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+				return false
+			}
+			low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		} else if n >= 0xdc00 && n <= 0xdfff {
+			return false
+		}
+	}
+	return true
 }
 func gatewayOAuthString(m map[string]json.RawMessage, name string) (string, bool) {
 	var value string
