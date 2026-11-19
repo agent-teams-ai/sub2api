@@ -128,6 +128,7 @@ type GatewayNativeOAuthConnectIntent struct {
 	DeviceDeadline      time.Time                    `json:"-"`
 	ImportInputMAC      string                       `json:"-"`
 	ImportClaimMAC      string                       `json:"-"`
+	ImportKeyCommitment string                       `json:"-"`
 }
 
 // One durable CAS owns token entry; no in-memory lock is replay authority.
@@ -205,7 +206,7 @@ func GatewayNativeOAuthConnectIntentValid(in GatewayNativeOAuthConnectIntent) bo
 }
 
 func SameGatewayNativeOAuthConnectIntent(a, b GatewayNativeOAuthConnectIntent) bool {
-	return a.Scope == b.Scope && a.Operation == b.Operation && a.ClientID == b.ClientID && a.Redirect == b.Redirect && connectMethod(a) == connectMethod(b) && a.ImportInputMAC == b.ImportInputMAC && a.ImportClaimMAC == b.ImportClaimMAC
+	return a.Scope == b.Scope && a.Operation == b.Operation && a.ClientID == b.ClientID && a.Redirect == b.Redirect && connectMethod(a) == connectMethod(b) && a.ImportInputMAC == b.ImportInputMAC && a.ImportClaimMAC == b.ImportClaimMAC && a.ImportKeyCommitment == b.ImportKeyCommitment
 }
 
 func connectAAD(in GatewayNativeOAuthConnectIntent) []byte {

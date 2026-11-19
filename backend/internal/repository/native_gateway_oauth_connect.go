@@ -22,14 +22,14 @@ func NewGatewayNativeOAuthConnectRepository(db *sql.DB) (service.GatewayNativeOA
 
 const connectColumns = `consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,state,
  COALESCE(outcome_operation,''),COALESCE(outcome_account_id,0),COALESCE(outcome_generation,''),COALESCE(outcome_state,''),
- enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied,method,device_phase,device_revision,COALESCE(device_poll_after,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(device_deadline,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(import_input_mac,''),COALESCE(import_claim_mac,'')`
+ enrollment_operation,COALESCE(enrollment_mac,''),recovery_denied,method,device_phase,device_revision,COALESCE(device_poll_after,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(device_deadline,'0001-01-01 00:00:00+00'::timestamptz),COALESCE(import_input_mac,''),COALESCE(import_claim_mac,''),COALESCE(import_key_commitment,'')`
 
 func scanConnect(row *sql.Row) (service.GatewayNativeOAuthConnectIntent, error) {
 	var in service.GatewayNativeOAuthConnectIntent
 	err := row.Scan(&in.Scope.Consumer, &in.Scope.Owner, &in.Scope.Account, &in.Scope.Generation, &in.Scope.Purpose,
 		&in.Operation, &in.ClientID, &in.Redirect, &in.Deadline, &in.StateHash, &in.Envelope, &in.State,
 		&in.Outcome.Operation, &in.Outcome.AccountID, &in.Outcome.Generation, &in.Outcome.State,
-		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied, &in.Method, &in.DevicePhase, &in.DeviceRevision, &in.DevicePollAfter, &in.DeviceDeadline, &in.ImportInputMAC, &in.ImportClaimMAC)
+		&in.EnrollmentOperation, &in.EnrollmentMAC, &in.RecoveryDenied, &in.Method, &in.DevicePhase, &in.DeviceRevision, &in.DevicePollAfter, &in.DeviceDeadline, &in.ImportInputMAC, &in.ImportClaimMAC, &in.ImportKeyCommitment)
 	if err != nil || !service.GatewayNativeOAuthConnectIntentValid(in) {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -49,9 +49,9 @@ func (r *gatewayOAuthConnectRepository) PrepareConnect(ctx context.Context, in s
 	}
 	// ON CONFLICT never updates the accepted scope, capability, birth or TTL.
 	_, err := r.db.ExecContext(ctx, `INSERT INTO gateway_oauth_connect_intents
- (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation,method,import_input_mac,import_claim_mac)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),NULLIF($15,'')) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
-		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation, connectStoredMethod(in), in.ImportInputMAC, in.ImportClaimMAC)
+ (consumer,owner_ref,account_ref,generation,purpose,operation_ref,client_id,redirect_uri,deadline,state_hash,material_envelope,enrollment_operation,method,import_input_mac,import_claim_mac,import_key_commitment)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),NULLIF($15,''),NULLIF($16,'')) ON CONFLICT (consumer,operation_ref) DO NOTHING`,
+		in.Scope.Consumer, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.Operation, in.ClientID, in.Redirect, in.Deadline, in.StateHash, in.Envelope, in.EnrollmentOperation, connectStoredMethod(in), in.ImportInputMAC, in.ImportClaimMAC, in.ImportKeyCommitment)
 	if err != nil {
 		return service.GatewayNativeOAuthConnectIntent{}, service.ErrGatewayNativeIdentity
 	}
@@ -84,16 +84,44 @@ func (r *gatewayOAuthConnectRepository) EnterConnect(ctx context.Context, in ser
 	if !connectAuthorized(ctx, in) {
 		return false, service.ErrGatewayNativeIdentity
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE gateway_oauth_connect_intents SET state='entered',entered_at=clock_timestamp()
+	// Serialize only SQL admission, never provider HTTP. A second runtime with
+	// a rotated MAC key cannot bypass any unresolved same-secret claim.
+	var tx *sql.Tx
+	var exec interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	} = r.db
+	if in.Method == "refresh_token" || in.Method == "auth_json" {
+		var err error
+		tx, err = r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, service.ErrGatewayNativeIdentity
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(261,1)`); err != nil {
+			return false, service.ErrGatewayNativeIdentity
+		}
+		var conflicting bool
+		if tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM gateway_oauth_connect_intents WHERE import_key_commitment IS NOT NULL AND import_key_commitment<>$1 AND state IN ('entered','unknown'))`, in.ImportKeyCommitment).Scan(&conflicting) != nil || conflicting {
+			return false, service.ErrGatewayNativeIdentity
+		}
+		exec = tx
+	}
+	result, err := exec.ExecContext(ctx, `UPDATE gateway_oauth_connect_intents SET state='entered',entered_at=clock_timestamp()
  WHERE consumer=$1 AND operation_ref=$2 AND owner_ref=$3 AND account_ref=$4 AND generation=$5 AND purpose=$6
- AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp() AND method=$9 AND device_phase=$10 AND device_revision=$11 AND (method='browser' OR device_deadline IS NULL OR device_deadline>clock_timestamp())`,
-		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline, connectStoredMethod(in), in.DevicePhase, in.DeviceRevision)
+ AND state_hash=$7 AND deadline=$8 AND state='prepared' AND deadline>clock_timestamp() AND method=$9 AND device_phase=$10 AND device_revision=$11 AND (method='browser' OR device_deadline IS NULL OR device_deadline>clock_timestamp())
+ AND COALESCE(import_key_commitment,'')=$12 AND COALESCE(import_input_mac,'')=$13 AND COALESCE(import_claim_mac,'')=$14`,
+		in.Scope.Consumer, in.Operation, in.Scope.Owner, in.Scope.Account, in.Scope.Generation, in.Scope.Purpose, in.StateHash, in.Deadline, connectStoredMethod(in), in.DevicePhase, in.DeviceRevision, in.ImportKeyCommitment, in.ImportInputMAC, in.ImportClaimMAC)
 	if err != nil {
 		return false, service.ErrGatewayNativeIdentity
 	}
 	n, err := result.RowsAffected()
 	if err != nil {
 		return false, service.ErrGatewayNativeIdentity
+	}
+	if tx != nil {
+		if tx.Commit() != nil {
+			return false, service.ErrGatewayNativeIdentity
+		}
 	}
 	return n == 1, nil
 }

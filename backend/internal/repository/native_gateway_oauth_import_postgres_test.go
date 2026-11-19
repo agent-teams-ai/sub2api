@@ -78,13 +78,16 @@ func TestGatewayNativeOAuthImportPostgresClaimsReplayAndLostACK(t *testing.T) {
 	require.NoError(t, err)
 	custody, err := service.NewGatewayNativeCredentialCustody("import-fixture", map[string][]byte{"import-fixture": key})
 	require.NoError(t, err)
-	enrollment, err := service.NewGatewayNativeOAuthEnrollment(verifier, custody, f1, key)
-	require.NoError(t, err)
-	build := func(repo service.GatewayNativeOAuthConnectRepository) *service.GatewayNativeOAuthConnect {
-		connect, e := service.NewGatewayNativeOAuthConnect(key, transport, repo, enrollment, f1)
+	buildWithKey := func(repo service.GatewayNativeOAuthConnectRepository, connectKey []byte) *service.GatewayNativeOAuthConnect {
+		enrollment, e := service.NewGatewayNativeOAuthEnrollment(verifier, custody, f1, connectKey)
+		require.NoError(t, e)
+		connect, e := service.NewGatewayNativeOAuthConnect(connectKey, transport, repo, enrollment, f1)
 		require.NoError(t, e)
 		require.NoError(t, connect.SetEntryAuthorizer(func(context.Context, service.GatewayNativeCredentialScope, string) error { return nil }))
 		return connect
+	}
+	build := func(repo service.GatewayNativeOAuthConnectRepository) *service.GatewayNativeOAuthConnect {
+		return buildWithKey(repo, key)
 	}
 	connect := build(connectLostFinalACK{repository})
 	owner, scope := oauthPGScope(t, "import-consumer", "import-owner", "import-account")
@@ -109,10 +112,21 @@ func TestGatewayNativeOAuthImportPostgresClaimsReplayAndLostACK(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, saved.Envelope)
 	require.NotEmpty(t, saved.ImportClaimMAC)
+	// A completed old-key operation does not create a permanent key blacklist.
+	// Runtime B has a new MAC/enrollment key but retains the custody keyring.
+	nextKey := make([]byte, 32)
+	_, err = rand.Read(nextKey)
+	require.NoError(t, err)
+	rotated := buildWithKey(repository, nextKey)
+	rotationOwner, rotationScope := oauthPGScope(t, "import-consumer", "import-owner", "rotation-account")
+	rotation, err := rotated.ImportConnect(rotationOwner, rotationScope, "rotation-operation", "refresh_token", "rotation-refresh")
+	require.NoError(t, err)
+	require.Equal(t, "completed", rotation.State)
+	require.EqualValues(t, 2, exchanges.Load(), "rotation is allowed only while no old unresolved claim exists")
 	// The completed claim is no blacklist: a new explicit operation reaches
 	// exchange. Existing F1 principal ownership still decides custody outcome.
 	_, _ = restarted.ImportConnect(owner, scope, "explicit-next-operation", "refresh_token", "fixture-refresh")
-	require.EqualValues(t, 2, exchanges.Load())
+	require.EqualValues(t, 3, exchanges.Load())
 	jsonOwner, jsonScope := oauthPGScope(t, "import-consumer", "import-owner", "json-account")
 	jsonOut, err := restarted.ImportConnect(jsonOwner, jsonScope, "json-operation", "auth_json", `{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"refresh_token":"json-refresh","id_token":"expired-id","access_token":"expired-access"}}`)
 	require.NoError(t, err)
@@ -130,6 +144,10 @@ func TestGatewayNativeOAuthImportPostgresClaimsReplayAndLostACK(t *testing.T) {
 		t.Fatal("exchange did not enter")
 	}
 	before := exchanges.Load()
+	rotatedOwner, rotatedScope := oauthPGScope(t, "rotated-consumer", "rotated-owner", "rotated-account")
+	_, err = rotated.ImportConnect(rotatedOwner, rotatedScope, "rotated-operation", "auth_json", `{"tokens":{"refresh_token":"blocked-refresh"}}`)
+	require.Error(t, err)
+	require.Equal(t, before, exchanges.Load(), "different key commitment cannot bypass an entered old-key claim")
 	otherOwner, otherScope := oauthPGScope(t, "other-consumer", "other-owner", "other-account")
 	_, err = restarted.ImportConnect(otherOwner, otherScope, "other-operation", "auth_json", `{"tokens":{"refresh_token":"blocked-refresh"}}`)
 	require.Error(t, err)
@@ -139,6 +157,9 @@ func TestGatewayNativeOAuthImportPostgresClaimsReplayAndLostACK(t *testing.T) {
 	unknown, err := restarted.ReadConnect(blockedOwner, blockedScope, "blocked-operation")
 	require.NoError(t, err)
 	require.Equal(t, "unknown", unknown.State)
+	_, err = rotated.ImportConnect(rotatedOwner, rotatedScope, "rotated-operation", "auth_json", `{"tokens":{"refresh_token":"blocked-refresh"}}`)
+	require.Error(t, err)
+	require.Equal(t, before, exchanges.Load(), "different key commitment cannot bypass an unknown old-key claim")
 	_, err = restarted.ImportConnect(otherOwner, otherScope, "other-operation", "auth_json", `{"tokens":{"refresh_token":"blocked-refresh"}}`)
 	require.Error(t, err)
 	require.Equal(t, before, exchanges.Load(), "unknown retains its claim")

@@ -26,7 +26,7 @@ const GatewayOAuthImportEnvelopeLimit = 48 * 1024
 
 // Transient sensitive ingress. Never an operation DTO or diagnostic record.
 type GatewayNativeOAuthImportInput struct {
-	Operation, Owner, Account, Generation, Method, Input string
+	Operation, Owner, Account, Generation, Method, Input string `json:"-"`
 }
 
 // The management authorizer and final handler use exactly the same decoder.
@@ -94,9 +94,9 @@ func gatewayConnectImportMethod(method string) bool {
 func gatewayConnectMethodShapeValid(in GatewayNativeOAuthConnectIntent) bool {
 	method := connectMethod(in)
 	if gatewayConnectImportMethod(method) {
-		return in.Redirect == "" && gatewayImportMACValid(in.ImportInputMAC) && gatewayImportMACValid(in.ImportClaimMAC) && in.DevicePhase == "" && in.DeviceRevision == 0 && in.DevicePollAfter.IsZero() && in.DeviceDeadline.IsZero()
+		return in.Redirect == "" && gatewayImportMACValid(in.ImportInputMAC) && gatewayImportMACValid(in.ImportClaimMAC) && gatewayImportMACValid(in.ImportKeyCommitment) && in.DevicePhase == "" && in.DeviceRevision == 0 && in.DevicePollAfter.IsZero() && in.DeviceDeadline.IsZero()
 	}
-	return in.ImportInputMAC == "" && in.ImportClaimMAC == "" && ((method == "browser" && in.Redirect == GatewayOAuthConnectRedirect) || (method == "device_code" && in.Redirect == GatewayOAuthDeviceRedirect))
+	return in.ImportInputMAC == "" && in.ImportClaimMAC == "" && in.ImportKeyCommitment == "" && ((method == "browser" && in.Redirect == GatewayOAuthConnectRedirect) || (method == "device_code" && in.Redirect == GatewayOAuthDeviceRedirect))
 }
 
 func gatewayImportMACValid(value string) bool {
@@ -212,8 +212,14 @@ func (s *GatewayNativeOAuthConnect) importCommitments(scope GatewayNativeCredent
 }
 
 func gatewayImportAAD(in GatewayNativeOAuthConnectIntent) []byte {
-	raw, _ := json.Marshal([]any{in.Scope, in.Operation, in.EnrollmentOperation, in.Method, in.ClientID, in.Deadline.UTC().Format(time.RFC3339Nano), in.StateHash, in.ImportInputMAC, in.ImportClaimMAC})
+	raw, _ := json.Marshal([]any{in.Scope, in.Operation, in.EnrollmentOperation, in.Method, in.ClientID, in.Deadline.UTC().Format(time.RFC3339Nano), in.StateHash, in.ImportInputMAC, in.ImportClaimMAC, in.ImportKeyCommitment})
 	return append([]byte("account-gateway/native/oauth-import-material/v1\x00"), raw...)
+}
+
+func (s *GatewayNativeOAuthConnect) importKeyCommitment() string {
+	mac := hmac.New(sha256.New, s.importKey)
+	_, _ = mac.Write([]byte("account-gateway/native/oauth-import-key/v1"))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (s *GatewayNativeOAuthConnect) sealImport(in GatewayNativeOAuthConnectIntent, refresh string) (string, error) {
@@ -267,7 +273,7 @@ func (s *GatewayNativeOAuthConnect) ImportConnect(ctx context.Context, scope Gat
 	if err != nil {
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
 	}
-	in := GatewayNativeOAuthConnectIntent{Scope: scope, Operation: operation, ClientID: openai.ClientID, Method: method, State: "prepared", EnrollmentOperation: "connect-" + uuid.NewString(), Deadline: s.now().UTC().Truncate(time.Microsecond).Add(GatewayOAuthConnectTTL - time.Second), StateHash: connectStateHash(state), ImportInputMAC: inputMAC, ImportClaimMAC: claimMAC}
+	in := GatewayNativeOAuthConnectIntent{Scope: scope, Operation: operation, ClientID: openai.ClientID, Method: method, State: "prepared", EnrollmentOperation: "connect-" + uuid.NewString(), Deadline: s.now().UTC().Truncate(time.Microsecond).Add(GatewayOAuthConnectTTL - time.Second), StateHash: connectStateHash(state), ImportInputMAC: inputMAC, ImportClaimMAC: claimMAC, ImportKeyCommitment: s.importKeyCommitment()}
 	in.Envelope, err = s.sealImport(in, refresh)
 	if err != nil {
 		return GatewayNativeOAuthConnectResult{}, err

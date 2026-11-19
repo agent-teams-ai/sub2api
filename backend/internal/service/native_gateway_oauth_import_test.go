@@ -59,7 +59,7 @@ func TestGatewayNativeOAuthImportStrictEscapedIngressAndSeparateCodec(t *testing
 	}
 	refresh := strings.Repeat(`\"`, 16384) // Maximum RT containing JSON-escaped bytes.
 	inputMAC, claimMAC := s.importCommitments(scope, "operation", "refresh_token", refresh, refresh)
-	intent := GatewayNativeOAuthConnectIntent{Scope: scope, Operation: "operation", EnrollmentOperation: "connect-" + uuid.NewString(), ClientID: openai.ClientID, Method: "refresh_token", Deadline: time.Now().UTC().Truncate(time.Microsecond).Add(time.Minute), StateHash: strings.Repeat("a", 64), ImportInputMAC: inputMAC, ImportClaimMAC: claimMAC}
+	intent := GatewayNativeOAuthConnectIntent{Scope: scope, Operation: "operation", EnrollmentOperation: "connect-" + uuid.NewString(), ClientID: openai.ClientID, Method: "refresh_token", Deadline: time.Now().UTC().Truncate(time.Microsecond).Add(time.Minute), StateHash: strings.Repeat("a", 64), ImportInputMAC: inputMAC, ImportClaimMAC: claimMAC, ImportKeyCommitment: s.importKeyCommitment()}
 	envelope, err := s.sealImport(intent, refresh)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(envelope), GatewayOAuthImportEnvelopeLimit)
