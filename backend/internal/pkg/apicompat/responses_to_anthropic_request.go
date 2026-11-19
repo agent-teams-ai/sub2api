@@ -265,13 +265,14 @@ func convertResponsesInputToAnthropic(instructions string, inputRaw json.RawMess
 
 		case item.Type == "function_call":
 			// function_call → assistant message with tool_use block
+			// Preserve the explicit call_id; it is not a Responses output item ID.
 			input := json.RawMessage("{}")
 			if item.Arguments != "" {
 				input = json.RawMessage(item.Arguments)
 			}
 			block := AnthropicContentBlock{
 				Type:  "tool_use",
-				ID:    fromResponsesCallIDToAnthropic(item.CallID),
+				ID:    item.CallID,
 				Name:  item.Name,
 				Input: input,
 			}
@@ -286,7 +287,7 @@ func convertResponsesInputToAnthropic(instructions string, inputRaw json.RawMess
 			contentJSON := responsesFunctionOutputToAnthropicContent(item)
 			block := AnthropicContentBlock{
 				Type:      "tool_result",
-				ToolUseID: fromResponsesCallIDToAnthropic(item.CallID),
+				ToolUseID: item.CallID,
 				Content:   contentJSON,
 			}
 			blockJSON, _ := json.Marshal([]AnthropicContentBlock{block})
@@ -683,22 +684,6 @@ func convertResponsesAssistantToAnthropicContent(raw json.RawMessage) (json.RawM
 		blocks = append(blocks, AnthropicContentBlock{Type: "text", Text: ""})
 	}
 	return json.Marshal(blocks)
-}
-
-// fromResponsesCallIDToAnthropic converts an OpenAI function call ID back to
-// Anthropic format. Reverses toResponsesCallID.
-func fromResponsesCallIDToAnthropic(id string) string {
-	// If it has our "fc_" prefix wrapping a known Anthropic prefix, strip it
-	if after, ok := strings.CutPrefix(id, "fc_"); ok {
-		if strings.HasPrefix(after, "toolu_") || strings.HasPrefix(after, "call_") {
-			return after
-		}
-	}
-	// Generate a synthetic Anthropic tool ID
-	if !strings.HasPrefix(id, "toolu_") && !strings.HasPrefix(id, "call_") {
-		return "toolu_" + id
-	}
-	return id
 }
 
 // dataURIToAnthropicImageSource parses a data URI into an AnthropicImageSource.
