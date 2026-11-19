@@ -2168,8 +2168,9 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 	var outputs []ResponsesOutput
 	if state.Reasoning.Len() > 0 {
 		outputs = append(outputs, ResponsesOutput{
-			Type: "reasoning",
-			ID:   generateItemID(),
+			Type:   "reasoning",
+			ID:     state.ReasoningItemID,
+			Status: "completed",
 			Summary: []ResponsesSummary{{
 				Type: "summary_text",
 				Text: state.Reasoning.String(),

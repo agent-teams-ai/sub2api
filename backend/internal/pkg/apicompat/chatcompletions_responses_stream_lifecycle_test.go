@@ -21,6 +21,80 @@ func collectStreamEvents(t *testing.T, chunks []string) []ResponsesStreamEvent {
 	return events
 }
 
+func TestStream_ReasoningWireMatchesCompletedHistory(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		chunks []string
+	}{
+		{
+			name: "text",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{"content":"answer"}}]}`,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			},
+		},
+		{
+			name: "tool",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			},
+		},
+		{
+			name: "reasoning_only_at_output_limit",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			chunks := append([]string{
+				`{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"fixture "}}]}`,
+				`{"choices":[{"index":0,"delta":{"reasoning_content":"plan"}}]}`,
+			}, test.chunks...)
+			var done, completed []json.RawMessage
+			for _, event := range collectStreamEvents(t, chunks) {
+				wire, err := ResponsesEventToSSE(event)
+				require.NoError(t, err)
+				for _, line := range strings.Split(wire, "\n") {
+					data, ok := strings.CutPrefix(line, "data: ")
+					if !ok {
+						continue
+					}
+					var payload struct {
+						Type        string          `json:"type"`
+						OutputIndex int             `json:"output_index"`
+						Item        json.RawMessage `json:"item"`
+						Response    struct {
+							Output []json.RawMessage `json:"output"`
+						} `json:"response"`
+					}
+					require.NoError(t, json.Unmarshal([]byte(data), &payload))
+					switch payload.Type {
+					case "response.output_item.done":
+						require.Equal(t, len(done), payload.OutputIndex)
+						done = append(done, payload.Item)
+					case "response.completed":
+						require.Nil(t, completed, "one terminal response")
+						completed = payload.Response.Output
+					}
+				}
+			}
+			require.Len(t, done, 2)
+			require.Len(t, completed, len(done))
+			var reasoning ResponsesOutput
+			require.NoError(t, json.Unmarshal(done[0], &reasoning))
+			require.Equal(t, "reasoning", reasoning.Type)
+			require.NotEmpty(t, reasoning.ID)
+			require.Equal(t, "completed", reasoning.Status)
+			require.Equal(t, []ResponsesSummary{{Type: "summary_text", Text: "fixture plan"}}, reasoning.Summary)
+			for i := range done {
+				require.JSONEq(t, string(done[i]), string(completed[i]), "wire history item %d", i)
+			}
+		})
+	}
+}
+
 // TestStream_ReasoningOpensItemBeforeDelta guards the bug where a strict client
 // (Codex) drops reasoning deltas that reference an item not yet opened.
 func TestStream_ReasoningOpensItemBeforeDelta(t *testing.T) {
