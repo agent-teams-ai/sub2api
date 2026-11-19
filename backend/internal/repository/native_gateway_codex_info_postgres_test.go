@@ -198,4 +198,22 @@ func TestGatewayAccountInfoCodexPostgresHydrationAndRefresh(t *testing.T) {
 	_, err = refresh.Refresh(owner, stale)
 	require.Error(t, err, "optional metadata isolation cannot relax the credential version CAS")
 	require.Equal(t, callsAfterRotation, counted.calls.Load())
+	// A newer observation order must not relabel an old credential's expiry.
+	// Remove the synthetic SQL failure so only the revision guard can reject it.
+	_, err = db.ExecContext(ctx, `DROP TRIGGER gateway_info_test_reject ON gateway_account_info_snapshots; DROP FUNCTION gateway_info_test_reject()`)
+	require.NoError(t, err)
+	staleObservation := fresh.Sources["credential"]
+	staleObservation.Order, err = info.ReserveGatewayAccountInfoOrder(owner)
+	require.NoError(t, err)
+	guardTx, current, err := info.physicalTx(owner, scope, route, true)
+	require.NoError(t, err)
+	defer func() { _ = guardTx.Rollback() }()
+	require.EqualValues(t, 3, current.CredentialRevision)
+	require.EqualValues(t, 2, staleObservation.CredentialRevision)
+	require.NoError(t, storeGatewayRefreshAccountInfoTx(owner, guardTx, current, []service.GatewayAccountInfoObservation{staleObservation}))
+	require.NoError(t, guardTx.Commit())
+	guarded, err := info.ReadGatewayAccountInfo(owner, input, route)
+	require.NoError(t, err)
+	require.Equal(t, unchanged.Revision, guarded.Revision)
+	require.Equal(t, unchanged.Sources, guarded.Sources, "stale expiry must not become a current-credential fact")
 }

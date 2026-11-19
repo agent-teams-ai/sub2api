@@ -226,7 +226,6 @@ func storeGatewayRefreshAccountInfoTx(ctx context.Context, tx *sql.Tx, p service
 		return service.ErrGatewayNativeIdentity
 	}
 	for _, observation := range observations {
-		observation.CredentialRevision = p.CredentialRevision
 		if err := storeGatewayAccountInfoTx(ctx, tx, p, observation, false); err != nil {
 			if _, rollbackErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT gateway_refresh_account_info`); rollbackErr != nil {
 				return service.ErrGatewayNativeIdentity
