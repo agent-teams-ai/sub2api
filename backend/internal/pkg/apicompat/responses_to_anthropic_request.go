@@ -1,9 +1,11 @@
 package apicompat
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
@@ -32,6 +34,13 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 
 	if len(system) > 0 {
 		out.System = system
+	}
+	format, err := responsesTextToAnthropicOutputFormat(req.Text)
+	if err != nil {
+		return nil, err
+	}
+	if format != nil {
+		out.OutputConfig = &AnthropicOutputConfig{Format: format}
 	}
 
 	// max_output_tokens → max_tokens
@@ -126,14 +135,20 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 			return nil, fmt.Errorf("%s does not support reasoning effort %q; use low, medium, high, xhigh or max", req.Model, effort)
 		}
 		out.Thinking = &AnthropicThinking{Type: "adaptive"}
-		out.OutputConfig = &AnthropicOutputConfig{Effort: effort}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &AnthropicOutputConfig{}
+		}
+		out.OutputConfig.Effort = effort
 		return out, nil
 	}
 
 	// reasoning.effort → output_config.effort + thinking
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		effort := mapResponsesEffortToAnthropic(req.Reasoning.Effort)
-		out.OutputConfig = &AnthropicOutputConfig{Effort: effort}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &AnthropicOutputConfig{}
+		}
+		out.OutputConfig.Effort = effort
 		// Enable thinking for non-low efforts
 		if effort != "low" {
 			out.Thinking = &AnthropicThinking{
@@ -144,6 +159,38 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 	}
 
 	return out, nil
+}
+
+// The schema is opaque here: conversion never removes constraints. The name,
+// description and strict flag belong to the Responses envelope, while the
+// equivalent Anthropic envelope contains only type and the original schema.
+func responsesTextToAnthropicOutputFormat(text *ResponsesText) (*AnthropicOutputFormat, error) {
+	if text == nil || len(text.Format) == 0 || bytes.Equal(bytes.TrimSpace(text.Format), []byte("null")) {
+		return nil, nil
+	}
+	if len(text.Format) > 64<<10 {
+		return nil, fmt.Errorf("invalid structured output format")
+	}
+	var format struct {
+		Type        string          `json:"type"`
+		Name        string          `json:"name,omitempty"`
+		Description string          `json:"description,omitempty"`
+		Strict      *bool           `json:"strict,omitempty"`
+		Schema      json.RawMessage `json:"schema,omitempty"`
+	}
+	d := json.NewDecoder(bytes.NewReader(text.Format))
+	d.DisallowUnknownFields()
+	if d.Decode(&format) != nil || d.Decode(new(any)) != io.EOF {
+		return nil, fmt.Errorf("invalid structured output format")
+	}
+	if format.Type == "text" && len(format.Schema) == 0 && format.Name == "" && format.Description == "" && format.Strict == nil {
+		return nil, nil
+	}
+	schema := bytes.TrimSpace(format.Schema)
+	if format.Type != "json_schema" || len(schema) == 0 || schema[0] != '{' || !json.Valid(schema) {
+		return nil, fmt.Errorf("unsupported structured output format")
+	}
+	return &AnthropicOutputFormat{Type: "json_schema", Schema: append(json.RawMessage(nil), format.Schema...)}, nil
 }
 
 // defaultThinkingBudget returns a sensible thinking budget based on effort level.

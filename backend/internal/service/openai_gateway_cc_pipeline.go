@@ -154,6 +154,9 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 
 // openAIChatCompletionsTargetURL 解析账号的（非 Grok）Chat Completions 上游端点。
 func (s *OpenAIGatewayService) openAIChatCompletionsTargetURL(account *Account) (string, error) {
+	if HasGatewayNativeIdentity(account) && account.Extra[GatewayProfileExtraKey] == GatewayGeminiAPIKeyProfile {
+		return GatewayGeminiAPIBaseURL + "/chat/completions", nil
+	}
 	baseURL := account.GetOpenAIBaseURL()
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
@@ -417,6 +420,9 @@ func (s *OpenAIGatewayService) scanCCStream(
 			continue
 		}
 		if strict {
+			if gatewayNativeGeminiSelected(c) && !gatewayNativeGeminiWireValid([]byte(payload), true) {
+				return failStrict(gatewayNativeFailureEvent)
+			}
 			if !gatewayNativeLegacyChunk([]byte(payload), &chunk) || (st.SawFinish && len(chunk.Choices) > 0) {
 				return failStrict(gatewayNativeFailureEvent)
 			}
@@ -487,7 +493,7 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 		writeError(c, http.StatusBadGateway, "api_error", "Failed to parse upstream response")
 		return nil, OpenAIUsage{}, fmt.Errorf("parse chat completions response: %w", err)
 	}
-	if gatewayNativeReasoningScope(c) != "" && !gatewayNativeLegacyBuffered(respBody, &ccResp) {
+	if gatewayNativeReasoningScope(c) != "" && (!gatewayNativeLegacyBuffered(respBody, &ccResp) || gatewayNativeGeminiSelected(c) && !gatewayNativeGeminiWireValid(respBody, false)) {
 		return nil, OpenAIUsage{}, ErrGatewayNativeEffectUnknown
 	}
 	// 观察上游 CC JSON 回显的 model / service_tier（计费以回显为准）。

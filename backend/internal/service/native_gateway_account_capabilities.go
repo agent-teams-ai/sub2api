@@ -41,6 +41,12 @@ func GatewayNativeAccountCapability(profile, anchor string, info, imports bool) 
 	}
 	out := GatewayAccountCapability{ProfileID: profile, Provider: GatewayAccountCapabilityLabel{ID: provider}, Region: GatewayAccountCapabilityLabel{ID: "global", Label: "Global"}, Protocol: "openai-responses", Models: []GatewayAccountModel{{ModelID: anchor, Tools: GatewayAccountModelChoices{Allowed: []string{"function"}, Default: "function"}}}, Methods: []GatewayAccountConnectionMethod{{Kind: "api_key", Create: true, Reconnect: true}}, AccountInfo: info, LimitsContract: "none", Availability: "enabled"}
 	switch profile {
+	case GatewayAnthropicAPIKeyProfile:
+		out.Provider.Label = "Anthropic"
+		out.Product = GatewayAccountCapabilityLabel{ID: "pay_as_you_go", Label: "Anthropic API"}
+	case GatewayGeminiAPIKeyProfile:
+		out.Provider.Label = "Gemini"
+		out.Product = GatewayAccountCapabilityLabel{ID: "pay_as_you_go", Label: "Gemini API"}
 	case GatewayMiMoResponsesProfile, GatewayLegacyBridgeProfile:
 		out.Provider.Label = "MiMo"
 		out.Product = GatewayAccountCapabilityLabel{ID: "unknown", Label: "MiMo"}

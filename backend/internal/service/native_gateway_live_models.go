@@ -343,6 +343,10 @@ func (s *OpenAIGatewayService) gatewayModelCatalogueAdmitted(scope GatewayNative
 // liveCatalogueModels builds the catalogue for one authorized account, refreshing
 // the live list when it is not fresh. Failure is invisible to callers.
 func (s *OpenAIGatewayService) liveCatalogueModels(ctx context.Context, in GatewayAccountModelsInput, route GatewayNativeRoute, account *Account, scope GatewayNativeCredentialScope) []GatewayAccountModel {
+	if GatewayNativeOfficialAPIProfileIDValid(route.Profile) {
+		// This release qualifies exactly one review model, not a vendor catalogue.
+		return gatewayCatalogAccountModels(route.Profile, route.Model, nil)
+	}
 	live := s.liveModels()
 	key := gatewayLiveModelsKey(route.Profile, scope, account.GetCredential("api_key"))
 	_, public := gatewayLiveModelsSource(route.Profile)

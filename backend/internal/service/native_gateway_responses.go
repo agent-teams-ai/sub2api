@@ -36,6 +36,12 @@ import (
 // neither is appropriate for MiMo's officially documented native Responses lite.
 // Ordinary callers, the historical bridge and their handlers stay unchanged.
 func (s *OpenAIGatewayService) gatewayNativeTargetURL(a *Account) (string, error) {
+	if a.Type == AccountTypeAPIKey && a.Extra[GatewayProfileExtraKey] == GatewayAnthropicAPIKeyProfile {
+		return GatewayAnthropicAPIBaseURL + "/messages", nil
+	}
+	if a.Type == AccountTypeAPIKey && a.Extra[GatewayProfileExtraKey] == GatewayGeminiAPIKeyProfile {
+		return GatewayGeminiAPIBaseURL + "/chat/completions", nil
+	}
 	if a.Type == AccountTypeOAuth && a.Extra[GatewayProfileExtraKey] == GatewayGrokOAuthResponsesProfile {
 		return GatewayGrokOAuthBaseURL + "/v1/responses", nil
 	}

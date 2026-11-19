@@ -15,6 +15,10 @@ const GatewayGLMCodingResponsesModelFull = "glm-5.3"
 // profile that returns nil has no such catalogue.
 func gatewayCatalogStaticModelIDs(profile string) []string {
 	switch profile {
+	case GatewayAnthropicAPIKeyProfile:
+		return []string{GatewayAnthropicAPIModel}
+	case GatewayGeminiAPIKeyProfile:
+		return []string{GatewayGeminiAPIModel}
 	case GatewayGLMCodingResponsesProfile:
 		return []string{GatewayGLMCodingResponsesModel, GatewayGLMCodingResponsesModelFull}
 	case GatewayKimiCodeResponsesProfile:
@@ -69,9 +73,13 @@ func gatewayCatalogAccountModels(profile, anchor string, live []string) []Gatewa
 	ids := gatewayModelCatalogue(profile, anchor, live)
 	models := make([]GatewayAccountModel, 0, len(ids))
 	for _, id := range ids {
+		tools := GatewayAccountModelChoices{Allowed: []string{"function"}, Default: "function"}
+		if GatewayNativeOfficialAPIProfileIDValid(profile) {
+			tools.Allowed = []string{"function", "function_and_custom"}
+		}
 		models = append(models, GatewayAccountModel{
 			ModelID: id,
-			Tools:   GatewayAccountModelChoices{Allowed: []string{"function"}, Default: "function"},
+			Tools:   tools,
 		})
 	}
 	return models

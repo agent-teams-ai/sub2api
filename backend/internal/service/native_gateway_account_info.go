@@ -93,8 +93,10 @@ func GatewayAccountInfoProvider(profile string) string {
 	switch profile {
 	case GatewayCodexOAuthResponsesProfile:
 		return "openai"
-	case GatewayClaudeOAuthMessagesProfile:
+	case GatewayClaudeOAuthMessagesProfile, GatewayAnthropicAPIKeyProfile:
 		return "anthropic"
+	case GatewayGeminiAPIKeyProfile:
+		return "gemini"
 	case GatewayGrokOAuthResponsesProfile:
 		return "grok"
 	case GatewayOpenRouterResponsesProfile:
@@ -291,6 +293,9 @@ func GatewayAccountInfoProject(profile string, stored GatewayAccountInfoStored, 
 			f.AccountLabel = gatewayInfoRefresh(o.Fields.AccountLabel, 24*time.Hour, o.ValidUntil, now)
 			f.Subscription = gatewayInfoRefresh(o.Fields.Subscription, 15*time.Minute, o.ValidUntil, now)
 		case "account_check":
+			if profile == GatewayClaudeOAuthMessagesProfile || profile == GatewayGrokOAuthResponsesProfile {
+				f.Email = gatewayInfoRefresh(o.Fields.Email, 24*time.Hour, o.ValidUntil, now)
+			}
 			f.AccountLabel = gatewayInfoRefresh(o.Fields.AccountLabel, 24*time.Hour, o.ValidUntil, now)
 			f.Subscription = gatewayInfoRefresh(o.Fields.Subscription, 15*time.Minute, o.ValidUntil, now)
 		case "plan_quota":
@@ -308,6 +313,28 @@ func GatewayAccountInfoObservationValid(profile string, o GatewayAccountInfoObse
 		return false
 	}
 	if o.ValidUntil != nil && (o.ValidUntil.IsZero() || o.ValidUntil.Year() < 1 || o.ValidUntil.Year() > 9999) {
+		return false
+	}
+	// Public provenance is a result of the closed producer, not a claim supplied
+	// by an arbitrary fact. Only verified claim producers may label facts so.
+	provenance := "provider_api"
+	if o.Source == "verified_claims" {
+		provenance = "verified_claim"
+	}
+	for _, fact := range []struct{ status, source string }{
+		{o.Fields.Email.Status, o.Fields.Email.Source}, {o.Fields.AccountLabel.Status, o.Fields.AccountLabel.Source},
+		{o.Fields.Subscription.Status, o.Fields.Subscription.Source}, {o.Fields.CredentialExpiresAt.Status, o.Fields.CredentialExpiresAt.Source}, {o.Fields.PrivacyMode.Status, o.Fields.PrivacyMode.Source},
+	} {
+		if fact.status == "known" && fact.source != provenance {
+			return false
+		}
+	}
+	emailProducer := o.Source == "verified_claims" && profile == GatewayCodexOAuthResponsesProfile ||
+		o.Source == "account_check" && (profile == GatewayClaudeOAuthMessagesProfile || profile == GatewayGrokOAuthResponsesProfile)
+	if o.Fields.PrivacyMode.Status == "known" || o.Source != "credential" && o.Fields.CredentialExpiresAt.Status == "known" || !emailProducer && o.Fields.Email.Status == "known" {
+		return false
+	}
+	if (o.Source == "plan_quota" || o.Source == "credential") && o.Fields.AccountLabel.Status == "known" || o.Source == "credential" && o.Fields.Subscription.Status == "known" {
 		return false
 	}
 	switch o.Source {

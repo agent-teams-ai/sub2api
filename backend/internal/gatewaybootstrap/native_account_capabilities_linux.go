@@ -25,6 +25,9 @@ func privateAccountCapabilities(profile ProfileConfig, transport *gatewaytranspo
 	for _, p := range transport.CodingPlanProfiles() {
 		add(p.Profile, p.Model)
 	}
+	for _, p := range transport.OfficialAPIProfiles() {
+		add(p.Profile, p.Model)
+	}
 	if oauth != nil {
 		if oauth.connect != nil && oauth.dispatch != nil {
 			add(service.GatewayCodexOAuthResponsesProfile, service.GatewayCodexOAuthModel)

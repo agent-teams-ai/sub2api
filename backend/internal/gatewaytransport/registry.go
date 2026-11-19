@@ -45,6 +45,7 @@ type Config struct {
 	Codex                                      *QualifiedProfile
 	Claude                                     *QualifiedProfile
 	CodingPlans                                []QualifiedProfile
+	OfficialAPIs                               []QualifiedProfile
 	Grok                                       *QualifiedProfile
 	CallbackOrigin, CallbackCredential         string
 	VerifyDispatch                             func(context.Context, string, Proof, time.Time) error
@@ -283,6 +284,17 @@ func New(ctx context.Context, cfg Config) (*Handler, error) {
 		seen[plan.Profile] = true
 	}
 	cfg.CodingPlans = plans
+	if len(cfg.OfficialAPIs) > 2 {
+		return nil, errDenied
+	}
+	apis := append([]QualifiedProfile(nil), cfg.OfficialAPIs...)
+	for _, api := range apis {
+		if !service.GatewayNativeOfficialAPIProfileValid(api.Profile, api.BaseURL, api.Model) || seen[api.Profile] || !providerProfileBoundsValid(api) || api.Tokens > 65536 || api.ProviderTokenUpperBound > 65536 {
+			return nil, errDenied
+		}
+		seen[api.Profile] = true
+	}
+	cfg.OfficialAPIs = apis
 	if (cfg.Grok == nil) != (cfg.GrokOAuth == nil) {
 		return nil, errDenied
 	}
@@ -326,6 +338,11 @@ func (h *Handler) profile(id string) (QualifiedProfile, bool) {
 			return plan, true
 		}
 	}
+	for _, api := range h.cfg.OfficialAPIs {
+		if id == api.Profile {
+			return api, true
+		}
+	}
 	if h.cfg.Grok != nil && id == h.cfg.Grok.Profile {
 		return *h.cfg.Grok, true
 	}
@@ -342,6 +359,10 @@ func providerProfileBoundsValid(p QualifiedProfile) bool {
 // runtime extension point. Unconfigured leaves are unavailable.
 func (h *Handler) CodingPlanProfiles() []QualifiedProfile {
 	return append([]QualifiedProfile(nil), h.cfg.CodingPlans...)
+}
+
+func (h *Handler) OfficialAPIProfiles() []QualifiedProfile {
+	return append([]QualifiedProfile(nil), h.cfg.OfficialAPIs...)
 }
 
 // Safe immutable configuration projection for the private candidate router.

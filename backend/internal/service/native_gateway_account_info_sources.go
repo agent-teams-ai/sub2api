@@ -22,6 +22,8 @@ func gatewayInfoSubscription(code, scope, expiry string) *GatewayAccountSubscrip
 	if expiry != "" {
 		if at, err := time.Parse(time.RFC3339Nano, expiry); err == nil {
 			v.EndsAt = &GatewayAccountInfoDate{Kind: "instant", Value: at.UTC().Format(time.RFC3339Nano)}
+		} else if date, err := time.Parse("2006-01-02", expiry); err == nil && date.Year() >= 1 && date.Format("2006-01-02") == expiry {
+			v.EndsAt = &GatewayAccountInfoDate{Kind: "date", Value: expiry}
 		}
 	}
 	return v
@@ -115,6 +117,17 @@ func gatewayCodexCredentialInfo(bundle GatewayNativeOAuthBundle, custody *Gatewa
 	var timing gatewayOAuthTiming
 	if json.Unmarshal(fields[gatewayOAuthTimingMember], &timing) == nil && gatewayInfoInstant(timing.AccessExpires) {
 		f.CredentialExpiresAt = gatewayKnownFact(timing.AccessExpires, "provider_api", at)
+	}
+	return f
+}
+
+// An expiry is observable only when its existing authenticated producer kept
+// the observation time. Legacy bundles without that time remain unknown.
+func gatewayOAuthCredentialExpiryInfo(profile string, expiry, observed time.Time) GatewayAccountInfoFields {
+	f := GatewayAccountInfoEmptyFields(profile)
+	value := expiry.UTC().Format(time.RFC3339Nano)
+	if !expiry.IsZero() && !observed.IsZero() && gatewayInfoInstant(value) && gatewayInfoInstant(observed.UTC().Format(time.RFC3339Nano)) {
+		f.CredentialExpiresAt = gatewayKnownFact(value, "provider_api", observed)
 	}
 	return f
 }

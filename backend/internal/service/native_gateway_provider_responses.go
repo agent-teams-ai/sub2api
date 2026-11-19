@@ -45,6 +45,9 @@ func GatewayNativeCodingPlanProfileIDValid(profile string) bool {
 }
 
 func gatewayNativeProviderProfile(profile string) bool {
+	if GatewayNativeOfficialAPIProfileIDValid(profile) {
+		return true
+	}
 	switch profile {
 	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile, GatewayNVIDIABuildChatProfile:
 		return true
@@ -129,6 +132,14 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 		return deny()
 	}
 	switch profile {
+	case GatewayAnthropicAPIKeyProfile:
+		if model != GatewayAnthropicAPIModel {
+			return deny()
+		}
+	case GatewayGeminiAPIKeyProfile:
+		if model != GatewayGeminiAPIModel {
+			return deny()
+		}
 	case GatewayNVIDIABuildChatProfile, GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile:
 		// Structural only: membership is decided at dispatch from the account's catalogue.
 		if !GatewayAccountModelIDValid(model) {
@@ -141,6 +152,12 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	}
 	if _, ok := gatewayOAuthSeconds(fields["max_output_tokens"]); !ok || !gatewayNativeProviderTextInput(profile, fields["input"]) {
 		return deny()
+	}
+	if GatewayNativeOfficialAPIProfileIDValid(profile) {
+		tokens, _ := gatewayOAuthSeconds(fields["max_output_tokens"])
+		if tokens < 1 || tokens > 65536 {
+			return deny()
+		}
 	}
 	if raw := fields["instructions"]; raw != nil {
 		var v string
@@ -226,6 +243,12 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	}
 	if !gatewayNativeProviderNamespaceReferences(fields["input"], fields["tool_choice"], mapping) {
 		return deny()
+	}
+	if profile == GatewayAnthropicAPIKeyProfile {
+		providerWire, _, err := gatewayNativePrepareAnthropicAPI(wire)
+		if err != nil || int64(len(providerWire)) > requestBytes {
+			return deny()
+		}
 	}
 	return wire, mapping, nil
 }

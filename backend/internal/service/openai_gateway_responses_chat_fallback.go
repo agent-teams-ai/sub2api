@@ -52,6 +52,10 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletionsWithStartTim
 	}
 
 	clientStream := responsesReq.Stream
+	gemini, err := gatewayNativeGeminiContinuation(c)
+	if err != nil {
+		return nil, ErrGatewayNativeIdentity
+	}
 	// custom 工具（如 codex 的 exec）降级为 function 工具转发，回程需按名字还原为
 	// custom_tool_call 项，先记下名字集合；tool_search 工具同理，回程还原为
 	// tool_search_call 项；namespace 子工具（如 MCP 工具）摊平转发，回程按映射还原
@@ -68,14 +72,18 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletionsWithStartTim
 
 	// 自愈回写：历史里带明文 summary 的 reasoning item 刷新进缓存，覆盖 Redis
 	// 被 flush / 跨实例漂移后同 id 的 encrypted-only 副本无法再取明文的情况。
-	s.recacheReasoningItemsFromInput(responsesReq.Input, gatewayNativeReasoningScope(c))
-
-	chatReq, err := apicompat.ResponsesToChatCompletionsRequestWithOptions(&responsesReq, &apicompat.ResponsesToChatOptions{
-		ReasoningContentByID: func(id string) string { return s.reasoningContentByID(id, gatewayNativeReasoningScope(c)) },
-	})
+	options := &apicompat.ResponsesToChatOptions{}
+	if gemini == nil {
+		s.recacheReasoningItemsFromInput(responsesReq.Input, gatewayNativeReasoningScope(c))
+		options.ReasoningContentByID = func(id string) string { return s.reasoningContentByID(id, gatewayNativeReasoningScope(c)) }
+	}
+	chatReq, err := apicompat.ResponsesToChatCompletionsRequestWithOptions(&responsesReq, options)
 	if err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, fmt.Errorf("convert responses to chat completions: %w", err)
+	}
+	if gemini != nil && apicompat.RestoreGeminiContinuation(responsesReq.Input, chatReq, gemini) != nil {
+		return nil, ErrGatewayNativeIdentity
 	}
 
 	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
@@ -180,7 +188,17 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 		return nil, err
 	}
 	responsesResp := apicompat.ChatCompletionsResponseToResponses(ccResp, originalModel, customTools, functionTools, toolSearch, namespaceTools)
-	s.cacheReasoningItemsFromOutput(responsesResp.Output, gatewayNativeReasoningScope(c))
+	gemini, codecErr := gatewayNativeGeminiContinuation(c)
+	if codecErr != nil {
+		return nil, ErrGatewayNativeEffectUnknown
+	}
+	if gemini != nil {
+		if len(ccResp.Choices) != 1 || apicompat.AttachGeminiContinuation(responsesResp, ccResp.Choices[0].Message, gemini) != nil {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+	} else {
+		s.cacheReasoningItemsFromOutput(responsesResp.Output, gatewayNativeReasoningScope(c))
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -239,6 +257,14 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	state.FunctionTools = functionTools
 	state.ToolSearchDeclared = toolSearch
 	state.NamespaceTools = namespaceTools
+	gemini, codecErr := gatewayNativeGeminiContinuation(c)
+	if codecErr != nil {
+		return nil, ErrGatewayNativeEffectUnknown
+	}
+	var continuation *apicompat.GeminiContinuationStream
+	if gemini != nil {
+		continuation = apicompat.NewGeminiContinuationStream()
+	}
 	clientDisconnected := false
 	strictTerminal := gatewayNativeReasoningScope(c) != ""
 	deliveryFailed := func() {
@@ -288,12 +314,18 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
+		if continuation != nil && continuation.Observe(chunk) != nil {
+			deliveryFailed()
+			return
+		}
 		if strictTerminal && !gatewayNativeLegacyToolDelta(chunk, state) {
 			deliveryFailed()
 			return
 		}
 		events := apicompat.ChatCompletionsChunkToResponsesEvents(chunk, state)
-		s.cacheReasoningItemsFromEvents(events, gatewayNativeReasoningScope(c))
+		if gemini == nil {
+			s.cacheReasoningItemsFromEvents(events, gatewayNativeReasoningScope(c))
+		}
 		writeEvents(events)
 	}, strictTerminal)
 	defer func() {
@@ -345,8 +377,17 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		}, fmt.Errorf("invalid tool call arguments from upstream: %w", err)
 	}
 
-	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
-	s.cacheReasoningItemsFromEvents(finalEvents, gatewayNativeReasoningScope(c))
+	var finalEvents []apicompat.ResponsesStreamEvent
+	if continuation != nil {
+		var err error
+		finalEvents, err = continuation.Finalize(state, gemini)
+		if err != nil {
+			return nil, ErrGatewayNativeEffectUnknown
+		}
+	} else {
+		finalEvents = apicompat.FinalizeChatCompletionsResponsesStream(state)
+		s.cacheReasoningItemsFromEvents(finalEvents, gatewayNativeReasoningScope(c))
+	}
 	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
