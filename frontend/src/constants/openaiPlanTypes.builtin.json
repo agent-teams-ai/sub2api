@@ -1,0 +1,115 @@
+{
+  "aliases": {
+    "chatgptpro": "pro"
+  },
+  "plans": [
+    {
+      "code": "free",
+      "key": "free",
+      "status": "Free",
+      "analytics": "Free"
+    },
+    {
+      "code": "go",
+      "key": "go",
+      "status": "Go",
+      "analytics": "Go"
+    },
+    {
+      "code": "plus",
+      "key": "plus",
+      "status": "Plus",
+      "analytics": "Plus"
+    },
+    {
+      "code": "prolite",
+      "key": "prolite",
+      "status": "Pro 100",
+      "analytics": "Pro 100"
+    },
+    {
+      "code": "pro",
+      "key": "pro",
+      "status": "Pro 200",
+      "analytics": "Pro 200"
+    },
+    {
+      "code": "promax",
+      "key": "promax",
+      "status": "Pro 500",
+      "analytics": "Pro 500"
+    },
+    {
+      "code": "team",
+      "key": "team",
+      "status": "Business",
+      "analytics": "Business"
+    },
+    {
+      "code": "self_serve_business_usage_based",
+      "key": "selfservebusinessusagebased",
+      "status": "Business",
+      "analytics": "Business"
+    },
+    {
+      "code": "self_serve_business_prolite",
+      "key": "selfservebusinessprolite",
+      "status": "Business Premium",
+      "analytics": "Business"
+    },
+    {
+      "code": "business",
+      "key": "business",
+      "status": "Enterprise",
+      "analytics": "Business"
+    },
+    {
+      "code": "enterprise",
+      "key": "enterprise",
+      "status": "Enterprise",
+      "analytics": "Enterprise"
+    },
+    {
+      "code": "ent26",
+      "key": "ent26",
+      "status": "Enterprise",
+      "analytics": "Enterprise"
+    },
+    {
+      "code": "enterprise_cbp_usage_based",
+      "key": "enterprisecbpusagebased",
+      "status": "Enterprise",
+      "analytics": "Enterprise"
+    },
+    {
+      "code": "enterprise_cbp_automation",
+      "key": "enterprisecbpautomation",
+      "status": "Enterprise (Automation)",
+      "analytics": "Enterprise"
+    },
+    {
+      "code": "edu",
+      "key": "edu",
+      "status": "Edu",
+      "analytics": "Education"
+    },
+    {
+      "code": "edu_plus",
+      "key": "eduplus",
+      "status": "Edu Plus",
+      "analytics": "Education"
+    },
+    {
+      "code": "edu_pro",
+      "key": "edupro",
+      "status": "Edu Pro",
+      "analytics": "Education"
+    },
+    {
+      "code": "unknown",
+      "key": "unknown",
+      "status": "Unknown",
+      "analytics": "Account"
+    }
+  ]
+}

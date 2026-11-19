@@ -129,6 +129,12 @@ func (r *gatewayAccountLimitsRepositoryV2) ReadGatewayAccountLimitsV2(ctx contex
 // Each collector owns a single dimension. Replacing that complete source set
 // removes disappeared windows while leaving independently observed sources intact.
 func (r *gatewayAccountLimitsRepositoryV2) StoreGatewayAccountLimitsV2(ctx context.Context, expected service.GatewayNativeOAuthPhysical, snapshot service.GatewayAccountLimitsSnapshotV2, observed time.Time) error {
+	return r.StoreGatewayQuotaAndInfo(ctx, expected, snapshot, observed, nil)
+}
+func (r *gatewayAccountLimitsRepositoryV2) ReserveGatewayAccountInfoOrder(ctx context.Context) (int64, error) {
+	return NewGatewayAccountInfoRepository(r.db).ReserveGatewayAccountInfoOrder(ctx)
+}
+func (r *gatewayAccountLimitsRepositoryV2) StoreGatewayQuotaAndInfo(ctx context.Context, expected service.GatewayNativeOAuthPhysical, snapshot service.GatewayAccountLimitsSnapshotV2, observed time.Time, info *service.GatewayAccountInfoObservation) error {
 	if observed.IsZero() || observed.Year() < 1 || observed.Year() > 9999 || observed.After(time.Now().Add(time.Minute)) || !service.ValidateGatewayAccountLimitsSnapshotV2(snapshot, expected.Route.Profile) {
 		return service.ErrGatewayNativeIdentity
 	}
@@ -244,6 +250,11 @@ func (r *gatewayAccountLimitsRepositoryV2) StoreGatewayAccountLimitsV2(ctx conte
 	if rows, e := result.RowsAffected(); e != nil || rows != 1 {
 		return service.ErrGatewayNativeIdentity
 	}
+	if info != nil {
+		if err := storeGatewayAccountInfoTx(ctx, tx, current, *info, false); err != nil {
+			return err
+		}
+	}
 	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity
 	}
@@ -251,3 +262,4 @@ func (r *gatewayAccountLimitsRepositoryV2) StoreGatewayAccountLimitsV2(ctx conte
 }
 
 var _ service.GatewayAccountLimitsRepositoryV2 = (*gatewayAccountLimitsRepositoryV2)(nil)
+var _ service.GatewayAccountQuotaInfoRepository = (*gatewayAccountLimitsRepositoryV2)(nil)

@@ -143,6 +143,13 @@ func storeGatewayAccountInfoTx(ctx context.Context, tx *sql.Tx, p service.Gatewa
 	if !service.GatewayAccountInfoObservationValid(p.Route.Profile, o) || o.CredentialRevision != p.CredentialRevision || !initialize && o.Order < 1 {
 		return service.ErrGatewayNativeIdentity
 	}
+	// The caller's verified exclusive physical lock owns replacement. Retire an
+	// obsolete identity before inserting the new snapshot, without relaxing CAS or
+	// exposing old facts to the new owner/generation.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM gateway_account_info_snapshots WHERE account_id=$1 AND
+ (native_created_at<>$2 OR generation<>$3 OR principal_version<>$4)`, p.Route.AccountID, p.Route.CreatedAt, p.Route.Generation, service.GatewayAccountInfoPrincipal(p)); err != nil {
+		return service.ErrGatewayNativeIdentity
+	}
 	stored, err := readGatewayAccountInfoTx(ctx, tx, p)
 	if err != nil {
 		return err

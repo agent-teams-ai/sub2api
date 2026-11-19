@@ -27,6 +27,24 @@ var ErrGatewayProviderQuota = errors.New("provider quota observation unavailable
 // the complete snapshot. It never enumerates ordinary accounts or writes Extra.
 type GatewayProviderQuotaCollector struct{ client *http.Client }
 
+type GatewayProviderQuotaObservation struct {
+	Limits     GatewayAccountLimitsSnapshotV2
+	ObservedAt time.Time
+	Info       *GatewayAccountInfoFields
+}
+
+// Facts and quota are projected from the same authenticated response bytes.
+func (c *GatewayProviderQuotaCollector) FetchWithAccountInfo(ctx context.Context, provider string, credential []byte) (GatewayProviderQuotaObservation, error) {
+	var info *GatewayAccountInfoFields
+	limits, at, err := c.fetchObserved(ctx, provider, credential, func(body []byte, observed time.Time) {
+		if provider == "glm" || provider == "minimax" {
+			fields := gatewayQuotaAccountInfo(provider, body, observed)
+			info = &fields
+		}
+	})
+	return GatewayProviderQuotaObservation{Limits: limits, ObservedAt: at, Info: info}, err
+}
+
 func NewGatewayProviderQuotaCollector(transport http.RoundTripper) *GatewayProviderQuotaCollector {
 	if transport == nil {
 		transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16384, MaxConnsPerHost: 2, DisableKeepAlives: true}
@@ -48,6 +66,10 @@ func (c *GatewayProviderQuotaCollector) Fetch(ctx context.Context, provider stri
 // FetchObserved also returns the observation identity required by the canonical
 // CAS writer, including successful observations containing no quota windows.
 func (c *GatewayProviderQuotaCollector) FetchObserved(ctx context.Context, provider string, credential []byte) (GatewayAccountLimitsSnapshotV2, time.Time, error) {
+	return c.fetchObserved(ctx, provider, credential, nil)
+}
+
+func (c *GatewayProviderQuotaCollector) fetchObserved(ctx context.Context, provider string, credential []byte, observe func([]byte, time.Time)) (GatewayAccountLimitsSnapshotV2, time.Time, error) {
 	empty := GatewayAccountLimitsSnapshotV2{Scope: "account", Windows: []GatewayAccountLimitWindowV2{}}
 	if c == nil || c.client == nil || len(credential) == 0 || len(credential) > 16384 || strings.TrimSpace(string(credential)) != string(credential) || strings.ContainsAny(string(credential), "\r\n") {
 		return empty, time.Time{}, ErrGatewayProviderQuota
@@ -81,6 +103,9 @@ func (c *GatewayProviderQuotaCollector) FetchObserved(ctx context.Context, provi
 			continue
 		}
 		observedAny = true
+		if observe != nil {
+			observe(body, observed)
+		}
 		for _, w := range snapshot.Windows {
 			// Billing has independently qualified weekly and monthly reads. Each
 			// endpoint contributes only its own domain; never carry old windows.

@@ -40,6 +40,7 @@ var ErrGatewayOAuthConflict = errors.New("gateway oauth enrollment conflict")
 type GatewayNativeOAuthIdentity struct {
 	issuer, subject string
 	expiresAt       time.Time
+	info            GatewayAccountInfoFields
 }
 
 func (i GatewayNativeOAuthIdentity) Principal() (string, string) { return i.issuer, i.subject }
@@ -286,7 +287,7 @@ func (v *GatewayNativeOAuthVerifier) Verify(ctx context.Context, encoded string)
 	if err != nil || !token.Valid {
 		return deny()
 	}
-	return GatewayNativeOAuthIdentity{issuer: issuer, subject: subject, expiresAt: time.Unix(exp, 0)}, nil
+	return GatewayNativeOAuthIdentity{issuer: issuer, subject: subject, expiresAt: time.Unix(exp, 0), info: gatewayVerifiedCodexInfo(claims, now)}, nil
 }
 func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (key *rsa.PublicKey, retErr error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, gatewayOAuthJWKS, nil)

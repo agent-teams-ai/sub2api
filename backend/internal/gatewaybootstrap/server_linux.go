@@ -343,6 +343,11 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 		c.Request = c.Request.WithContext(service.WithGatewayNativeCustody(ctx, custody))
 		c.Next()
 	}
+	capabilities := privateAccountCapabilities(profile, transport, oauth)
+	router.GET("/private/native/v1/account-capabilities", authorizeCandidate, func(c *gin.Context) {
+		c.Header("Cache-Control", "private, no-store")
+		c.JSON(http.StatusOK, capabilities)
+	})
 	secondary, hasOpenRouter := transport.OpenRouterProfile()
 	var second []admin.GatewayNativeProfile
 	if hasOpenRouter {
@@ -589,7 +594,7 @@ func privateHandler(profile ProfileConfig, adminSvc service.AdminService, gatewa
 			return
 		}
 		switch {
-		case oauth != nil && (oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh-capabilities" || oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/capabilities" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/capabilities"):
+		case r.URL.Path == "/private/native/v1/account-capabilities" || oauth != nil && (oauth.limitsRefresh != nil && r.URL.Path == "/private/native/v1/account-limits/refresh-capabilities" || oauth.limits != nil && r.URL.Path == "/private/native/v1/account-limits/capabilities" || oauth.limitsV2 != nil && r.URL.Path == "/private/native/v2/account-limits/capabilities"):
 			if r.Method != http.MethodGet {
 				http.Error(w, "private native bootstrap denied", 400)
 				return
