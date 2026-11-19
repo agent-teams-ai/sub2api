@@ -87,7 +87,11 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 		if mode.Load() == 1 {
 			principal = uuid.NewString()
 		}
-		payload, _ := json.Marshal(map[string]any{"access_token": "fixture-access-private", "refresh_token": "fixture-refresh-private", "token_type": "Bearer", "expires_in": 60, "scope": "user:profile user:inference", "account": map[string]string{"uuid": principal}, "organization": map[string]string{"uuid": organization}})
+		email := "claude-initial@example.test"
+		if body["grant_type"] == "refresh_token" {
+			email = "claude-refreshed@example.test"
+		}
+		payload, _ := json.Marshal(map[string]any{"access_token": "fixture-access-private", "refresh_token": "fixture-refresh-private", "token_type": "Bearer", "expires_in": 60, "scope": "user:profile user:inference", "account": map[string]string{"uuid": principal, "email_address": email}, "organization": map[string]string{"uuid": organization}})
 		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(string(payload))), Request: r}, nil
 	})
 	claude, err := service.NewGatewayNativeClaudeOAuth(source, custody, transport)
@@ -131,11 +135,35 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 	require.Equal(t, "controlled-source-v1", descriptor.Qualification)
 	require.NotNil(t, descriptor.Native)
 	route := *descriptor.Native
+	infoStore := NewGatewayAccountInfoRepository(db)
+	infoInput := service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: route.Profile}
+	initialInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Len(t, initialInfo.Sources, 2, "enrollment and metadata commit together")
+	require.Equal(t, "claude-initial@example.test", *initialInfo.Sources["account_check"].Fields.Email.Value)
+	require.EqualValues(t, 1, initialInfo.Sources["credential"].CredentialRevision)
+	require.Equal(t, "unknown", initialInfo.Sources["account_check"].Fields.Subscription.Status)
+	require.NoError(t, claude.HydrateAccountInfo(ownerCtx, scope, op))
+	unchangedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Equal(t, initialInfo, unchangedInfo, "cached initialization cannot overwrite live observations")
+	require.EqualValues(t, 1, exchanges.Load(), "metadata hydration does not refresh")
+	// A missing snapshot can be initialized from timestamped sealed custody,
+	// without fabricating or duplicating the account facts discarded by custody.
+	_, err = db.ExecContext(ctx, `DELETE FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID)
+	require.NoError(t, err)
+	require.NoError(t, claude.HydrateAccountInfo(ownerCtx, scope, op))
+	hydratedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Len(t, hydratedInfo.Sources, 1)
+	require.EqualValues(t, 0, hydratedInfo.Sources["credential"].Order)
+	require.Equal(t, initialInfo.Sources["credential"].Fields.CredentialExpiresAt, hydratedInfo.Sources["credential"].Fields.CredentialExpiresAt)
 	var stored string
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials::text||extra::text FROM accounts WHERE id=$1`, route.AccountID).Scan(&stored))
 	require.NotContains(t, stored, "fixture-access-private")
 	require.NotContains(t, stored, "fixture-refresh-private")
 	require.NotContains(t, stored, "id_token")
+	require.NotContains(t, stored, "claude-initial@example.test")
 	for _, sql := range []string{`UPDATE accounts SET schedulable=true WHERE id=$1`, `UPDATE accounts SET credentials='{}'::jsonb WHERE id=$1`, `UPDATE accounts SET extra='{}'::jsonb WHERE id=$1`, `DELETE FROM accounts WHERE id=$1`} {
 		_, e := db.ExecContext(ctx, sql, route.AccountID)
 		require.Error(t, e)
@@ -180,6 +208,12 @@ func TestGatewayNativeClaudePostgresLifecycleAndPassiveLimits(t *testing.T) {
 	entry.Release()
 	require.NoError(t, <-refreshDone)
 	require.EqualValues(t, 2, exchanges.Load())
+	refreshedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Greater(t, refreshedInfo.Revision, hydratedInfo.Revision)
+	require.EqualValues(t, 2, refreshedInfo.CredentialRevision)
+	require.EqualValues(t, 2, refreshedInfo.Sources["credential"].CredentialRevision)
+	require.Equal(t, "claude-refreshed@example.test", *refreshedInfo.Sources["account_check"].Fields.Email.Value)
 	again, err := claude.Refresh(ownerCtx, scope, op, refreshOp)
 	require.NoError(t, err)
 	require.Equal(t, "completed", again.State)

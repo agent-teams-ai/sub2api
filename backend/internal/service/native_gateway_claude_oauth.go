@@ -36,10 +36,16 @@ type GatewayClaudeConnectIntent struct {
 	Deadline                              time.Time
 }
 
-type GatewayClaudeIdentity struct{ account, organization string }
+type GatewayClaudeIdentity struct {
+	account, organization string
+	info                  []GatewayAccountInfoObservation
+}
 
 func (i GatewayClaudeIdentity) Principal() (string, string) { return i.account, i.organization }
 func (i GatewayClaudeIdentity) Verified() bool              { return i.account != "" && i.organization != "" }
+func (i GatewayClaudeIdentity) AccountInfo() []GatewayAccountInfoObservation {
+	return append([]GatewayAccountInfoObservation(nil), i.info...)
+}
 
 type GatewayClaudeEnrollment struct {
 	Intent   GatewayClaudeConnectIntent
@@ -63,7 +69,7 @@ type GatewayNativeClaudeRepository interface {
 	LockGatewayClaudeMaintenance(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthPhysical, string, string, string, func(), error)
 	ReadGatewayClaudeRefresh(context.Context, GatewayNativeCredentialScope, string, string) (GatewayNativeOAuthRefreshOutcome, bool, error)
 	ClaimGatewayClaudeRefresh(context.Context, GatewayNativeCredentialScope, string, string, int64) (GatewayNativeOAuthPhysical, string, bool, error)
-	CompleteGatewayClaudeRefresh(context.Context, GatewayNativeOAuthPhysical, string, string) error
+	CompleteGatewayClaudeRefresh(context.Context, GatewayNativeOAuthPhysical, string, string, ...GatewayAccountInfoObservation) error
 	CleanupGatewayClaude(context.Context, GatewayNativeOAuthCleanupRequest, GatewayNativeOAuthCleanupAuthorizer) (GatewayNativeOAuthCleanupResult, error)
 	StoreGatewayClaudeLimits(context.Context, GatewayNativeOAuthPhysical, GatewayClaudeRawLimits, time.Time) error
 	ReadGatewayClaudeLimits(context.Context, GatewayNativeCredentialScope, GatewayNativeRoute) (GatewayAccountLimitsStored, error)
@@ -88,6 +94,8 @@ type gatewayClaudeBundle struct {
 	Account      string    `json:"account"`
 	Organization string    `json:"organization"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	ObservedAt   time.Time `json:"observed_at,omitzero"`
+	info         []GatewayAccountInfoObservation
 }
 type gatewayClaudeConnectSecret struct {
 	Kind     string `json:"kind"`
@@ -261,7 +269,7 @@ func (s *GatewayNativeClaudeOAuth) CompleteOwnerCallback(ctx context.Context, sc
 	if err != nil {
 		return empty, err
 	}
-	_, err = s.repository.CompleteGatewayClaudeConnect(ctx, GatewayClaudeEnrollment{Intent: in, Identity: GatewayClaudeIdentity{bundle.Account, bundle.Organization}, Envelope: envelope})
+	_, err = s.repository.CompleteGatewayClaudeConnect(ctx, GatewayClaudeEnrollment{Intent: in, Identity: GatewayClaudeIdentity{account: bundle.Account, organization: bundle.Organization, info: bundle.info}, Envelope: envelope})
 	if err != nil {
 		return empty, err
 	}
@@ -286,6 +294,16 @@ func claudeToken(value string) bool {
 
 func (s *GatewayNativeClaudeOAuth) exchange(ctx context.Context, body map[string]any, previous *gatewayClaudeBundle) (gatewayClaudeBundle, error) {
 	var empty gatewayClaudeBundle
+	var infoOrder int64
+	if source, ok := s.repository.(interface {
+		ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
+	}); ok {
+		var err error
+		infoOrder, err = source.ReserveGatewayAccountInfoOrder(ctx)
+		if err != nil {
+			return empty, ErrGatewayNativeIdentity
+		}
+	}
 	raw, _ := json.Marshal(body)
 	defer clear(raw)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauth.TokenURL, bytes.NewReader(raw))
@@ -341,7 +359,7 @@ func (s *GatewayNativeClaudeOAuth) exchange(ctx context.Context, body map[string
 	if !hasInference {
 		return empty, ErrGatewayNativeIdentity
 	}
-	b := gatewayClaudeBundle{Kind: "claude-oauth/v1", Revision: 1, AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: started.Add(time.Duration(token.ExpiresIn) * time.Second)}
+	b := gatewayClaudeBundle{Kind: "claude-oauth/v1", Revision: 1, AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: started.Add(time.Duration(token.ExpiresIn) * time.Second), ObservedAt: started}
 	if previous != nil {
 		b.Account, b.Organization = previous.Account, previous.Organization
 		b.Revision = previous.Revision + 1
@@ -361,6 +379,19 @@ func (s *GatewayNativeClaudeOAuth) exchange(ctx context.Context, body map[string
 	if !claudeUUID(b.Account) || !claudeUUID(b.Organization) {
 		return empty, ErrGatewayNativeIdentity
 	}
+	if infoOrder > 0 {
+		// A refresh may omit the entire optional account object. That partial
+		// response cannot erase facts from an earlier authenticated account read.
+		if token.Account != nil {
+			fields := GatewayAccountInfoEmptyFields(GatewayClaudeOAuthMessagesProfile)
+			account, _ := gatewayOAuthJSON(claims["account"])
+			if email, ok := gatewayOAuthString(account, "email_address"); ok && gatewayInfoText(email, 320) {
+				fields.Email = gatewayKnownFact(email, "provider_api", started)
+			}
+			b.info = append(b.info, GatewayAccountInfoObservation{Source: "account_check", Order: infoOrder, CredentialRevision: b.Revision, Fields: fields})
+		}
+		b.info = append(b.info, GatewayAccountInfoObservation{Source: "credential", Order: infoOrder, CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayClaudeOAuthMessagesProfile, b.ExpiresAt, started)})
+	}
 	return b, nil
 }
 
@@ -369,7 +400,39 @@ func (s *GatewayNativeClaudeOAuth) bundle(scope GatewayNativeCredentialScope, en
 	if s.open(scope, envelope, &b) != nil || b.Kind != "claude-oauth/v1" || b.Revision < 1 || b.Revision != p.CredentialRevision || !claudeToken(b.AccessToken) || !claudeToken(b.RefreshToken) || !claudeUUID(b.Account) || !claudeUUID(b.Organization) || b.Account != p.Subject || b.Organization != p.ProviderAccount || p.Issuer != GatewayClaudeOAuthIssuer || b.ExpiresAt.IsZero() {
 		return b, ErrGatewayNativeIdentity
 	}
+	if !b.ObservedAt.IsZero() && (!gatewayInfoInstant(b.ObservedAt.UTC().Format(time.RFC3339Nano)) || b.ObservedAt.After(b.ExpiresAt)) {
+		return b, ErrGatewayNativeIdentity
+	}
 	return b, nil
+}
+
+// Explicit bounded rollout for a selected existing logical account. Neither
+// account-info reads nor this hydration path perform provider HTTP or refresh.
+func (s *GatewayNativeClaudeOAuth) HydrateAccountInfo(ctx context.Context, scope GatewayNativeCredentialScope, operation string) error {
+	if s == nil || !claudeScope(ctx, scope, operation) {
+		return ErrGatewayNativeIdentity
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	p, envelope, release, err := s.repository.LockGatewayClaudePhysical(ctx, scope, operation, nil)
+	if err != nil {
+		return err
+	}
+	b, err := s.bundle(scope, envelope, p)
+	release()
+	if err != nil {
+		return err
+	}
+	// Legacy custody has no original observation instant. Backfill must not
+	// make the historical credential appear to have been freshly observed.
+	if b.ObservedAt.IsZero() {
+		return nil
+	}
+	writer, ok := s.repository.(GatewayAccountInfoWriter)
+	if !ok {
+		return ErrGatewayNativeIdentity
+	}
+	return writer.StoreGatewayAccountInfo(ctx, p, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayClaudeOAuthMessagesProfile, b.ExpiresAt, b.ObservedAt)}, true)
 }
 
 func (s *GatewayNativeClaudeOAuth) Descriptor(ctx context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthDescriptorResult, error) {
@@ -494,7 +557,7 @@ func (s *GatewayNativeClaudeOAuth) Refresh(ctx context.Context, scope GatewayNat
 	if s.refreshEntry(ctx, scope, connectOperation) != nil {
 		return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "unknown"}, ErrGatewayNativeIdentity
 	}
-	if err = s.repository.CompleteGatewayClaudeRefresh(ctx, p, refreshOperation, next); err != nil {
+	if err = s.repository.CompleteGatewayClaudeRefresh(ctx, p, refreshOperation, next, b.info...); err != nil {
 		return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "unknown"}, err
 	}
 	return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "completed", Version: p.CredentialRevision + 1}, nil

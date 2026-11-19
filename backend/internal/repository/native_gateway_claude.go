@@ -22,6 +22,12 @@ func NewGatewayNativeClaudeRepository(db *sql.DB) (service.GatewayNativeClaudeRe
 	}
 	return &gatewayClaudeRepository{db}, nil
 }
+func (r *gatewayClaudeRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) (int64, error) {
+	return NewGatewayAccountInfoRepository(r.db).ReserveGatewayAccountInfoOrder(ctx)
+}
+func (r *gatewayClaudeRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, o service.GatewayAccountInfoObservation, initialize bool) error {
+	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, o, initialize)
+}
 func claudeArgs(s service.GatewayNativeCredentialScope, op string) []any {
 	return []any{s.Consumer, op, s.Owner, s.Account, s.Generation, s.Purpose}
 }
@@ -104,7 +110,17 @@ func (r *gatewayClaudeRepository) CompleteGatewayClaudeConnect(ctx context.Conte
 	}
 	args := append(claudeArgs(s, op), id, birth, account, org)
 	_, err = tx.ExecContext(ctx, `UPDATE gateway_claude_connect_intents SET state='completed',material_envelope='',account_id=$7,native_created_at=$8,account_uuid=$9,organization_uuid=$10`+claudeWhere, args...)
-	if err != nil || tx.Commit() != nil {
+	if err != nil {
+		return out, service.ErrGatewayNativeIdentity
+	}
+	p := service.GatewayNativeOAuthPhysical{Scope: s, Operation: op, Route: claudeRoute(id, birth, s.Generation), Issuer: service.GatewayClaudeOAuthIssuer, Subject: account, ProviderAccount: org, CredentialRevision: 1}
+	for _, observation := range in.Identity.AccountInfo() {
+		observation.CredentialRevision = p.CredentialRevision
+		if storeGatewayAccountInfoTx(ctx, tx, p, observation, false) != nil {
+			return out, service.ErrGatewayNativeIdentity
+		}
+	}
+	if tx.Commit() != nil {
 		return out, service.ErrGatewayNativeIdentity
 	}
 	return service.GatewayNativeOAuthOutcome{Operation: op, AccountID: id, Generation: s.Generation, State: "staged"}, nil
@@ -208,7 +224,7 @@ func (r *gatewayClaudeRepository) ClaimGatewayClaudeRefresh(ctx context.Context,
 	}
 	return p, envelope, true, nil
 }
-func (r *gatewayClaudeRepository) CompleteGatewayClaudeRefresh(ctx context.Context, p service.GatewayNativeOAuthPhysical, attempt, envelope string) error {
+func (r *gatewayClaudeRepository) CompleteGatewayClaudeRefresh(ctx context.Context, p service.GatewayNativeOAuthPhysical, attempt, envelope string, info ...service.GatewayAccountInfoObservation) error {
 	tx, current, _, err := r.physicalTx(ctx, p.Scope, p.Operation, &p.Route, true, true)
 	if err != nil {
 		return err
@@ -234,7 +250,17 @@ func (r *gatewayClaudeRepository) CompleteGatewayClaudeRefresh(ctx context.Conte
 		return service.ErrGatewayNativeIdentity
 	}
 	n, _ = result.RowsAffected()
-	if n != 1 || tx.Commit() != nil {
+	if n != 1 {
+		return service.ErrGatewayNativeIdentity
+	}
+	current.CredentialRevision++
+	for _, observation := range info {
+		observation.CredentialRevision = current.CredentialRevision
+		if storeGatewayAccountInfoTx(ctx, tx, current, observation, false) != nil {
+			return service.ErrGatewayNativeIdentity
+		}
+	}
+	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity
 	}
 	return nil

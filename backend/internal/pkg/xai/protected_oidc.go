@@ -23,7 +23,7 @@ const ProtectedUserinfoURL = OAuthIssuer + "/oauth2/userinfo"
 
 var ErrProtectedIdentity = errors.New("protected xai identity unavailable")
 
-type ProtectedPrincipal struct{ Subject, Account string }
+type ProtectedPrincipal struct{ Subject, Account, Email, Name string }
 type protectedClaims struct {
 	jwt.RegisteredClaims
 	Nonce           string `json:"nonce"`
@@ -111,8 +111,10 @@ func VerifyProtectedPrincipal(ctx context.Context, client *http.Client, token, a
 		return out, ErrProtectedIdentity
 	}
 	var user struct {
-		Subject string `json:"sub"`
-		Team    string `json:"team_id"`
+		Subject string          `json:"sub"`
+		Team    string          `json:"team_id"`
+		Email   json.RawMessage `json:"email"`
+		Name    json.RawMessage `json:"name"`
 	}
 	if FetchProtectedJSON(ctx, client, ProtectedUserinfoURL, access, &user) != nil || user.Subject != claims.Subject || user.Team != claims.TeamID {
 		return out, ErrProtectedIdentity
@@ -124,7 +126,12 @@ func VerifyProtectedPrincipal(ctx context.Context, client *http.Client, token, a
 		}
 		account = "team:" + claims.TeamID
 	}
-	return ProtectedPrincipal{Subject: claims.Subject, Account: account}, nil
+	// Optional display fields come only from the authenticated, same-principal
+	// userinfo response. Invalid optional types cannot change login eligibility.
+	var email, name string
+	_ = json.Unmarshal(user.Email, &email)
+	_ = json.Unmarshal(user.Name, &name)
+	return ProtectedPrincipal{Subject: claims.Subject, Account: account, Email: email, Name: name}, nil
 }
 func ProtectedPrincipalPart(v string) bool {
 	if v == "" || len(v) > 512 || strings.TrimSpace(v) != v {
