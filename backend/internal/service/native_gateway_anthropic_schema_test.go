@@ -91,9 +91,9 @@ func TestGatewayNativeOfficialAnthropicOriginalSchemaBeforeSuccess(t *testing.T)
 					fmt.Fprintf(w, "data: %s\n\n", raw)
 				}
 			})
-			body := []byte(`{"model":"claude-sonnet-4-6","input":"Review","stream":true,"store":false,"max_output_tokens":512,"text":{"format":{"type":"json_schema","strict":true,"schema":` + schema + `}}}`)
+			body := []byte(`{"model":"claude-sonnet-4-6","input":"Review","stream":true,"store":false,"max_output_tokens":512,"text":{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,"schema":` + schema + `}}}`)
 			recorder, entered, err := call(body)
-			require.True(t, entered)
+			require.True(t, entered, "request admission failed: %v", err)
 			require.Equal(t, 1, requests)
 			if tc.ok {
 				require.NoError(t, err)
