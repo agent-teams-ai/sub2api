@@ -401,7 +401,7 @@ func TestGatewayNativeOAuthConnectHTTPImportStrictIngress(t *testing.T) {
 			require.JSONEq(t, accepted.Body.String(), replay.Body.String())
 			require.Equal(t, 1, entryCalls)
 			require.Equal(t, int32(1), f.tokens.Load())
-			require.Equal(t, int32(1), f.checks.Load())
+			require.Zero(t, f.checks.Load(), "import stages the verified identity; descriptor qualification owns the account check")
 			require.Equal(t, 1, f.enrolled.calls)
 			for _, secret := range f.secrets {
 				require.NotContains(t, accepted.Body.String()+replay.Body.String()+f.logs.String()+f.enrolled.reservation.Envelope, secret)
