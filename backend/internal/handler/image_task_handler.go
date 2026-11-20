@@ -103,7 +103,7 @@ func (h *AsyncImageHandler) Submit(c *gin.Context) {
 
 	taskCtx, recorder, cancel, err := newAsyncImageContext(c, body, h.tasks.ExecutionTimeout())
 	if err != nil {
-		if !middleware2.RejectRequestBodyMemoryOverload(c, err) {
+		if !middleware2.RejectRequestBodyReadError(c, "handler.image_task", err) {
 			imageTaskError(c, service.ErrImageTaskUnavailable)
 		}
 		return
@@ -268,7 +268,7 @@ func (h *AsyncImageHandler) failTask(taskID string, statusCode int, taskErr json
 func newAsyncImageContext(c *gin.Context, body []byte, timeoutDuration time.Duration) (*gin.Context, *httptest.ResponseRecorder, context.CancelFunc, error) {
 	// The task keeps body after Submit returns and the ingress reservation is
 	// released, so it holds the body, and whatever it buffers, on its own one.
-	retained, releaseBody, err := pkghttputil.DetachRequestBodyMemory(c.Request.Context(), int64(len(body)))
+	retained, releaseBody, err := pkghttputil.DetachRequestBodyMemory(c.Request.Context(), int64(cap(body)))
 	if err != nil {
 		return nil, nil, nil, err
 	}
