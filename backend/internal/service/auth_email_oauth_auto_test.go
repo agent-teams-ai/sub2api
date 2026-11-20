@@ -87,3 +87,37 @@ func TestEmailOAuthAuto_SnapshotsPlatformQuotaDefaults(t *testing.T) {
 	require.NotNil(t, geminiRecord.MonthlyLimitUSD)
 	require.InDelta(t, 100.0, *geminiRecord.MonthlyLimitUSD, 0.0001)
 }
+
+func TestEmailOAuthAuto_RespectsDomainQuotaAtCreation(t *testing.T) {
+	ctx := context.Background()
+	repo := &userRepoStub{nextID: 120, domainCounts: map[string]int{"custom.example": 0}}
+	svc := newEmailOAuthAutoAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled:                 "true",
+		SettingKeyRegistrationEmailSuffixWhitelist:    `["@example.com"]`,
+		SettingKeyRegistrationEmailDomainQuotaEnabled: "true",
+	}, nil)
+	first, err := svc.createEmailOAuthUser(ctx, "first@custom.example", "first", "github", "", "")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Equal(t, 1, repo.guardedCreates, "OAuth creation must use an atomic alias/domain guarded insert")
+
+	// Emulate an existing registration in the same domain as a second identity.
+	repo.domainCounts["custom.example"] = 1
+	second, err := svc.createEmailOAuthUser(ctx, "second@custom.example", "second", "github", "", "")
+	require.Nil(t, second)
+	require.ErrorIs(t, err, ErrEmailDomainRegistrationLimit)
+	require.Equal(t, 1, repo.guardedCreates)
+}
+
+func TestEmailOAuthAuto_RejectsOutsideWhitelistWithoutQuota(t *testing.T) {
+	repo := &userRepoStub{nextID: 121}
+	svc := newEmailOAuthAutoAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled:                 "true",
+		SettingKeyRegistrationEmailSuffixWhitelist:    `["@example.com"]`,
+		SettingKeyRegistrationEmailDomainQuotaEnabled: "false",
+	}, nil)
+	user, err := svc.createEmailOAuthUser(context.Background(), "first@custom.example", "first", "github", "", "")
+	require.Nil(t, user)
+	require.ErrorIs(t, err, ErrEmailSuffixNotAllowed)
+	require.Empty(t, repo.created)
+}
