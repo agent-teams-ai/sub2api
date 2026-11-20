@@ -260,7 +260,8 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
 		if HasGatewayNativeIdentity(account) {
-			return nil, ErrGatewayNativeEffectUnknown
+			// Same bare 502 as before; only the closed transport phase is reported.
+			return nil, gatewayNativeLegacyFailure(ctx, gatewayNativeFailureTransport)
 		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
