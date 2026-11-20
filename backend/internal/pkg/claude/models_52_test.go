@@ -19,7 +19,7 @@ func TestClaude52CatalogAndCapabilities(t *testing.T) {
 				}
 			}
 			require.Equal(t, 1, count)
-			for _, variant := range []string{id, "anthropic/" + id, "global.anthropic." + id, id + "-thinking", id + "-20261109"} {
+			for _, variant := range []string{id, "anthropic/" + id, "global.anthropic." + id, "anthropic/claude-" + family + "-5.2", "claude-" + family + "-5.2", id + "-thinking", id + "-20261109"} {
 				require.Equal(t, []string{"low", "medium", "high", "xhigh", "max"}, EffortLevelsForModel(variant))
 				require.Equal(t, family == "fable", IsFable52(variant))
 				require.Equal(t, family == "mythos", IsMythos52(variant))
