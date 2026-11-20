@@ -5,6 +5,7 @@ package antigravity
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -97,5 +98,38 @@ func TestClient_QuotaSummaryConnectionErrorCanFallback(t *testing.T) {
 	requestErr := &url.Error{Op: "Post", URL: "https://example.invalid", Err: &url.Error{Op: "dial", Err: http.ErrServerClosed}}
 	if !shouldFallbackToNextURL(requestErr, 0) {
 		t.Fatal("quota summary must fall back on connection errors")
+	}
+}
+
+type quotaSummaryRedirectRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn quotaSummaryRedirectRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestClient_RetrieveUserQuotaSummaryFromURL_DoesNotFollowTrustedHostRedirect(t *testing.T) {
+	calls := 0
+	client := &Client{httpClient: &http.Client{Transport: quotaSummaryRedirectRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header: http.Header{"Location": []string{BaseURLs[0] + "/redirected"}},
+				Body: io.NopCloser(strings.NewReader("redirect")),
+				Request: req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(quotaSummaryBody)),
+			Request: req,
+		}, nil
+	})}}
+	_, err := client.RetrieveUserQuotaSummaryFromURL(context.Background(), BaseURLs[0], "sensitive-token", "proj")
+	if err == nil {
+		t.Fatal("fixed-endpoint quota summary must reject redirects")
+	}
+	if calls != 1 {
+		t.Fatalf("redirect must not be followed even to an allowed BaseURL host; got %d calls", calls)
 	}
 }

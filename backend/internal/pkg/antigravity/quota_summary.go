@@ -46,7 +46,7 @@ type QuotaSummaryResponse struct {
 func (c *Client) RetrieveUserQuotaSummary(ctx context.Context, accessToken, projectID string) (*QuotaSummaryResponse, error) {
 	var lastErr error
 	for urlIdx, baseURL := range BaseURLs {
-		summary, status, err := c.retrieveUserQuotaSummary(ctx, baseURL, accessToken, projectID)
+		summary, status, err := c.retrieveUserQuotaSummary(ctx, baseURL, accessToken, projectID, false)
 		if err == nil {
 			DefaultURLAvailability.MarkSuccess(baseURL)
 			return summary, nil
@@ -66,11 +66,11 @@ func (c *Client) RetrieveUserQuotaSummaryFromURL(ctx context.Context, baseURL, a
 	if baseURL == "" {
 		return nil, errors.New("retrieveUserQuotaSummary base URL is required")
 	}
-	summary, _, err := c.retrieveUserQuotaSummary(ctx, baseURL, accessToken, projectID)
+	summary, _, err := c.retrieveUserQuotaSummary(ctx, baseURL, accessToken, projectID, true)
 	return summary, err
 }
 
-func (c *Client) retrieveUserQuotaSummary(ctx context.Context, baseURL, accessToken, projectID string) (*QuotaSummaryResponse, int, error) {
+func (c *Client) retrieveUserQuotaSummary(ctx context.Context, baseURL, accessToken, projectID string, fixedEndpoint bool) (*QuotaSummaryResponse, int, error) {
 	if c == nil || c.httpClient == nil {
 		return nil, 0, errors.New("antigravity client is not configured")
 	}
@@ -86,7 +86,12 @@ func (c *Client) retrieveUserQuotaSummary(ctx context.Context, baseURL, accessTo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", GetUserAgentForContext(ctx))
 
-	resp, err := servertiming.Do(c.fetchAvailableModelsHTTPClient(), req)
+	fetchClient := c.fetchAvailableModelsHTTPClient()
+	if fixedEndpoint {
+		// Like FetchAvailableModelsFromURL, never switch endpoints for a pinned account.
+		fetchClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	resp, err := servertiming.Do(fetchClient, req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("retrieveUserQuotaSummary request failed: %w", err)
 	}
