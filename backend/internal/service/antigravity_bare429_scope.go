@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -21,6 +22,12 @@ const antigravityBare429CooledAccountKey = "antigravity_bare429_cooled_account_i
 // Google's statement about the account and is not bare.
 func isBareAntigravity429(statusCode int, body []byte) bool {
 	if statusCode != http.StatusTooManyRequests {
+		return false
+	}
+	message := strings.TrimSpace(strings.ToLower(gjson.GetBytes(body, "error.message").String()))
+	if !strings.HasPrefix(message, "resource has been exhausted") ||
+		gjson.GetBytes(body, "error.code").Int() != http.StatusTooManyRequests ||
+		gjson.GetBytes(body, "error.status").String() != "RESOURCE_EXHAUSTED" {
 		return false
 	}
 	if gjson.GetBytes(body, "error.details").Exists() {
@@ -59,7 +66,7 @@ func (s *AntigravityGatewayService) handleUpstreamErrorAfterRetryLoop(
 	requestedModel string,
 	groupID int64, sessionHash string, isStickySession bool,
 ) *handleModelRateLimitResult {
-	if isBareAntigravity429(statusCode, body) && !claimBare429Cooldown(c, account.ID) {
+	if account.ShouldHandleErrorCode(statusCode) && isBareAntigravity429(statusCode, body) && !claimBare429Cooldown(c, account.ID) {
 		logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d bare_429_cooldown_skipped account=%d (after retry loop)", prefix, statusCode, account.ID)
 		return nil
 	}
