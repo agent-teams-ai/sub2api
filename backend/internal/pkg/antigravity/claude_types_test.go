@@ -100,3 +100,27 @@ func TestIsGeminiReasoningModel_IncludesProAgent(t *testing.T) {
 		t.Fatal("did not expect gemini-2.5-flash to be recognized as a Gemini reasoning model")
 	}
 }
+
+func TestClaudeOutputConfigAcceptsNonStringEffort(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{`{"output_config":{"effort":"high"}}`, "high"},
+		{`{"output_config":{"effort":7}}`, ""},
+		{`{"output_config":{"effort":true}}`, ""},
+		{`{"output_config":{"effort":{"name":"high"}}}`, ""},
+		{`{"output_config":{"effort":null}}`, ""},
+		{`{"output_config":{"effort":["high"]}}`, ""},
+		{`{"output_config":{"other":"ignored"}}`, ""},
+	} {
+		var request ClaudeRequest
+		if err := json.Unmarshal([]byte(tt.input), &request); err != nil {
+			t.Fatalf("unmarshal %s: %v", tt.input, err)
+		}
+		if request.OutputConfig == nil || request.OutputConfig.Effort != tt.want {
+			t.Fatalf("unmarshal %s: effort = %+v; want %q", tt.input, request.OutputConfig, tt.want)
+		}
+	}
+	var req ClaudeRequest
+	if err := json.Unmarshal([]byte(`{"output_config":true}`), &req); err == nil {
+		t.Fatal("non-object output_config must still fail")
+	}
+}
