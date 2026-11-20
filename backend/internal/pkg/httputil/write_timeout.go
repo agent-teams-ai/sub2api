@@ -91,7 +91,9 @@ func (w *writeTimeoutWriter) FlushError() error {
 	}
 	defer w.finish()
 	err := http.NewResponseController(w.ResponseWriter).Flush()
-	w.fail(err)
+	if !errors.Is(err, http.ErrNotSupported) {
+		w.fail(err)
+	}
 	return err
 }
 
