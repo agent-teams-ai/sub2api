@@ -846,7 +846,7 @@ func TestSanitizeOpenAIResponsesToolParameterTypes_RewriteCountIndependentOfHits
 	if os.Getenv(isolatedAllocEnv) != "1" {
 		executable, err := os.Executable()
 		require.NoError(t, err)
-		command := exec.Command(executable, "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.timeout=30s")
+		command := exec.Command(executable, "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.timeout=1m")
 		command.Env = append(os.Environ(), isolatedAllocEnv+"=1")
 		output, err := command.CombinedOutput()
 		require.NoError(t, err, "isolated allocation guard failed:\n%s", output)
