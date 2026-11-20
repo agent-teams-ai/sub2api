@@ -433,6 +433,7 @@ func cleanJSONSchemaRecursive(value any) any {
 			// If we mandated string values, we must ensure type is string
 			if hasNonString {
 				schemaMap["type"] = "string"
+				delete(schemaMap, "items")
 			}
 		}
 	}
