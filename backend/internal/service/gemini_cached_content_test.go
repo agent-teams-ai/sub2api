@@ -613,3 +613,39 @@ func TestGeminiCachedContentCreateUpstreamGateway(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "https://upstream.example.com/gw/v1beta/cachedContents/gatewayid0001", resource)
 }
+
+func TestGeminiCachedContentLocationUsesValidatedDecodedReference(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "Vertex resource",
+			body: `{"cachedContent":"projects/project1/locations/us-central1/cachedContents/cache1"}`,
+			want: "us-central1",
+		},
+		{
+			name: "escaped JSON slashes",
+			body: `{"cachedContent":"projects/project1/locations/us-central1\/cachedContents\/cache1"}`,
+			want: "us-central1",
+		},
+		{
+			name: "nested Vertex resource",
+			body: `{"generateContentRequest":{"cachedContent":"projects/project1/locations/europe-west1/cachedContents/cache1"}}`,
+			want: "europe-west1",
+		},
+		{
+			name: "conflicting references cannot select arbitrary region",
+			body: `{"cachedContent":"projects/project1/locations/us-central1/cachedContents/cache1","generateContentRequest":{"cachedContent":"projects/project1/locations/europe-west1/cachedContents/cache2"}}`,
+		},
+		{
+			name: "duplicate keys cannot select arbitrary region",
+			body: `{"cachedContent":"projects/project1/locations/us-central1/cachedContents/cache1","cachedContent":"projects/project1/locations/europe-west1/cachedContents/cache2"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, geminiCachedContentLocationInBody([]byte(tc.body)))
+		})
+	}
+}
