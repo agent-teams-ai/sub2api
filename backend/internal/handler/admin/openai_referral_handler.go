@@ -52,7 +52,8 @@ func (h *OpenAIOAuthHandler) RefreshReferrals(c *gin.Context) {
 	}
 	eligibility, err := h.referralService.QueryReferralEligibility(c.Request.Context(), id)
 	if err != nil {
-		scopedOpenAIError(c, err)
+		// Referral errors contain fixed, user-facing reasons; preserve their status and reason fields.
+		response.ErrorFrom(c, err)
 		return
 	}
 	if eligibility == nil {
@@ -79,7 +80,8 @@ func (h *OpenAIOAuthHandler) SendReferralInvite(c *gin.Context) {
 	}
 	result, err := h.referralService.SendReferralInvite(c.Request.Context(), id, input)
 	if err != nil {
-		scopedOpenAIError(c, err)
+		// Referral errors contain fixed, user-facing reasons; preserve their status and reason fields.
+		response.ErrorFrom(c, err)
 		return
 	}
 	if result == nil || !result.Sent {
