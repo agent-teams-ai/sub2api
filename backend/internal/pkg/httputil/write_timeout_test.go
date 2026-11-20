@@ -143,3 +143,20 @@ func TestWriteTimeoutFlushCancelsContextAndRemembersFailure(t *testing.T) {
 	_, err = w.Write([]byte("must not retry after failed flush"))
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 }
+
+func TestWriteTimeoutUnsupportedFlushKeepsWriterUsable(t *testing.T) {
+	base := httptest.NewRecorder()
+	// Wrapping in the http.ResponseWriter interface deliberately removes the
+	// optional Flusher and SetWriteDeadline methods.
+	bare := struct{ http.ResponseWriter }{ResponseWriter: base}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &writeTimeoutWriter{ResponseWriter: bare, timeout: time.Second, cancel: cancel}
+	require.ErrorIs(t, w.FlushError(), http.ErrNotSupported)
+	require.NoError(t, ctx.Err())
+	n, err := w.Write([]byte("still writable"))
+	require.NoError(t, err)
+	require.Equal(t, len("still writable"), n)
+	require.Equal(t, "still writable", base.Body.String())
+	require.NoError(t, ctx.Err())
+}
