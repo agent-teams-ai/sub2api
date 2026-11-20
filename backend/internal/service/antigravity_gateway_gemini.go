@@ -487,6 +487,9 @@ func cleanGeminiRequest(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, err
 	}
+	if envelope == nil {
+		return nil, fmt.Errorf("invalid Gemini request envelope: expected a JSON object")
+	}
 	// Rewrite individual tool parameter schemas instead of decoding and
 	// re-marshaling the entire payload. The latter reorders unrelated JSON
 	// properties and converts large integers to float64.
