@@ -8,7 +8,12 @@ import (
 // SupportsMultimodalFunctionResponses reports whether tool media can remain
 // inside functionResponse.parts (Gemini 3 and later).
 func SupportsMultimodalFunctionResponses(model string) bool {
-	model = strings.TrimPrefix(model, "models/")
+	model = strings.ToLower(strings.TrimSpace(model))
+	if idx := strings.LastIndex(model, "/models/"); idx >= 0 {
+		model = model[idx+len("/models/"):]
+	} else {
+		model = strings.TrimPrefix(model, "models/")
+	}
 	version, ok := strings.CutPrefix(model, "gemini-")
 	if !ok {
 		return false
