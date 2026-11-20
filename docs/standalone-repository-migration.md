@@ -25,10 +25,12 @@ The exact **current** branch HEAD must be read from GitHub at execution time. PR
 
 Run `scripts/github/probe-sub2api-standalone.sh` on a network-capable machine with authenticated `git` and `gh` and permission to create an organization repository. The script:
 
-1. Checks the source is a fork, verifies that the destination does **not** exist, resolves the **live** main and PR HEAD, and verifies their exact SHAs from a bare clone **before** creating anything.
-2. Creates an **empty public standalone** repository (not a GitHub fork or template) and pushes the exact existing main and PR feature branch, **preserving commit history and tree SHA**.
-3. Checks `isFork=false`, both remote commit SHAs, and the feature branch Git tree before creating a new PR against its main.
+1. Checks the source is a fork, configures Git authentication through `gh auth setup-git --hostname github.com`, resolves the **live** main and PR HEAD, verifies both refs and their Git tree in a bare clone, and rechecks source identity **before** creating anything.
+2. Creates an **empty public standalone** repository (not a GitHub fork or template), or safely resumes a matching earlier partial trial only after verifying `fork: false`, public visibility, expected description, allowed refs and identical SHAs. Pushes exactly `main` and the PR branch **without force**, preserving Git history.
+3. Checks `isFork=false`, both remote commit SHAs, and the feature branch Git tree before opening a PR; reruns reuse a matching still-open PR and never create a duplicate.
 4. Does **not** transfer tags/other branches, secrets, settings, PR comments, issues, or Actions history; does **not** archive/delete/rename the original, change the original main, or merge the new PR.
+
+If interrupted after repository creation, rerun the script against the **same exact source SHA**. It will resume only if the destination still contains solely the allowed matching refs. Any unexpected branch, tag, SHA, visibility, fork status, description or closed PR causes a safe refusal; inspect manually rather than deleting, resetting, force-pushing or overwriting an existing repository. If the source branch advanced, do **not** update a stale trial in place; inspect both repositories before choosing a new safe trial name.
 
 The trial **only** tests whether actual GitHub Actions `CI`, `Security Scan` and `Account gateway native qualification` runs are created in the independent repository. A queued CodeQL dynamic run or a successful AI review does not count as E2E.
 
@@ -44,7 +46,7 @@ The trial **only** tests whether actual GitHub Actions `CI`, `Security Scan` and
 
 - Deliberately migrate other required Git branches, tags, issues/PR references, organization permissions, branch protections/rulesets, repository secrets/variables, environments, webhooks, CI integration and consumer URLs. **Version tags are held back during the initial trial because pushing them may trigger a release/deployment.**
 - Keep old PR #106 and review evidence accessible at its original URL. Git push does **not** transfer GitHub issues, PR comments, reviews, rulesets or Actions run history.
-- For every developer clone, set `origin` to the new standalone repo and add the local Git remote `upstream` pointing to `https://github.com/Wei-Shaw/sub2api.git`. Git remotes are local configuration and do **not** restore GitHub's `forked from` UI relation or auto-sync.
+- For each developer clone after successful promotion, set `origin` to the new standalone repo, and **set or add** `upstream` to `https://github.com/Wei-Shaw/sub2api.git`. An existing `upstream` must use `git remote set-url upstream https://github.com/Wei-Shaw/sub2api.git`; if absent, use `git remote add upstream https://github.com/Wei-Shaw/sub2api.git`. Git remotes are local configuration and do **not** restore GitHub's `forked from` UI relation or auto-sync.
 - Repoint dependencies and CI references, then mark the old fork's description/README **deprecated** while keeping it available for historical links. Do not detach/delete its fork network, which could discard GitHub metadata.
 
 If new non-fork Actions also fail to start, **do not migrate or deprecate**: investigate repository/organization Actions policy. The old repository remains canonical until a fully qualified cutover.
