@@ -44,6 +44,23 @@ func TestScopedAccountLookupPreservesInfrastructureError(t *testing.T) {
 	require.Equal(t, 404, infraerrors.Code(err), "missing accounts must remain hidden as 404")
 }
 
+func TestScopedParentAccountLookupPreservesInfrastructureError(t *testing.T) {
+	parentID := int64(2)
+	shadow := &Account{
+		ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		GroupIDs: []int64{1}, ParentAccountID: &parentID,
+	}
+	ctx := scopedStatisticsServiceContext("accounts.usage.read")
+	storageErr := fmt.Errorf("parent database unavailable")
+	err := scopedAccountAccess(ctx, &scopedAccountLookupErrorRepo{err: storageErr}, shadow, "accounts.usage.read", true)
+	require.ErrorIs(t, err, storageErr)
+	require.Equal(t, 500, infraerrors.Code(err), "parent database outage must not be hidden as a 404")
+
+	notFound := fmt.Errorf("wrapped missing: %w", ErrAccountNotFound)
+	err = scopedAccountAccess(ctx, &scopedAccountLookupErrorRepo{err: notFound}, shadow, "accounts.usage.read", true)
+	require.Equal(t, 404, infraerrors.Code(err))
+}
+
 func TestScopedAdminUsageServiceRechecksScopeBeforeSnapshot(t *testing.T) {
 	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, GroupIDs: []int64{2}, Extra: map[string]any{"codex_5h_used_percent": 25.0}}
 	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{1: a}}

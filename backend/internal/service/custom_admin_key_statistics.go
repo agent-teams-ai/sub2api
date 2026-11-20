@@ -36,7 +36,13 @@ func scopedAccountAccess(ctx context.Context, repo AccountRepository, a *Account
 			return denied()
 		}
 		source, err := repo.GetByID(ctx, *a.ParentAccountID)
-		if err != nil || source == nil || source.IsShadow() || !p.Policy.AllowsAccount(action, scopedAccountResource(source)) {
+		if err != nil {
+			if errors.Is(err, ErrAccountNotFound) {
+				return denied()
+			}
+			return err
+		}
+		if source == nil || source.IsShadow() || !p.Policy.AllowsAccount(action, scopedAccountResource(source)) {
 			return denied()
 		}
 	}

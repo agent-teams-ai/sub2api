@@ -249,7 +249,7 @@ func (s *AntigravityGatewayService) streamUpstreamResponse(c *gin.Context, resp 
 				if errors.Is(ev.err, bufio.ErrTooLong) {
 					logger.LegacyPrintf("service.antigravity_gateway", "Upstream SSE event exceeded configured limits: %v", ev.err)
 					if !cw.Disconnected() {
-						MarkOpsStreamError(c, "response_too_large", "upstream SSE event exceeded configured limits", http.StatusBadGateway)
+						MarkOpsStreamFailure(c, "response_too_large", "response_too_large", "upstream SSE event exceeded configured limits", http.StatusBadGateway)
 						cw.Fprintf("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"response_too_large\",\"message\":\"upstream SSE event exceeded configured limits\"}}\n\n")
 					}
 					return &antigravityStreamResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: cw.Disconnected()}

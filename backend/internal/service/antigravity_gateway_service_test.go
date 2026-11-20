@@ -1276,6 +1276,10 @@ func TestStreamUpstreamResponse_OversizedEventSendsError(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "event: error")
 	require.Contains(t, rec.Body.String(), "response_too_large")
 	require.NotContains(t, rec.Body.String(), strings.Repeat("x", 512))
+	ops, marked := GetOpsStreamError(c)
+	require.True(t, marked)
+	require.True(t, ops.CountTowardsSLA, "oversized stream must count as failed despite HTTP 200")
+	require.Equal(t, http.StatusBadGateway, ops.IntendedStatus)
 }
 
 func TestStreamUpstreamResponse_NormalComplete(t *testing.T) {
