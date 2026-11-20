@@ -126,3 +126,17 @@ func TestCleanGeminiRequest_SnakeCaseToolDeclarationsKeepExactJSON(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, string(body), string(out), "unchanged snake_case schemas retain exact client bytes")
 }
+
+func TestCleanGeminiRequest_ToolSchemaPreservesUnrelatedJSONAndLargeIntegers(t *testing.T) {
+	body := []byte(`{"tools":[{"functionDeclarations":[{"name":"extract","parameters":{"type":"object","properties":{"count":{"type":"integer","enum":[9007199254740993]},"title":{"type":"string","maxLength":40}}}}]}],"generationConfig":{"responseJsonSchema":{"type":"object","properties":{"value":{"type":"integer","enum":[9007199254740993]}}}},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	out, err := cleanGeminiRequest(body)
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "9007199254740992")
+	require.Contains(t, string(out), "9007199254740993")
+	require.Less(t, strings.Index(string(out), `"tools"`), strings.Index(string(out), `"generationConfig"`))
+	require.Less(t, strings.Index(string(out), `"generationConfig"`), strings.Index(string(out), `"contents"`))
+	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.count.enum.0").Raw)
+	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "generationConfig.responseSchema.properties.value.enum.0").Raw)
+	require.False(t, gjson.GetBytes(out, "generationConfig.responseJsonSchema").Exists())
+	require.True(t, gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.title.description").Exists())
+}
