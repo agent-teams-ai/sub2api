@@ -25,7 +25,7 @@ The exact **current** branch HEAD must be read from GitHub at execution time. PR
 
 Run `scripts/github/probe-sub2api-standalone.sh` on a network-capable machine with authenticated `git` and `gh` and permission to create an organization repository. The script:
 
-1. Checks the source is a fork, configures Git authentication through `gh auth setup-git --hostname github.com`, resolves the **live** main and PR HEAD, verifies both refs and their Git tree in a bare clone, and rechecks source identity **before** creating anything.
+1. Checks the source is a fork, configures Git authentication through `gh auth setup-git --hostname github.com`, resolves the **live** main and PR HEAD, verifies both refs and their Git tree in a bare clone, and rechecks the exact source main and PR refs **before** creating anything.
 2. Creates an **empty public standalone** repository (not a GitHub fork or template), or safely resumes a matching earlier partial trial only after verifying `fork: false`, public visibility, expected description, allowed refs and identical SHAs. Pushes exactly `main` and the PR branch **without force**, preserving Git history.
 3. Checks `isFork=false`, both remote commit SHAs, and the feature branch Git tree before opening a PR; reruns reuse a matching still-open PR and never create a duplicate.
 4. Does **not** transfer tags/other branches, secrets, settings, PR comments, issues, or Actions history; does **not** archive/delete/rename the original, change the original main, or merge the new PR.
