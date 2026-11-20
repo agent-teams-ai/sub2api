@@ -89,3 +89,14 @@ func TestExaProvider_SearchHTTPError(t *testing.T) {
 
 	require.ErrorContains(t, err, "exa: status 401")
 }
+
+func TestExaProvider_ClampsTooManyResults(t *testing.T) {
+	var seen http.Request
+	var seenBody []byte
+	p := NewExaProvider("k", exaTestClient(http.StatusOK, `{"results":[]}`, &seen, &seenBody))
+	_, err := p.Search(context.Background(), SearchRequest{Query: "many", MaxResults: 10000})
+	require.NoError(t, err)
+	var body struct { NumResults int `json:"numResults"` }
+	require.NoError(t, json.Unmarshal(seenBody, &body))
+	require.Equal(t, 100, body.NumResults)
+}
