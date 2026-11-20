@@ -2171,8 +2171,9 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 	var outputs []ResponsesOutput
 	if state.Reasoning.Len() > 0 {
 		outputs = append(outputs, ResponsesOutput{
-			Type: "reasoning",
-			ID:   generateItemID(),
+			Type:   "reasoning",
+			ID:     state.ReasoningItemID,
+			Status: "completed",
 			Summary: []ResponsesSummary{{
 				Type: "summary_text",
 				Text: state.Reasoning.String(),
@@ -2203,7 +2204,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsCustom[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:   "custom_tool_call",
-				ID:     generateItemID(),
+				ID:     state.ToolItemIDs[i],
 				CallID: toolCall.ID,
 				Name:   customNameForStreamTool(state, toolCall.Function.Name),
 				Input:  extractCustomToolCallInput(arguments),
@@ -2214,7 +2215,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsToolSearch[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:      "tool_search_call",
-				ID:        generateItemID(),
+				ID:        state.ToolItemIDs[i],
 				CallID:    toolCall.ID,
 				Arguments: arguments,
 				Status:    "completed",
@@ -2227,7 +2228,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		}
 		outputs = append(outputs, ResponsesOutput{
 			Type:      "function_call",
-			ID:        generateItemID(),
+			ID:        state.ToolItemIDs[i],
 			CallID:    toolCall.ID,
 			Name:      name,
 			Namespace: namespace,

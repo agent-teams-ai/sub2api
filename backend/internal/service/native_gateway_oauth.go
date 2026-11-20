@@ -37,9 +37,12 @@ var ErrGatewayOAuthConflict = errors.New("gateway oauth enrollment conflict")
 
 // Only Verify produces a nonzero identity. This upstream principal is not RR
 // owner authority, an account-check ID, a workspace, or dispatch qualification.
+// The private info field is a display-only projection of verified claims;
+// it grants no principal, ownership, model or dispatch authority.
 type GatewayNativeOAuthIdentity struct {
 	issuer, subject string
 	expiresAt       time.Time
+	info            GatewayAccountInfoFields
 }
 
 func (i GatewayNativeOAuthIdentity) Principal() (string, string) { return i.issuer, i.subject }
@@ -68,42 +71,8 @@ func NewGatewayNativeOAuthVerifier(transport http.RoundTripper) *GatewayNativeOA
 // Reject duplicate decoded names, case aliases and invalid UTF-8 before the
 // maintained JWT parser sees claims. The same rule protects nested metadata.
 func gatewayOAuthJSON(raw []byte) (map[string]json.RawMessage, error) {
-	if len(raw) > gatewayOAuthBundleLimit || !utf8.Valid(raw) {
+	if len(raw) > gatewayOAuthBundleLimit || !gatewayOAuthUnicodeValid(raw) {
 		return nil, ErrGatewayNativeIdentity
-	}
-	// encoding/json replaces unpaired UTF-16 surrogates. Reject them instead of
-	// projecting a different signed subject/critical name into identity authority.
-	for i := 0; i < len(raw); i++ {
-		if raw[i] != '\\' {
-			continue
-		}
-		i++
-		if i >= len(raw) {
-			return nil, ErrGatewayNativeIdentity
-		}
-		if raw[i] != 'u' {
-			continue
-		}
-		if i+4 >= len(raw) {
-			return nil, ErrGatewayNativeIdentity
-		}
-		n, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
-		if err != nil {
-			return nil, ErrGatewayNativeIdentity
-		}
-		i += 4
-		if n >= 0xd800 && n <= 0xdbff {
-			if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
-				return nil, ErrGatewayNativeIdentity
-			}
-			low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
-			if err != nil || low < 0xdc00 || low > 0xdfff {
-				return nil, ErrGatewayNativeIdentity
-			}
-			i += 6
-		} else if n >= 0xdc00 && n <= 0xdfff {
-			return nil, ErrGatewayNativeIdentity
-		}
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
@@ -164,6 +133,46 @@ func gatewayOAuthJSON(raw []byte) (map[string]json.RawMessage, error) {
 		return nil, ErrGatewayNativeIdentity
 	}
 	return result, nil
+}
+func gatewayOAuthUnicodeValid(raw []byte) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	// encoding/json replaces unpaired UTF-16 surrogates. Reject them instead of
+	// projecting a different signed subject/critical name into identity authority.
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		n, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if n >= 0xd800 && n <= 0xdbff {
+			if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+				return false
+			}
+			low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		} else if n >= 0xdc00 && n <= 0xdfff {
+			return false
+		}
+	}
+	return true
 }
 func gatewayOAuthString(m map[string]json.RawMessage, name string) (string, bool) {
 	var value string
@@ -286,7 +295,7 @@ func (v *GatewayNativeOAuthVerifier) Verify(ctx context.Context, encoded string)
 	if err != nil || !token.Valid {
 		return deny()
 	}
-	return GatewayNativeOAuthIdentity{issuer: issuer, subject: subject, expiresAt: time.Unix(exp, 0)}, nil
+	return GatewayNativeOAuthIdentity{issuer: issuer, subject: subject, expiresAt: time.Unix(exp, 0), info: gatewayVerifiedCodexInfo(claims, now)}, nil
 }
 func (v *GatewayNativeOAuthVerifier) key(ctx context.Context, kid string) (key *rsa.PublicKey, retErr error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, gatewayOAuthJWKS, nil)
@@ -381,6 +390,7 @@ type GatewayNativeOAuthBundle struct {
 	SensitiveMetadata json.RawMessage `json:"sensitive_metadata"`
 	// Only a fresh fixed-origin token exchange sets this; never part of replay bytes.
 	requestStarted time.Time
+	info           []GatewayAccountInfoObservation
 }
 
 func (b GatewayNativeOAuthBundle) bytes() ([]byte, error) {

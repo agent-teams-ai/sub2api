@@ -80,7 +80,11 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 			if mode.Load() == 3 {
 				subject = verifiedForeign
 			}
-			body, _ := json.Marshal(map[string]string{"sub": subject, "team_id": team})
+			email, name := "grok-initial@example.test", "Initial reviewer"
+			if exchanges.Load() > 1 {
+				email, name = "grok-refreshed@example.test", "Refreshed reviewer"
+			}
+			body, _ := json.Marshal(map[string]string{"sub": subject, "team_id": team, "email": email, "name": name})
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
 		}
 		exchanges.Add(1)
@@ -186,12 +190,43 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	require.Equal(t, "controlled-source-v1", descriptor.Qualification)
 	require.NotNil(t, descriptor.Native)
 	route := *descriptor.Native
+	infoStore := NewGatewayAccountInfoRepository(db)
+	infoInput := service.GatewayAccountLimitsInput{OwnerRef: scope.Owner, AccountRef: scope.Account, ProfileID: route.Profile}
+	initialized := func() bool {
+		p, _, _, _, release, e := source.LockGatewayGrokMaintenance(ownerCtx, scope, op)
+		require.NoError(t, e)
+		release()
+		return p.AccountInfoInitialized
+	}
+	require.True(t, initialized())
+	initialInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Len(t, initialInfo.Sources, 2, "verified enrollment publishes facts in its own transaction")
+	require.Equal(t, "grok-initial@example.test", *initialInfo.Sources["account_check"].Fields.Email.Value)
+	require.Equal(t, "Initial reviewer", *initialInfo.Sources["account_check"].Fields.AccountLabel.Value)
+	require.Equal(t, "unknown", initialInfo.Sources["account_check"].Fields.Subscription.Status)
+	require.NoError(t, grok.HydrateAccountInfo(ownerCtx, scope, op))
+	unchangedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Equal(t, initialInfo, unchangedInfo)
+	require.EqualValues(t, 1, exchanges.Load(), "metadata hydration adds no OAuth effects")
+	_, err = db.ExecContext(ctx, `DELETE FROM gateway_account_info_snapshots WHERE account_id=$1`, route.AccountID)
+	require.NoError(t, err)
+	require.False(t, initialized())
+	require.NoError(t, grok.HydrateAccountInfo(ownerCtx, scope, op))
+	require.True(t, initialized())
+	hydratedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Len(t, hydratedInfo.Sources, 1)
+	require.EqualValues(t, 0, hydratedInfo.Sources["credential"].Order)
+	require.Equal(t, initialInfo.Sources["credential"].Fields.CredentialExpiresAt, hydratedInfo.Sources["credential"].Fields.CredentialExpiresAt)
 	gatewayAccountLimitsV2GrokPostgresFixture(t, ownerCtx, db, scope, op, route)
 	var stored string
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT credentials::text||extra::text FROM accounts WHERE id=$1`, route.AccountID).Scan(&stored))
 	require.NotContains(t, stored, "fixture-access-private")
 	require.NotContains(t, stored, "fixture-refresh-private")
 	require.NotContains(t, stored, "id_token")
+	require.NotContains(t, stored, "grok-initial@example.test")
 	for _, sql := range []string{`UPDATE accounts SET schedulable=true WHERE id=$1`, `UPDATE accounts SET credentials='{}'::jsonb WHERE id=$1`, `UPDATE accounts SET extra='{}'::jsonb WHERE id=$1`, `DELETE FROM accounts WHERE id=$1`} {
 		_, e := db.ExecContext(ctx, sql, route.AccountID)
 		require.Error(t, e)
@@ -219,6 +254,13 @@ func TestGatewayNativeGrokPostgresProtectedOAuthLifecycle(t *testing.T) {
 	entry.Release()
 	require.NoError(t, <-refreshDone)
 	require.EqualValues(t, 2, exchanges.Load())
+	refreshedInfo, err := infoStore.ReadGatewayAccountInfo(ownerCtx, infoInput, route)
+	require.NoError(t, err)
+	require.Greater(t, refreshedInfo.Revision, hydratedInfo.Revision)
+	require.EqualValues(t, 2, refreshedInfo.CredentialRevision)
+	require.EqualValues(t, 2, refreshedInfo.Sources["credential"].CredentialRevision)
+	require.Equal(t, "grok-refreshed@example.test", *refreshedInfo.Sources["account_check"].Fields.Email.Value)
+	require.Equal(t, "Refreshed reviewer", *refreshedInfo.Sources["account_check"].Fields.AccountLabel.Value)
 	again, err := grok.Refresh(ownerCtx, scope, op, refreshOp)
 	require.NoError(t, err)
 	require.Equal(t, "completed", again.State)

@@ -35,6 +35,27 @@ func RegisterGatewayNativeOAuthConnectRoutes(group *gin.RouterGroup, connect *se
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"code": "native_connect_unavailable"})
 	}
 	control := group.Group("/private/native/v1/oauth", authorize)
+	control.POST("/connect/import", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, service.GatewayOAuthImportBodyLimit+1))
+		req, valid := service.DecodeGatewayNativeOAuthImport(raw)
+		if err != nil || !valid || c.Request.URL.RawQuery != "" {
+			fail(c)
+			return
+		}
+		consumer, err := service.GatewayNativeConsumer(c.Request.Context())
+		if err != nil {
+			fail(c)
+			return
+		}
+		scope := service.GatewayNativeCredentialScope{Consumer: consumer, Owner: req.Owner, Account: req.Account, Generation: req.Generation, Purpose: service.GatewayOAuthBundlePurpose}
+		out, err := connect.ImportConnect(c.Request.Context(), scope, req.Operation, req.Method, req.Input)
+		if err != nil {
+			fail(c)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	})
 	control.POST("/connect", func(c *gin.Context) {
 		var req gatewayConnectInput
 		if !gatewayConnectDecode(c, &req, true) {

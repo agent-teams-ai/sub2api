@@ -61,3 +61,19 @@ func composePrivateLimitsV2(out *privateOAuth, db *sql.DB, owners NativeOAuthOwn
 	})
 	return err
 }
+
+func composePrivateAccountInfo(out *privateOAuth, db *sql.DB, owners NativeOAuthOwnerAuthority) error {
+	authority, ok := owners.(NativeAccountInfoAuthority)
+	if !ok || out == nil {
+		return ErrDenied
+	}
+	var err error
+	out.info, err = service.NewGatewayAccountInfoReader(repository.NewGatewayAccountInfoRepository(db), func(ctx context.Context, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+		consumer, e := service.GatewayNativeConsumer(ctx)
+		if e != nil {
+			return service.GatewayNativeRoute{}, ErrDenied
+		}
+		return authority.AuthorizeNativeAccountInfo(ctx, consumer, in)
+	})
+	return err
+}

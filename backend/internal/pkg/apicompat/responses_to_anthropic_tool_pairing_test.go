@@ -64,10 +64,6 @@ func convertAnthropic(t *testing.T, input string) []AnthropicMessage {
 	return messages
 }
 
-// Tests use call_-prefixed ids because fromResponsesCallIDToAnthropic passes
-// those through unchanged (matching codex's real call_00_... ids); bare ids
-// would be rewritten to toolu_<id>.
-
 // A developer/approval message injected between a function_call and its output
 // must be moved out of the tool_use→tool_result adjacency. This is the shape
 // that produced the production 400 "tool_result ... must have a corresponding

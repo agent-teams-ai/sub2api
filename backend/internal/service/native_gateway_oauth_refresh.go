@@ -26,6 +26,7 @@ type GatewayNativeOAuthRefreshIntent struct {
 	Operation        string
 	Intent           string
 	ConnectOperation string
+	info             *gatewayOAuthRefreshInfo
 }
 
 func (in GatewayNativeOAuthRefreshIntent) Authorized(ctx context.Context) bool {
@@ -78,6 +79,7 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	if s == nil || !in.Authorized(ctx) {
 		return GatewayNativeOAuthRefreshOutcome{}, ErrGatewayNativeIdentity
 	}
+	in.info = nil
 	// Intent contains copied primitives only; no mutable ingress maps survive await.
 	prepared, err := s.repository.PrepareGatewayNativeOAuthRefresh(ctx, in)
 	if err != nil || !prepared.Claimed {
@@ -98,6 +100,15 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	if ctx.Err() != nil || (s.authorizeEntry != nil && s.authorizeEntry(ctx, in.Scope, in.ConnectOperation) != nil) {
 		return unknown()
 	}
+	var infoOrder int64
+	if source, ok := s.repository.(interface {
+		ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
+	}); ok {
+		infoOrder, err = source.ReserveGatewayAccountInfoOrder(ctx)
+		if err != nil {
+			return unknown()
+		}
+	}
 	entered, err := s.repository.EnterGatewayNativeOAuthRefresh(ctx, in, prepared.Fence)
 	if err != nil {
 		return unknown()
@@ -117,6 +128,13 @@ func (s *GatewayNativeOAuthRefresh) Refresh(ctx context.Context, in GatewayNativ
 	envelope, err := s.custody.sealOAuthVersion(in.Scope, in.ExpectedVersion+1, next)
 	if err != nil {
 		return unknown()
+	}
+	if infoOrder > 0 {
+		for i := range next.info {
+			next.info[i].Order = infoOrder
+			next.info[i].CredentialRevision = in.ExpectedVersion + 1
+		}
+		in.info = &gatewayOAuthRefreshInfo{intent: in, observations: next.info}
 	}
 	// SQL publishes whole ciphertext and version atomically; a lost ACK is read
 	// back by the same operation without decrypting or entering a second time.
@@ -188,17 +206,27 @@ func (s *GatewayNativeOAuthRefresh) exchange(ctx context.Context, refresh, issue
 	if _, err = bundle.bytes(); err != nil {
 		return deny()
 	}
-	return gatewayOAuthTimedBundle(bundle, started, identity, s.custody)
+	bundle, err = gatewayOAuthTimedBundle(bundle, started, identity, s.custody)
+	if err != nil {
+		return deny()
+	}
+	bundle.info = []GatewayAccountInfoObservation{
+		{Source: "verified_claims", ValidUntil: &identity.expiresAt, Fields: identity.info},
+		{Source: "credential", Fields: gatewayCodexCredentialInfo(bundle, s.custody, started)},
+	}
+	return bundle, nil
 }
 
 // This projection is private to the engine; HTTP uses the separate finite reply.
 type GatewayNativeOAuthRefreshResolution struct {
-	AccountID int64
-	CreatedAt time.Time
-	Version   int64
-	Envelope  string
-	Attempt   *GatewayNativeOAuthRefreshIntent
-	State     string
+	AccountID              int64
+	CreatedAt              time.Time
+	Version                int64
+	Envelope               string
+	Attempt                *GatewayNativeOAuthRefreshIntent
+	State                  string
+	Qualified              bool
+	AccountInfoInitialized bool
 }
 type GatewayNativeOAuthRefreshResolver interface {
 	ResolveGatewayNativeOAuthRefresh(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthRefreshResolution, error)
@@ -253,6 +281,11 @@ func (s *GatewayNativeOAuthRefresh) Maintain(ctx context.Context, scope GatewayN
 	}
 	due, qualified := gatewayOAuthBundleDue(previous, time.Now(), s.custody)
 	if !qualified || !due {
+		if qualified && current.Qualified && !current.AccountInfoInitialized {
+			if err := s.HydrateAccountInfo(ctx, scope, operation); err != nil {
+				return out, err
+			}
+		}
 		if current.Attempt != nil {
 			out.State = current.State
 			out.RefreshRef = current.Attempt.Operation

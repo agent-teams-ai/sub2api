@@ -33,6 +33,16 @@ func (s *GatewayNativeGrokOAuth) connectSecretValid(v gatewayGrokConnectSecret) 
 }
 func (s *GatewayNativeGrokOAuth) exchange(ctx context.Context, form url.Values, nonce string, previous *gatewayGrokBundle) (gatewayGrokBundle, error) {
 	var empty gatewayGrokBundle
+	var infoOrder int64
+	if source, ok := s.repository.(interface {
+		ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
+	}); ok {
+		var err error
+		infoOrder, err = source.ReserveGatewayAccountInfoOrder(ctx)
+		if err != nil {
+			return empty, ErrGatewayNativeIdentity
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, xai.DefaultTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return empty, ErrGatewayNativeIdentity
@@ -82,17 +92,20 @@ func (s *GatewayNativeGrokOAuth) exchange(ctx context.Context, form url.Values, 
 			return empty, ErrGatewayNativeIdentity
 		}
 	}
-	b := gatewayGrokBundle{Kind: "grok-oauth/v1", Revision: 1, AccessToken: token.Access, RefreshToken: token.Refresh, ExpiresAt: started.Add(time.Duration(token.Expiry) * time.Second), Nonce: nonce, ClientID: s.qualification.ClientID}
+	b := gatewayGrokBundle{Kind: "grok-oauth/v1", Revision: 1, AccessToken: token.Access, RefreshToken: token.Refresh, ExpiresAt: started.Add(time.Duration(token.Expiry) * time.Second), ObservedAt: started, Nonce: nonce, ClientID: s.qualification.ClientID}
 	if previous != nil {
 		b.Revision = previous.Revision + 1
 		b.Nonce = previous.Nonce
 	}
+	var email, label string
 	if token.ID == "" && previous != nil {
 		// OIDC refresh may omit id_token. Only previously verified identity survives;
 		// authenticated userinfo must still confirm subject and team continuity.
 		var user struct {
-			Subject string `json:"sub"`
-			Team    string `json:"team_id"`
+			Subject string          `json:"sub"`
+			Team    string          `json:"team_id"`
+			Email   json.RawMessage `json:"email"`
+			Name    json.RawMessage `json:"name"`
 		}
 		if xai.FetchProtectedJSON(ctx, s.client, xai.ProtectedUserinfoURL, token.Access, &user) != nil || user.Subject != previous.Subject {
 			return empty, ErrGatewayNativeIdentity
@@ -108,17 +121,65 @@ func (s *GatewayNativeGrokOAuth) exchange(ctx context.Context, form url.Values, 
 			return empty, ErrGatewayNativeIdentity
 		}
 		b.Subject, b.Team = previous.Subject, previous.Team
+		_ = json.Unmarshal(user.Email, &email)
+		_ = json.Unmarshal(user.Name, &label)
 	} else {
 		principal, e := xai.VerifyProtectedPrincipal(ctx, s.client, token.ID, token.Access, s.qualification.ClientID, b.Nonce, previous == nil)
 		if e != nil {
 			return empty, ErrGatewayNativeIdentity
 		}
 		b.Subject, b.Team = principal.Subject, principal.Account
+		email, label = principal.Email, principal.Name
 	}
 	if previous != nil && (b.Subject != previous.Subject || b.Team != previous.Team) {
 		return empty, ErrGatewayNativeIdentity
 	}
+	if infoOrder > 0 {
+		fields := GatewayAccountInfoEmptyFields(GatewayGrokOAuthResponsesProfile)
+		if gatewayInfoText(email, 320) {
+			fields.Email = gatewayKnownFact(email, "provider_api", started)
+		}
+		if gatewayInfoText(label, 200) {
+			fields.AccountLabel = gatewayKnownFact(label, "provider_api", started)
+		}
+		b.info = []GatewayAccountInfoObservation{
+			{Source: "account_check", Order: infoOrder, CredentialRevision: b.Revision, Fields: fields},
+			{Source: "credential", Order: infoOrder, CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayGrokOAuthResponsesProfile, b.ExpiresAt, started)},
+		}
+	}
 	return b, nil
+}
+
+// Explicit bounded rollout from sealed custody; it never calls provider HTTP.
+func (s *GatewayNativeGrokOAuth) HydrateAccountInfo(ctx context.Context, scope GatewayNativeCredentialScope, operation string) error {
+	if s == nil || !grokScope(ctx, scope, operation) {
+		return ErrGatewayNativeIdentity
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	p, envelope, release, err := s.repository.LockGatewayGrokPhysical(ctx, scope, operation, nil)
+	if err != nil {
+		return err
+	}
+	if release == nil || !grokPhysicalValid(p, scope, operation, nil) {
+		if release != nil {
+			release()
+		}
+		return ErrGatewayNativeIdentity
+	}
+	b, err := s.bundle(scope, envelope, p)
+	release()
+	if err != nil {
+		return err
+	}
+	if b.ObservedAt.IsZero() {
+		return nil
+	}
+	writer, ok := s.repository.(GatewayAccountInfoWriter)
+	if !ok {
+		return ErrGatewayNativeIdentity
+	}
+	return writer.StoreGatewayAccountInfo(ctx, p, true, GatewayAccountInfoObservation{Source: "credential", CredentialRevision: b.Revision, Fields: gatewayOAuthCredentialExpiryInfo(GatewayGrokOAuthResponsesProfile, b.ExpiresAt, b.ObservedAt)})
 }
 
 func (s *GatewayNativeGrokOAuth) ResolveApproved(ctx context.Context, route GatewayNativeRoute, account string) (GatewayNativeCredentialScope, string, error) {

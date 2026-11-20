@@ -171,6 +171,9 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 
 // openAIChatCompletionsTargetURL 解析账号的（非 Grok）Chat Completions 上游端点。
 func (s *OpenAIGatewayService) openAIChatCompletionsTargetURL(account *Account) (string, error) {
+	if HasGatewayNativeIdentity(account) && account.Extra[GatewayProfileExtraKey] == GatewayGeminiAPIKeyProfile {
+		return s.gatewayNativeTargetURL(account)
+	}
 	baseURL := account.GetOpenAIBaseURL()
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
@@ -232,7 +235,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// 记录本次实际选择的协议端点，供错误日志和用量日志在没有
 	// OpenAIForwardResult（例如 503/传输失败）时使用。每次发送都覆盖，
 	// 避免 Gin context 在账号 failover 尝试之间残留旧端点。
-	SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
+	SetActualOpenAIUpstreamEndpoint(c, upstreamReq.URL.Path)
 	upstreamReq = upstreamReq.WithContext(WithHTTPUpstreamProfile(upstreamReq.Context(), HTTPUpstreamProfileOpenAI))
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("Authorization", "Bearer "+bearerToken)
@@ -435,6 +438,9 @@ func (s *OpenAIGatewayService) scanCCStream(
 			continue
 		}
 		if strict {
+			if gatewayNativeGeminiSelected(c) && !gatewayNativeGeminiWireValid([]byte(payload), true) {
+				return failStrict(gatewayNativeFailureEvent)
+			}
 			if !gatewayNativeLegacyChunk([]byte(payload), &chunk) || (st.SawFinish && len(chunk.Choices) > 0) {
 				return failStrict(gatewayNativeFailureEvent)
 			}
@@ -505,7 +511,7 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 		writeError(c, http.StatusBadGateway, "api_error", "Failed to parse upstream response")
 		return nil, OpenAIUsage{}, fmt.Errorf("parse chat completions response: %w", err)
 	}
-	if gatewayNativeReasoningScope(c) != "" && !gatewayNativeLegacyBuffered(respBody, &ccResp) {
+	if gatewayNativeReasoningScope(c) != "" && (!gatewayNativeLegacyBuffered(respBody, &ccResp) || gatewayNativeGeminiSelected(c) && !gatewayNativeGeminiWireValid(respBody, false)) {
 		return nil, OpenAIUsage{}, ErrGatewayNativeEffectUnknown
 	}
 	// 观察上游 CC JSON 回显的 model / service_tier（计费以回显为准）。

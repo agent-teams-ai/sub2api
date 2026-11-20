@@ -72,7 +72,7 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	responsesReq.Model = mappedModel
 	anthropicReq, err := apicompat.ResponsesToAnthropicRequest(responsesReq)
 	if err != nil {
-		if isClaude55SignedThinkingModel(mappedModel) {
+		if isClaude55SignedThinkingModel(mappedModel) || errors.Is(err, apicompat.ErrResponsesOutputFormat) {
 			writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		}
 		return nil, fmt.Errorf("convert responses to anthropic: %w", err)

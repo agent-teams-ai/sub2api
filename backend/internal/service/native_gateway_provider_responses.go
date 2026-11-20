@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
@@ -45,6 +46,9 @@ func GatewayNativeCodingPlanProfileIDValid(profile string) bool {
 }
 
 func gatewayNativeProviderProfile(profile string) bool {
+	if GatewayNativeOfficialAPIProfileIDValid(profile) {
+		return true
+	}
 	switch profile {
 	case GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile, GatewayGrokOAuthResponsesProfile, GatewayNVIDIABuildChatProfile:
 		return true
@@ -129,6 +133,14 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 		return deny()
 	}
 	switch profile {
+	case GatewayAnthropicAPIKeyProfile:
+		if model != GatewayAnthropicAPIModel {
+			return deny()
+		}
+	case GatewayGeminiAPIKeyProfile:
+		if model != GatewayGeminiAPIModel {
+			return deny()
+		}
 	case GatewayNVIDIABuildChatProfile, GatewayKimiCodeResponsesProfile, GatewayGLMCodingResponsesProfile, GatewayMiniMaxMPlanResponsesProfile:
 		// Structural only: membership is decided at dispatch from the account's catalogue.
 		if !GatewayAccountModelIDValid(model) {
@@ -141,6 +153,12 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	}
 	if _, ok := gatewayOAuthSeconds(fields["max_output_tokens"]); !ok || !gatewayNativeProviderTextInput(profile, fields["input"]) {
 		return deny()
+	}
+	if GatewayNativeOfficialAPIProfileIDValid(profile) {
+		tokens, _ := gatewayOAuthSeconds(fields["max_output_tokens"])
+		if tokens < 1 || tokens > 65536 {
+			return deny()
+		}
 	}
 	if raw := fields["instructions"]; raw != nil {
 		var v string
@@ -227,6 +245,12 @@ func gatewayNativePrepareProviderResponses(profile string, body []byte, requestB
 	if !gatewayNativeProviderNamespaceReferences(fields["input"], fields["tool_choice"], mapping) {
 		return deny()
 	}
+	if profile == GatewayAnthropicAPIKeyProfile {
+		providerWire, _, err := gatewayNativePrepareAnthropicAPI(wire)
+		if err != nil || int64(len(providerWire)) > requestBytes {
+			return deny()
+		}
+	}
 	return wire, mapping, nil
 }
 
@@ -302,29 +326,41 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 				return false
 			}
 		case "reasoning":
-			keys := []string{"type", "id", "summary", "encrypted_content", "status"}
+			keys := []string{"type", "id", "summary", "encrypted_content", "status", "content"}
 			// MiniMax and the open reasoning models served through OpenRouter
 			// return clear reasoning content in their Responses output. Clients
 			// replay output items unchanged on the next turn, so a text-only
 			// reasoning_text content part must be accepted there; without it
 			// every multi-turn review on such a model was refused at input
 			// admission. It stays opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile {
-				keys = append(keys, "content")
-			}
+			allowClearReasoning := profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile
 			// OpenRouter tags every reasoning item with the format of its
 			// reasoning data (observed in production: a replayed item with this
 			// key was the only thing refused at input admission).
 			if profile == GatewayOpenRouterResponsesProfile {
 				keys = append(keys, "format")
 			}
-			fields, ok = gatewayClaudeObject(raw, keys...)
+			fields, ok = gatewayNativeCanonicalObject(raw, keys...)
 			if !ok {
 				return false
 			}
+			for name, value := range fields {
+				if !slices.Contains(keys, name) {
+					return false
+				}
+				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+					// Codex 0.133 serializes absent optional reasoning fields as
+					// null. Treat only these two as absent in the admission view;
+					// the original history bytes remain unchanged on the wire.
+					if name != "content" && name != "encrypted_content" {
+						return false
+					}
+					delete(fields, name)
+				}
+			}
 			if content := fields["content"]; content != nil {
 				var parts []json.RawMessage
-				if bytes.Equal(bytes.TrimSpace(content), []byte("null")) || json.Unmarshal(content, &parts) != nil {
+				if !allowClearReasoning || json.Unmarshal(content, &parts) != nil {
 					return false
 				}
 				for _, raw := range parts {
