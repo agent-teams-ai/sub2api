@@ -6,6 +6,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Passthrough may bypass stale mappings, but OAuth/SetupToken credentials still
+// target the Codex backend and must not be scheduled for foreign model families.
+func TestGatewaySchedulingPassthroughPreservesOAuthFamilyRestriction(t *testing.T) {
+	gateway := &GatewayService{}
+	for _, accountType := range []string{AccountTypeOAuth, AccountTypeSetupToken} {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     accountType,
+			Extra:    map[string]any{"openai_passthrough": true},
+		}
+		require.False(t, gateway.isModelSupportedByAccount(account, "claude-sonnet-4-5"), "OAuth-like passthrough cannot serve Anthropic models")
+	}
+	apiKey := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Extra:    map[string]any{"openai_passthrough": true},
+	}
+	require.True(t, gateway.isModelSupportedByAccount(apiKey, "claude-sonnet-4-5"), "API key passthrough can target a custom upstream")
+}
+
 func TestAccount_IsOpenAIPassthroughEnabled(t *testing.T) {
 	t.Run("新字段开启", func(t *testing.T) {
 		account := &Account{
