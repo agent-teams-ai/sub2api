@@ -15,6 +15,13 @@ import (
 
 const cgroupRoot = "/sys/fs/cgroup"
 
+// CgroupMemoryLimitBytes reports the tightest cgroup memory limit along the
+// process's hierarchy; the Ops collector uses this same reader as memory
+// budgeting, instead of a separate mount-root-only implementation.
+func CgroupMemoryLimitBytes() uint64 {
+	return cgroupMemoryLimit(cgroupRoot, "/proc/self/cgroup")
+}
+
 // MemoryLimitBytes returns the memory available to this process: the smallest
 // of physical memory, the cgroup (container/systemd) limit and GOMEMLIMIT.
 // It returns 0 when none of them can be determined.
@@ -24,7 +31,7 @@ func MemoryLimitBytes() uint64 {
 		physical = vm.Total
 	}
 	goLimit := debug.SetMemoryLimit(-1)
-	return minPositive(physical, cgroupMemoryLimit(cgroupRoot, "/proc/self/cgroup"), goMemoryLimit(goLimit))
+	return minPositive(physical, CgroupMemoryLimitBytes(), goMemoryLimit(goLimit))
 }
 
 // cgroupMemoryLimit returns the tightest memory limit on this process's cgroup
