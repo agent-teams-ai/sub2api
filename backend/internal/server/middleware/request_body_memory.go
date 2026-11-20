@@ -3,6 +3,7 @@ package middleware
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/gin-gonic/gin"
@@ -32,7 +33,28 @@ func RejectRequestBodyMemoryOverload(c *gin.Context, err error) bool {
 		return false
 	}
 	c.Header("Retry-After", "1")
-	groupModelAllowlistErrorWriter(c)(c, http.StatusServiceUnavailable, "Request body buffering capacity is exhausted; retry later")
+	writeGatewayMemoryOverload(c, "Request body buffering capacity is exhausted; retry later")
 	c.Abort()
 	return true
+}
+
+func writeGatewayMemoryOverload(c *gin.Context, message string) {
+	path := ""
+	if c.Request != nil && c.Request.URL != nil {
+		path = c.Request.URL.Path
+	}
+	switch {
+	case strings.HasPrefix(path, "/v1beta") || strings.HasPrefix(path, "/antigravity/v1beta"):
+		GoogleErrorWriter(c, http.StatusServiceUnavailable, message)
+	case strings.Contains(path, "/messages"):
+		AnthropicErrorWriter(c, http.StatusServiceUnavailable, message)
+	case strings.Contains(path, "/responses"):
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{"code": "service_unavailable", "message": message},
+		})
+	default:
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{"type": "server_error", "code": "service_unavailable", "message": message},
+		})
+	}
 }
