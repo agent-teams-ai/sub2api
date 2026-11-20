@@ -54,3 +54,51 @@ func TestEmptyMessageContentArray(t *testing.T) {
 	item := marshalMessageWire(t, ResponsesOutput{Type: "message", ID: "msg_1", Role: "assistant"})
 	require.Equal(t, "[]", item.Get("content").Raw)
 }
+
+func TestMergedResponsesReasoningSummaryWire(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		summary []ResponsesSummary
+	}{
+		{name: "empty"},
+		{name: "present", summary: []ResponsesSummary{{Type: "summary_text", Text: "plan"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			item := ResponsesOutput{Type: "reasoning", ID: "rs_1", Status: "completed", Summary: tc.summary}
+			response := ResponsesResponse{ID: "resp_1", Object: "response", Status: "completed", Output: []ResponsesOutput{item}}
+			encoded := []gjson.Result{
+				marshalMessageWire(t, item),
+				marshalMessageWire(t, response).Get("output.0"),
+				marshalMessageWire(t, ResponsesStreamEvent{Type: "response.output_item.done", Item: &item}).Get("item"),
+				marshalMessageWire(t, ResponsesStreamEvent{Type: "response.completed", Response: &response}).Get("response.output.0"),
+			}
+			for _, result := range encoded {
+				require.True(t, result.Get("summary").Exists(), "required reasoning summary array must be present")
+				require.True(t, result.Get("summary").IsArray(), "reasoning summary must be an array")
+				require.Len(t, result.Get("summary").Array(), len(tc.summary))
+				if len(tc.summary) != 0 {
+					require.Equal(t, "summary_text", result.Get("summary.0.type").String())
+					require.Equal(t, "plan", result.Get("summary.0.text").String())
+				}
+			}
+		})
+	}
+}
+
+func TestMergedResponsesClientToolSearchWire(t *testing.T) {
+	item := ResponsesOutput{Type: "tool_search_call", ID: "tsc_1", CallID: "call_1", Arguments: "{\"query\":\"repo\"}"}
+	response := ResponsesResponse{ID: "resp_1", Object: "response", Status: "completed", Output: []ResponsesOutput{item}}
+	encoded := []gjson.Result{
+		marshalMessageWire(t, item),
+		marshalMessageWire(t, response).Get("output.0"),
+		marshalMessageWire(t, ResponsesStreamEvent{Type: "response.output_item.done", Item: &item}).Get("item"),
+	}
+	for _, result := range encoded {
+		require.Equal(t, "tool_search_call", result.Get("type").String())
+		require.Equal(t, "tsc_1", result.Get("id").String())
+		require.Equal(t, "call_1", result.Get("call_id").String())
+		require.Equal(t, "client", result.Get("execution").String())
+		require.True(t, result.Get("arguments").IsObject(), "tool_search arguments must be an object")
+		require.Equal(t, "repo", result.Get("arguments.query").String())
+	}
+}
