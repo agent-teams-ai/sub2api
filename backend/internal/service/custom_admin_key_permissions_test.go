@@ -22,7 +22,7 @@ func TestScopedAdminPermissionFieldClassification(t *testing.T) {
 		body string
 		want []string
 	}{
-		{`{"extra":{"email":"test@example.com","openai_oauth_responses_websockets_v2_enabled":false,"openai_oauth_responses_websockets_v2_mode":"off","openai_long_context_billing_enabled":false}}`, []string{"accounts.options.write"}},
+		{`{"extra":{"email":"test@example.com","openai_oauth_responses_websockets_v2_enabled":false,"openai_oauth_responses_websockets_v2_mode":"off"}}`, []string{"accounts.options.write"}},
 		{`{"rate_multiplier":0.5}`, []string{"accounts.rate.write"}},
 		{`{"credentials":{"expires_at":2000000000,"email":"test@example.com","plan_type":"plus"}}`, []string{"accounts.credentials", "accounts.credentials", "accounts.credentials"}},
 	} {
@@ -89,7 +89,7 @@ func TestScopedAdminPermissionCreateAuthorizesEveryField(t *testing.T) {
 			}
 			ctx := adminaccess.WithPrincipal(context.Background(), &adminaccess.Principal{Policy: adminaccess.Policy{Rules: []adminaccess.Rule{{Permissions: granted, IncludeUngrouped: true, AccountTypes: []string{"oauth"}, Platforms: []string{"openai"}}}}})
 			var fields map[string]json.RawMessage
-			require.NoError(t, json.Unmarshal([]byte(`{"name":"授权创建","platform":"openai","type":"oauth","group_ids":[],"credentials":{"access_token":"test","refresh_token":"test","expires_at":2000000000,"email":"test@example.com","plan_type":"plus"},"extra":{"email":"test@example.com","openai_oauth_responses_websockets_v2_enabled":false,"openai_oauth_responses_websockets_v2_mode":"off","openai_long_context_billing_enabled":false},"rate_multiplier":0.5,"concurrency":20,"priority":1,"expires_at":null,"auto_pause_on_expired":true}`), &fields))
+			require.NoError(t, json.Unmarshal([]byte(`{"name":"授权创建","platform":"openai","type":"oauth","group_ids":[],"credentials":{"access_token":"test","refresh_token":"test","expires_at":2000000000,"email":"test@example.com","plan_type":"plus"},"extra":{"email":"test@example.com","openai_oauth_responses_websockets_v2_enabled":false,"openai_oauth_responses_websockets_v2_mode":"off"},"rate_multiplier":0.5,"concurrency":20,"priority":1,"expires_at":null,"auto_pause_on_expired":true}`), &fields))
 			a, err := svc.ScopedAdminWrite(ctx, 0, "", fields, nil)
 			if missing != "" {
 				require.Equal(t, 403, infraerrors.Code(err))
