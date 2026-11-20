@@ -528,3 +528,34 @@ func TestEvaluateAccountSchedulingThreshold_GrokUsesOnlyHeaderQuotaWindow(t *tes
 	require.NotNil(t, decision.Until)
 	require.True(t, headerUntil.Equal(*decision.Until))
 }
+
+func TestEvaluateAccountSchedulingThreshold_KimiMonthlyWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(20 * 24 * time.Hour)
+	account := &Account{Platform: PlatformKimi, Extra: map[string]any{
+		"kimi_monthly_used_percent": 95.0,
+		"kimi_monthly_reset_at":     resetAt.Format(time.RFC3339),
+	}}
+	thresholds := map[string]int{PlatformKimi: 90}
+
+	decision := EvaluateAccountSchedulingThreshold(account, thresholds, now)
+	require.True(t, decision.ShouldPause)
+	require.Equal(t, "monthly", decision.Window)
+	require.Equal(t, 95.0, decision.UsedPercent)
+	require.NotNil(t, decision.Until)
+	require.True(t, resetAt.Equal(*decision.Until))
+
+	delete(account.Extra, "kimi_monthly_reset_at")
+	require.False(t, EvaluateAccountSchedulingThreshold(account, thresholds, now).ShouldPause,
+		"monthly utilization without a reset must not trigger a pause")
+	delete(account.Extra, "kimi_monthly_used_percent")
+	require.False(t, EvaluateAccountSchedulingThreshold(account, thresholds, now).ShouldPause,
+		"missing monthly observation must not trigger a pause")
+
+	account.Extra["kimi_monthly_used_percent"] = 98.0
+	account.Extra["kimi_monthly_reset_at"] = now.Add(-time.Minute).Format(time.RFC3339)
+	require.False(t, EvaluateAccountSchedulingThreshold(account, thresholds, now).ShouldPause,
+		"expired monthly window must not trigger a pause")
+}
