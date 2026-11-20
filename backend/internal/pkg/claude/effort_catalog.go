@@ -89,6 +89,12 @@ func normalizeEffortModelID(model string) string {
 	if id == "claude-haiku-5.5" {
 		id = "claude-haiku-5-5"
 	}
+	if id == "claude-fable-5.2" {
+		id = "claude-fable-5-2"
+	}
+	if id == "claude-mythos-5.2" {
+		id = "claude-mythos-5-2"
+	}
 	if mapped, ok := ModelIDReverseOverrides[id]; ok {
 		id = mapped
 	}
