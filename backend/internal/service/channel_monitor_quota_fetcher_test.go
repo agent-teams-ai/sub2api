@@ -348,7 +348,8 @@ func TestUsageFailureInfo_ClassificationMatrix(t *testing.T) {
 		{name: "error code rate limited", usage: &UsageInfo{ErrorCode: errorCodeRateLimited}, failed: true, msg: errorCodeRateLimited},
 		{name: "error code network error", usage: &UsageInfo{ErrorCode: errorCodeNetworkError}, failed: true, msg: errorCodeNetworkError},
 		{name: "grok quota unknown exempted", usage: &UsageInfo{ErrorCode: "quota_unknown", Error: "Grok quota is unknown until billing is probed"}},
-		{name: "openai quota refresh failed exempted", usage: &UsageInfo{ErrorCode: errorCodeQuotaRefreshFailed, Error: "Unable to refresh OpenAI quota"}},
+		{name: "openai quota refresh failed without observation", usage: &UsageInfo{ErrorCode: errorCodeQuotaRefreshFailed, Error: "Unable to refresh OpenAI quota"}, failed: true, msg: "Unable to refresh OpenAI quota"},
+		{name: "openai quota refresh failed with cached tier", usage: &UsageInfo{ErrorCode: errorCodeQuotaRefreshFailed, Error: "Unable to refresh OpenAI quota", FiveHour: &UsageProgress{Utilization: 42}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
