@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -139,6 +140,19 @@ func performOpenAIQuotaRefreshRequest(t *testing.T, handler *OpenAIOAuthHandler)
 	var envelope openAIQuotaRefreshEnvelope
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
 	return recorder.Code, envelope
+}
+
+func TestScopedOpenAIError_ShadowResetIsPermanentNotBusy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/reset", nil).WithContext(
+		adminaccess.WithPrincipal(context.Background(), &adminaccess.Principal{}),
+	)
+	scopedOpenAIError(c, service.ErrSparkShadowResetNotSupported)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Contains(t, rec.Body.String(), "影子账户不支持额度重置")
+	require.NotContains(t, rec.Body.String(), "账户正在处理")
 }
 
 func successfulOpenAIQuotaWorkflowStub() *openAIQuotaWorkflowStub {
