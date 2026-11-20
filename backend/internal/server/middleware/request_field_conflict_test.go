@@ -280,3 +280,18 @@ func TestRejectConflictingRequestFieldsMarksIngressReject(t *testing.T) {
 		t.Fatalf("expected 400 with ingress reason %q, got %d reason=%v", IngressRejectConflictingRequestFields, w.Code, reason)
 	}
 }
+
+func TestRejectConflictingRequestFieldsPreservesResponsesErrorCode(t *testing.T) {
+	router, _ := newRequestFieldConflictTestRouter(nil)
+	for _, tc := range []struct {
+		path, field string
+	}{
+		{"/v1/responses", `"code":"invalid_request_error"`},
+		{"/v1/chat/completions", `"type":"invalid_request_error"`},
+	} {
+		w := doJSON(t, router, http.MethodPost, tc.path, `{"model":"gpt-5","model":"gpt-5.6"}`)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), tc.field) {
+			t.Fatalf("%s must return protocol-specific error field %s, got %d: %s", tc.path, tc.field, w.Code, w.Body.String())
+		}
+	}
+}
