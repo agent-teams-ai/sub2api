@@ -52,7 +52,7 @@ func (c *Client) RetrieveUserQuotaSummary(ctx context.Context, accessToken, proj
 			return summary, nil
 		}
 		lastErr = err
-		if urlIdx < len(BaseURLs)-1 && shouldFallbackToNextURL(nil, status) {
+		if urlIdx < len(BaseURLs)-1 && shouldFallbackToNextURL(err, status) {
 			continue
 		}
 		return nil, err
@@ -86,7 +86,7 @@ func (c *Client) retrieveUserQuotaSummary(ctx context.Context, baseURL, accessTo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", GetUserAgentForContext(ctx))
 
-	resp, err := servertiming.Do(c.httpClient, req)
+	resp, err := servertiming.Do(c.fetchAvailableModelsHTTPClient(), req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("retrieveUserQuotaSummary request failed: %w", err)
 	}
