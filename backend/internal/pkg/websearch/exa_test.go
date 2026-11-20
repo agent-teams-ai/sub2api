@@ -96,7 +96,9 @@ func TestExaProvider_ClampsTooManyResults(t *testing.T) {
 	p := NewExaProvider("k", exaTestClient(http.StatusOK, `{"results":[]}`, &seen, &seenBody))
 	_, err := p.Search(context.Background(), SearchRequest{Query: "many", MaxResults: 10000})
 	require.NoError(t, err)
-	var body struct { NumResults int `json:"numResults"` }
+	var body struct {
+		NumResults int `json:"numResults"`
+	}
 	require.NoError(t, json.Unmarshal(seenBody, &body))
 	require.Equal(t, 100, body.NumResults)
 }
