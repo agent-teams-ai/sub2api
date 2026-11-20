@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -389,13 +390,15 @@ func TestPublicTerminalEventAndEOFWaitForDurableSettlementAndFailureTruncates(t 
 	}
 }
 
-// FLAKY ON LINUX CI: failed once on a GitHub-hosted runner (require.Equal(1, failed) saw 0)
-// and passed on rerun; 30/30 locally on macOS. Likely a timing race between abort() and
-// the aborted stream finishing. If it fails again, investigate instead of just rerunning.
+// Synchronize cancellation before releasing settlement so the test cannot
+// race a successful body EOF against the deliberate queued-owner abort.
 func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *testing.T) {
 	var original Request
 	var active, maximum, settlements, entries atomic.Int32
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	var activeRequests sync.Map
 	authority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -408,6 +411,12 @@ func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
 			_ = json.NewEncoder(w).Encode(ownerReply(input))
 		case "/private/native/v1/execution-settle":
+			var input struct {
+				Proof Proof `json:"proof"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+			activeRequests.Store(input.Proof.RequestRef, true)
+			defer activeRequests.Delete(input.Proof.RequestRef)
 			current := active.Add(1)
 			defer active.Add(-1)
 			for {
@@ -423,7 +432,7 @@ func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *
 			w.WriteHeader(403)
 		}
 	}))
-	defer authority.Close()
+	defer func() { releaseAll(); authority.Close() }()
 	h, _, _, _ := ownerIngressFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		entries.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -435,15 +444,16 @@ func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *
 		cfg.MaxEntries = 32
 	})
 	public := httptest.NewServer(h.PublicHandler(12))
-	defer public.Close()
+	defer func() { releaseAll(); public.Close() }()
 	type opened struct {
-		index  int
+		ref    string
 		cancel context.CancelFunc
 	}
 	openedRequests := make(chan opened, 12)
 	finished := make(chan error, 12)
 	for i := 0; i < 12; i++ {
-		go func(i int) {
+		go func() {
+			ref := uuid.NewString()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, public.URL+"/v1/responses", bytes.NewReader(original.Payload))
@@ -453,25 +463,23 @@ func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *
 			}
 			req.Header.Set("Authorization", "Bearer synthetic-capability-123")
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Gateway-Request-Id", uuid.NewString())
+			req.Header.Set("X-Gateway-Request-Id", ref)
 			response, err := public.Client().Do(req)
 			if err != nil {
 				finished <- err
 				return
 			}
 			defer response.Body.Close()
-			openedRequests <- opened{i, cancel}
+			openedRequests <- opened{ref, cancel}
 			_, err = io.ReadAll(response.Body)
 			finished <- err
-		}(i)
+		}()
 	}
-	var abort context.CancelFunc
+	var openedStreams []opened
 	for i := 0; i < 12; i++ {
 		select {
 		case opened := <-openedRequests:
-			if opened.index == 11 {
-				abort = opened.cancel
-			}
+			openedStreams = append(openedStreams, opened)
 		case <-time.After(2 * time.Second):
 			t.Fatal("not all public streams reached response headers")
 		}
@@ -488,21 +496,30 @@ func TestPublicTerminalBurstPacesTwelveCallbacksAndRetainsAbortedQueuedOwner(t *
 	require.NoError(t, err)
 	require.Equal(t, 503, denied.StatusCode)
 	_ = denied.Body.Close()
+	var abort context.CancelFunc
+	for _, opened := range openedStreams {
+		if _, active := activeRequests.Load(opened.ref); !active {
+			abort = opened.cancel
+			break
+		}
+	}
 	require.NotNil(t, abort)
 	abort()
-	close(release)
-	failed := 0
-	for i := 0; i < 12; i++ {
+	select {
+	case err := <-finished:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled queued stream did not close before settlement release")
+	}
+	releaseAll()
+	for i := 0; i < 11; i++ {
 		select {
 		case err := <-finished:
-			if err != nil {
-				failed++
-			}
+			require.NoError(t, err)
 		case <-time.After(2 * time.Second):
 			t.Fatal("paced terminal queue did not drain")
 		}
 	}
-	require.Equal(t, 1, failed)
 	require.Eventually(t, func() bool { return settlements.Load() == 12 }, time.Second, time.Millisecond)
 	require.LessOrEqual(t, maximum.Load(), int32(4))
 	h.mu.Lock()

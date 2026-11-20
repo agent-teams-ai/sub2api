@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -126,6 +127,9 @@ type GatewayNativeOAuthConnectIntent struct {
 	DeviceRevision      int64                        `json:"-"`
 	DevicePollAfter     time.Time                    `json:"-"`
 	DeviceDeadline      time.Time                    `json:"-"`
+	ImportInputMAC      string                       `json:"-"`
+	ImportClaimMAC      string                       `json:"-"`
+	ImportKeyCommitment string                       `json:"-"`
 }
 
 // One durable CAS owns token entry; no in-memory lock is replay authority.
@@ -163,6 +167,7 @@ type GatewayNativeOAuthConnect struct {
 	readback       GatewayNativeOAuthConnectReadback
 	now            func() time.Time
 	authorizeEntry GatewayNativeOAuthEntryAuthorizer
+	importKey      []byte
 }
 
 // The key stays outside DB/backup. transport is trusted composition ONLY (TLS
@@ -184,9 +189,12 @@ func NewGatewayNativeOAuthConnect(key []byte, transport http.RoundTripper, repos
 			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second,
 			ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 16384, MaxConnsPerHost: 2, DisableKeepAlives: true}
 	}
+	// Derive MAC material separately from the existing AES-GCM envelope key.
+	importKey := hmac.New(sha256.New, key)
+	_, _ = importKey.Write([]byte("account-gateway/native/oauth-import-mac-key/v1"))
 	return &GatewayNativeOAuthConnect{aead: aead, client: &http.Client{Transport: transport, Timeout: 5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return ErrGatewayNativeIdentity }},
-		repository: repository, enrollment: enrollment, readback: readback, now: time.Now}, nil
+		repository: repository, enrollment: enrollment, readback: readback, now: time.Now, importKey: importKey.Sum(nil)}, nil
 }
 
 func GatewayNativeOAuthConnectIntentValid(in GatewayNativeOAuthConnectIntent) bool {
@@ -196,13 +204,13 @@ func GatewayNativeOAuthConnectIntentValid(in GatewayNativeOAuthConnectIntent) bo
 	return GatewayNativeOAuthScopeValid(in.Scope) && GatewayNativeCredentialRefValid(in.Operation) &&
 		idErr == nil && enrollmentID != uuid.Nil && in.EnrollmentOperation == "connect-"+enrollmentID.String() && in.EnrollmentOperation != in.Operation &&
 		(in.EnrollmentMAC == "" || (macErr == nil && len(mac) == 32 && hex.EncodeToString(mac) == in.EnrollmentMAC)) &&
-		in.ClientID == openai.ClientID && ((connectMethod(in) == "browser" && in.Redirect == GatewayOAuthConnectRedirect) || (connectMethod(in) == "device_code" && in.Redirect == GatewayOAuthDeviceRedirect)) &&
+		in.ClientID == openai.ClientID && gatewayConnectMethodShapeValid(in) &&
 		!in.Deadline.IsZero() && in.Deadline.Equal(in.Deadline.Truncate(time.Microsecond)) &&
 		err == nil && len(hash) == 32 && hex.EncodeToString(hash) == in.StateHash
 }
 
 func SameGatewayNativeOAuthConnectIntent(a, b GatewayNativeOAuthConnectIntent) bool {
-	return a.Scope == b.Scope && a.Operation == b.Operation && a.ClientID == b.ClientID && a.Redirect == b.Redirect && connectMethod(a) == connectMethod(b)
+	return a.Scope == b.Scope && a.Operation == b.Operation && a.ClientID == b.ClientID && a.Redirect == b.Redirect && connectMethod(a) == connectMethod(b) && a.ImportInputMAC == b.ImportInputMAC && a.ImportClaimMAC == b.ImportClaimMAC && a.ImportKeyCommitment == b.ImportKeyCommitment
 }
 
 func connectAAD(in GatewayNativeOAuthConnectIntent) []byte {
@@ -263,7 +271,11 @@ func connectStateHash(state string) string {
 }
 
 func connectResult(in GatewayNativeOAuthConnectIntent) GatewayNativeOAuthConnectResult {
-	return GatewayNativeOAuthConnectResult{Operation: in.Operation, Account: in.Scope.Account, State: in.State, Outcome: in.Outcome.State, Method: in.Method}
+	method := in.Method
+	if GatewayNativeOAuthImportMethodValid(method) {
+		method = "" // Existing receipt contract intentionally has no import enum.
+	}
+	return GatewayNativeOAuthConnectResult{Operation: in.Operation, Account: in.Scope.Account, State: in.State, Outcome: in.Outcome.State, Method: method}
 }
 
 func (s *GatewayNativeOAuthConnect) BeginConnect(ctx context.Context, scope GatewayNativeCredentialScope, operation string) (GatewayNativeOAuthConnectResult, error) {
@@ -474,6 +486,12 @@ func (s *GatewayNativeOAuthConnect) completeEntered(ownerCtx context.Context, in
 		return GatewayNativeOAuthConnectResult{}, ErrGatewayNativeIdentity
 	}
 	bundle, err := s.exchangeRedirect(bounded, code, verifier, in.Redirect)
+	return s.finishEntered(bounded, ownerCtx, in, bundle, err)
+}
+
+// Browser, device and selected imports share the existing Stage/receipt path.
+// The caller has already won durable entry before making its one exchange.
+func (s *GatewayNativeOAuthConnect) finishEntered(bounded, ownerCtx context.Context, in GatewayNativeOAuthConnectIntent, bundle GatewayNativeOAuthBundle, err error) (GatewayNativeOAuthConnectResult, error) {
 	if err != nil {
 		gatewayOAuthReportFailure(err, in)
 	}
@@ -508,13 +526,17 @@ func (s *GatewayNativeOAuthConnect) completeEntered(ownerCtx context.Context, in
 }
 
 func (s *GatewayNativeOAuthConnect) exchangeRedirect(ctx context.Context, code, verifier, redirect string) (GatewayNativeOAuthBundle, error) {
+	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {openai.ClientID}, "redirect_uri": {redirect}, "code": {code}, "code_verifier": {verifier}}
+	return s.exchangeConnectToken(ctx, form, "")
+}
+
+func (s *GatewayNativeOAuthConnect) exchangeConnectToken(ctx context.Context, form url.Values, submittedRefresh string) (GatewayNativeOAuthBundle, error) {
 	// One deadline covers dialing, TLS, headers AND reading/closing the body.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	deny := func(phase string) (GatewayNativeOAuthBundle, error) {
 		return GatewayNativeOAuthBundle{}, gatewayOAuthFail(phase, ErrGatewayNativeIdentity)
 	}
-	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {openai.ClientID}, "redirect_uri": {redirect}, "code": {code}, "code_verifier": {verifier}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, openai.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return deny("exchange_transport")
@@ -549,6 +571,9 @@ func (s *GatewayNativeOAuthConnect) exchangeRedirect(ctx context.Context, code, 
 	}
 	access, aOK := gatewayOAuthString(m, "access_token")
 	refresh, rOK := gatewayOAuthString(m, "refresh_token")
+	if _, present := m["refresh_token"]; !present && submittedRefresh != "" {
+		refresh, rOK = submittedRefresh, true
+	}
 	id, iOK := gatewayOAuthString(m, "id_token")
 	kind, _ := gatewayOAuthString(m, "token_type")
 	if !aOK || !rOK || !iOK || !strings.EqualFold(kind, "Bearer") {
@@ -558,6 +583,8 @@ func (s *GatewayNativeOAuthConnect) exchangeRedirect(ctx context.Context, code, 
 		if n, ok := gatewayOAuthSeconds(expiry); !ok || n <= 0 {
 			return deny("exchange_token_fields")
 		}
+	} else if submittedRefresh != "" {
+		return deny("exchange_token_fields")
 	}
 	if rawScope, exists := m["scope"]; exists {
 		var scope string
@@ -566,6 +593,9 @@ func (s *GatewayNativeOAuthConnect) exchangeRedirect(ctx context.Context, code, 
 		}
 		got := strings.Fields(scope)
 		want := strings.Fields(openai.DefaultScopes)
+		if submittedRefresh != "" {
+			want = strings.Fields(openai.RefreshScopes)
+		}
 		seen := map[string]bool{}
 		for _, name := range got {
 			if seen[name] {

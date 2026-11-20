@@ -48,6 +48,8 @@ type Config struct {
 	OAuth               *OAuthConfig       `json:"oauth,omitempty"`
 	OpenRouter          *ProfileConfig     `json:"openRouter,omitempty"`
 	NVIDIA              *ProfileConfig     `json:"nvidia,omitempty"`
+	AnthropicAPI        *ProfileConfig     `json:"anthropicApi,omitempty"`
+	GeminiAPI           *ProfileConfig     `json:"geminiApi,omitempty"`
 	Claude              *ProfileConfig     `json:"claude,omitempty"`
 	CodingPlans         []CodingPlanConfig `json:"codingPlans,omitempty"`
 	Grok                *GrokConfig        `json:"grok,omitempty"`
@@ -262,6 +264,14 @@ func (c Config) validate() (*service.GatewayNativeCredentialCustody, error) {
 		c.NVIDIA.Model != service.GatewayNVIDIABuildAnchorModel) {
 		return nil, ErrDenied
 	}
+	for _, api := range c.officialAPIProfiles() {
+		if !service.GatewayNativeOfficialAPIProfileValid(api.Profile, api.BaseURL, api.Model) || api.Tokens > 65536 || api.ProviderTokenUpperBound > 65536 {
+			return nil, ErrDenied
+		}
+	}
+	if c.AnthropicAPI != nil && !c.AnthropicAPI.valid() || c.GeminiAPI != nil && !c.GeminiAPI.valid() {
+		return nil, ErrDenied
+	}
 	if c.Claude != nil && (!c.Claude.valid() || c.Claude.BaseURL != service.GatewayClaudeOAuthBaseURL || c.Claude.Model != service.GatewayClaudeOAuthModel || c.Claude.Tokens > 65536 || c.Claude.ProviderTokenUpperBound > 65536) {
 		return nil, ErrDenied
 	}
@@ -384,4 +394,20 @@ func (c Config) grokProfile() *gatewaytransport.QualifiedProfile {
 	p := c.Grok.Profile.qualified()
 	p.Profile = service.GatewayGrokOAuthResponsesProfile
 	return &p
+}
+
+// Two closed optional API tuples share existing qualification bounds.
+func (c Config) officialAPIProfiles() []gatewaytransport.QualifiedProfile {
+	out := []gatewaytransport.QualifiedProfile{}
+	if c.AnthropicAPI != nil {
+		p := c.AnthropicAPI.qualified()
+		p.Profile = service.GatewayAnthropicAPIKeyProfile
+		out = append(out, p)
+	}
+	if c.GeminiAPI != nil {
+		p := c.GeminiAPI.qualified()
+		p.Profile = service.GatewayGeminiAPIKeyProfile
+		out = append(out, p)
+	}
+	return out
 }

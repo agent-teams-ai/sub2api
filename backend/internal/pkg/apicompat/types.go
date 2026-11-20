@@ -37,7 +37,15 @@ type AnthropicRequest struct {
 
 // AnthropicOutputConfig controls output generation parameters.
 type AnthropicOutputConfig struct {
-	Effort string `json:"effort,omitempty"` // "low" | "medium" | "high" | "max"
+	Effort string                 `json:"effort,omitempty"` // "low" | "medium" | "high" | "max"
+	Format *AnthropicOutputFormat `json:"format,omitempty"`
+}
+
+// AnthropicOutputFormat carries the caller's JSON schema without weakening it.
+// Native provider admission owns any qualified schema lowering and validation.
+type AnthropicOutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 // AnthropicThinking configures extended thinking in the Anthropic API.
@@ -425,12 +433,16 @@ type ResponsesOutput struct {
 	Action *WebSearchAction `json:"action,omitempty"`
 }
 
-// MarshalJSON 处理 tool_search_call 项的线上形态（复用 CallID/Arguments 字段）：
-// execution 固定为 "client"（codex 的必填字段，非 client 的调用会被静默忽略），
-// arguments 是 JSON 对象而非 function_call 语义下的字符串。其余类型走默认结构体
-// 序列化，输出逐字节不变。
+// MarshalJSON preserves required reasoning summary arrays and tool-search
+// arguments/execution fields. Other output types keep the default encoding.
 func (o ResponsesOutput) MarshalJSON() ([]byte, error) {
 	type responsesOutputAlias ResponsesOutput
+	if o.Type == "reasoning" {
+		return json.Marshal(struct {
+			responsesOutputAlias
+			Summary []map[string]any `json:"summary"`
+		}{responsesOutputAlias(o), reasoningSummaryWire(o.Summary)})
+	}
 	if o.Type != "tool_search_call" {
 		return json.Marshal(responsesOutputAlias(o))
 	}
@@ -693,14 +705,15 @@ type ChatStreamOptions struct {
 
 // ChatMessage is a single message in the Chat Completions conversation.
 type ChatMessage struct {
-	Role             string          `json:"role"` // "system" | "user" | "assistant" | "tool" | "function"
-	Content          json.RawMessage `json:"content,omitempty"`
-	Refusal          string          `json:"refusal,omitempty"`
-	ReasoningContent string          `json:"reasoning_content,omitempty"`
-	Reasoning        string          `json:"reasoning,omitempty"`
-	Name             string          `json:"name,omitempty"`
-	ToolCalls        []ChatToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	Role             string            `json:"role"` // "system" | "user" | "assistant" | "tool" | "function"
+	Content          json.RawMessage   `json:"content,omitempty"`
+	Refusal          string            `json:"refusal,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	Reasoning        string            `json:"reasoning,omitempty"`
+	Name             string            `json:"name,omitempty"`
+	ToolCalls        []ChatToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	ExtraContent     *ChatExtraContent `json:"extra_content,omitempty"`
 
 	// Legacy function calling
 	FunctionCall *ChatFunctionCall `json:"function_call,omitempty"`
@@ -753,10 +766,22 @@ type ChatFunction struct {
 // ChatToolCall represents a tool call made by the assistant.
 // Index is only populated in streaming chunks (omitted in non-streaming responses).
 type ChatToolCall struct {
-	Index    *int             `json:"index,omitempty"`
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"` // "function"
-	Function ChatFunctionCall `json:"function"`
+	Index        *int              `json:"index,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Type         string            `json:"type,omitempty"` // "function"
+	Function     ChatFunctionCall  `json:"function"`
+	ExtraContent *ChatExtraContent `json:"extra_content,omitempty"`
+}
+
+// Only Google's opaque continuation extension is retained. It is interpreted
+// exclusively by the opt-in Gemini codec; arbitrary provider fields are not
+// copied into a Responses item or the next upstream request.
+type ChatExtraContent struct {
+	Google *ChatGoogleExtraContent `json:"google,omitempty"`
+}
+
+type ChatGoogleExtraContent struct {
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 // ChatFunctionCall contains the function name and arguments.
@@ -834,12 +859,13 @@ type ChatChunkChoice struct {
 
 // ChatDelta carries incremental content in a streaming chunk.
 type ChatDelta struct {
-	Role             string         `json:"role,omitempty"`
-	Content          *string        `json:"content,omitempty"` // pointer: omit when not present, null vs "" matters
-	Refusal          *string        `json:"refusal,omitempty"`
-	ReasoningContent *string        `json:"reasoning_content,omitempty"`
-	Reasoning        *string        `json:"reasoning,omitempty"`
-	ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
+	Role             string            `json:"role,omitempty"`
+	Content          *string           `json:"content,omitempty"` // pointer: omit when not present, null vs "" matters
+	Refusal          *string           `json:"refusal,omitempty"`
+	ReasoningContent *string           `json:"reasoning_content,omitempty"`
+	Reasoning        *string           `json:"reasoning,omitempty"`
+	ToolCalls        []ChatToolCall    `json:"tool_calls,omitempty"`
+	ExtraContent     *ChatExtraContent `json:"extra_content,omitempty"`
 }
 
 func (m ChatMessage) reasoningText() string {

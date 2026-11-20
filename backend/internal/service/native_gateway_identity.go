@@ -46,6 +46,7 @@ func GatewayNativeAPIKeyProfileValid(profile, baseURL, model string) bool {
 	return (profile == GatewayMiMoResponsesProfile || profile == GatewayLegacyBridgeProfile) && baseURL != "" && strings.TrimSpace(model) != "" ||
 		profile == GatewayOpenRouterResponsesProfile && baseURL == GatewayOpenRouterBaseURL && GatewayOpenRouterModelValid(model) ||
 		profile == GatewayNVIDIABuildChatProfile && baseURL == GatewayNVIDIABuildBaseURL && model == GatewayNVIDIABuildAnchorModel ||
+		GatewayNativeOfficialAPIProfileValid(profile, baseURL, model) ||
 		GatewayNativeCodingPlanProfileValid(profile, baseURL, model)
 }
 
@@ -154,7 +155,7 @@ func validateGatewayNativeShape(a *Account) error {
 	if profile == GatewayLegacyBridgeProfile || profile == GatewayNVIDIABuildChatProfile {
 		mode, passthrough = "force_chat_completions", false
 	}
-	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && profile != GatewayNVIDIABuildChatProfile && !GatewayNativeCodingPlanProfileIDValid(profile)) ||
+	if !profileOK || (profile != GatewayMiMoResponsesProfile && profile != GatewayLegacyBridgeProfile && profile != GatewayOpenRouterResponsesProfile && profile != GatewayNVIDIABuildChatProfile && !GatewayNativeCodingPlanProfileIDValid(profile) && !GatewayNativeOfficialAPIProfileIDValid(profile)) ||
 		a.Extra["openai_responses_mode"] != mode ||
 		a.Extra["openai_passthrough"] != passthrough ||
 		a.Extra["native_api_key_cancel_on_disconnect"] != true ||
@@ -325,7 +326,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 		setGrokResponsesClientToolMapping(c, mapping)
 		defer clearGrokResponsesClientToolMapping(c)
 	}
-	if route.Profile == GatewayNVIDIABuildChatProfile {
+	if route.Profile == GatewayNVIDIABuildChatProfile || route.Profile == GatewayGeminiAPIKeyProfile {
 		// Validate the bounded provider subset before custody, but do NOT
 		// pre-lower custom/namespace tools. The existing protected Chat bridge
 		// owns the single Responses-to-Chat conversion and reverse restoration.
@@ -335,7 +336,7 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 			return nil, false, ErrGatewayNativeIdentity
 		}
 	}
-	if GatewayNativeCodingPlanProfileIDValid(route.Profile) {
+	if GatewayNativeCodingPlanProfileIDValid(route.Profile) || route.Profile == GatewayAnthropicAPIKeyProfile {
 		prepared, mapping, prepareErr := gatewayNativePrepareProviderResponses(route.Profile, body, 4<<20)
 		if prepareErr != nil {
 			gatewayNativeAdmissionDiagnostic(gatewayAdmissionMapping)
@@ -405,7 +406,9 @@ func (s *OpenAIGatewayService) ForwardGatewayRoute(ctx context.Context, c *gin.C
 	// Native Responses is the first qualification path. The separately selected
 	// historical bridge is never an automatic fallback after any dispatch.
 	var result *OpenAIForwardResult
-	if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile || GatewayNativeCodingPlanProfileIDValid(route.Profile) {
+	if route.Profile == GatewayAnthropicAPIKeyProfile {
+		result, err = s.forwardGatewayAnthropicAPI(ctx, c, a, body)
+	} else if route.Profile == GatewayMiMoResponsesProfile || route.Profile == GatewayOpenRouterResponsesProfile || GatewayNativeCodingPlanProfileIDValid(route.Profile) {
 		result, err = s.forwardGatewayNativeResponses(ctx, c, a, body)
 	} else {
 		result, err = s.forwardResponsesViaRawChatCompletions(ctx, c, a, body)
@@ -446,6 +449,9 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 	if state.account != a || validateGatewayNativeRoute(state.route, a) != nil || request.Method != http.MethodPost ||
 		request.Header.Get("Authorization") != "Bearer "+a.GetCredential("api_key") {
 		gatewayNativeAdmissionDiagnostic(gatewayAdmissionDescriptor)
+		return noop, ErrGatewayNativeIdentity
+	}
+	if state.route.Profile == GatewayAnthropicAPIKeyProfile && (request.Header.Get("x-api-key") != "" || request.Header.Get("anthropic-version") != "2023-06-01" || request.Header.Get("anthropic-beta") != "") {
 		return noop, ErrGatewayNativeIdentity
 	}
 	target, err := s.gatewayNativeTargetURL(a)
@@ -541,7 +547,12 @@ func (s *OpenAIGatewayService) checkGatewayNativeDispatch(request *http.Request,
 		gatewayNativeAdmissionDiagnostic(gatewayAdmissionReplay)
 		return noop, ErrGatewayNativeReplay
 	}
-	request.Header.Set("Authorization", authorization)
+	if state.route.Profile == GatewayAnthropicAPIKeyProfile {
+		request.Header.Del("Authorization")
+		request.Header.Set("x-api-key", strings.TrimPrefix(authorization, "Bearer "))
+	} else {
+		request.Header.Set("Authorization", authorization)
+	}
 	request.GetBody = nil
 	request.Header.Del("Idempotency-Key")
 	request.Header.Del("X-Idempotency-Key")

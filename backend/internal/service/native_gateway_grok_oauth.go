@@ -34,11 +34,17 @@ type GatewayGrokConnectIntent struct {
 	Deadline                              time.Time
 }
 
-type GatewayGrokIdentity struct{ subject, team string }
+type GatewayGrokIdentity struct {
+	subject, team string
+	info          []GatewayAccountInfoObservation
+}
 
 func (i GatewayGrokIdentity) Principal() (string, string) { return i.subject, i.team }
 func (i GatewayGrokIdentity) Verified() bool {
 	return grokPrincipal(i.subject) && grokPrincipal(i.team)
+}
+func (i GatewayGrokIdentity) AccountInfo() []GatewayAccountInfoObservation {
+	return append([]GatewayAccountInfoObservation(nil), i.info...)
 }
 
 type GatewayGrokEnrollment struct {
@@ -61,7 +67,7 @@ type GatewayNativeGrokRepository interface {
 	LockGatewayGrokMaintenance(context.Context, GatewayNativeCredentialScope, string) (GatewayNativeOAuthPhysical, string, string, string, func(), error)
 	ReadGatewayGrokRefresh(context.Context, GatewayNativeCredentialScope, string, string) (GatewayNativeOAuthRefreshOutcome, bool, error)
 	ClaimGatewayGrokRefresh(context.Context, GatewayNativeCredentialScope, string, string, int64) (GatewayNativeOAuthPhysical, string, bool, error)
-	CompleteGatewayGrokRefresh(context.Context, GatewayNativeOAuthPhysical, string, string) error
+	CompleteGatewayGrokRefresh(context.Context, GatewayNativeOAuthPhysical, string, string, ...GatewayAccountInfoObservation) error
 	CleanupGatewayGrok(context.Context, GatewayNativeOAuthCleanupRequest, GatewayNativeOAuthCleanupAuthorizer) (GatewayNativeOAuthCleanupResult, error)
 	ResolveGatewayGrokCanonical(context.Context, GatewayNativeRoute, string) (GatewayNativeCredentialScope, string, error)
 	ListGatewayGrokQuotaAccounts(context.Context) ([]GatewayNativeOAuthPhysical, error)
@@ -82,8 +88,10 @@ type gatewayGrokBundle struct {
 	Subject      string    `json:"subject"`
 	Team         string    `json:"team"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	ObservedAt   time.Time `json:"observed_at,omitzero"`
 	Nonce        string    `json:"nonce"`
 	ClientID     string    `json:"client_id"`
+	info         []GatewayAccountInfoObservation
 }
 type gatewayGrokConnectSecret struct {
 	Kind        string `json:"kind"`
@@ -299,7 +307,7 @@ func (s *GatewayNativeGrokOAuth) CompleteOwnerCallback(ctx context.Context, scop
 	if err != nil {
 		return empty, err
 	}
-	_, err = s.repository.CompleteGatewayGrokConnect(ctx, GatewayGrokEnrollment{Intent: in, Identity: GatewayGrokIdentity{bundle.Subject, bundle.Team}, Envelope: envelope})
+	_, err = s.repository.CompleteGatewayGrokConnect(ctx, GatewayGrokEnrollment{Intent: in, Identity: GatewayGrokIdentity{subject: bundle.Subject, team: bundle.Team, info: bundle.info}, Envelope: envelope})
 	if err != nil {
 		return empty, err
 	}
@@ -321,6 +329,9 @@ func grokToken(value string) bool {
 func (s *GatewayNativeGrokOAuth) bundle(scope GatewayNativeCredentialScope, envelope string, p GatewayNativeOAuthPhysical) (gatewayGrokBundle, error) {
 	var b gatewayGrokBundle
 	if !grokPhysicalValid(p, scope, p.Operation, nil) || s.open(scope, envelope, &b) != nil || b.Kind != "grok-oauth/v1" || b.Revision < 1 || b.Revision != p.CredentialRevision || !grokToken(b.AccessToken) || !grokToken(b.RefreshToken) || !grokPrincipal(b.Subject) || !grokPrincipal(b.Team) || b.Subject != p.Subject || b.Team != p.ProviderAccount || p.Issuer != GatewayGrokOAuthIssuer || b.ExpiresAt.IsZero() || len(b.Nonce) != 43 || b.ClientID != s.qualification.ClientID {
+		return b, ErrGatewayNativeIdentity
+	}
+	if !b.ObservedAt.IsZero() && (!gatewayInfoInstant(b.ObservedAt.UTC().Format(time.RFC3339Nano)) || b.ObservedAt.After(b.ExpiresAt)) {
 		return b, ErrGatewayNativeIdentity
 	}
 	return b, nil
@@ -452,7 +463,7 @@ func (s *GatewayNativeGrokOAuth) Refresh(ctx context.Context, scope GatewayNativ
 	if s.refreshEntry(ctx, scope, connectOperation) != nil {
 		return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "unknown"}, ErrGatewayNativeIdentity
 	}
-	if err = s.repository.CompleteGatewayGrokRefresh(ctx, p, refreshOperation, next); err != nil {
+	if err = s.repository.CompleteGatewayGrokRefresh(ctx, p, refreshOperation, next, b.info...); err != nil {
 		return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "unknown"}, err
 	}
 	return GatewayNativeOAuthRefreshOutcome{Operation: refreshOperation, State: "completed", Version: p.CredentialRevision + 1}, nil
@@ -523,6 +534,13 @@ func (s *GatewayNativeGrokOAuth) Maintain(ctx context.Context, scope GatewayNati
 		return out, err
 	}
 	if time.Now().Add(5 * time.Minute).Before(previous.ExpiresAt) {
+		if !p.AccountInfoInitialized && !previous.ObservedAt.IsZero() {
+			// The existing maintenance call initializes only an absent snapshot
+			// after releasing its lock. Initialized idle accounts do no extra SQL.
+			if err := s.HydrateAccountInfo(ctx, scope, operation); err != nil {
+				return out, err
+			}
+		}
 		if attempt != "" {
 			out.State = "completed"
 			out.RefreshRef = attempt

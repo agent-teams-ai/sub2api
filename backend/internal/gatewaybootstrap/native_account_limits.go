@@ -14,6 +14,20 @@ type NativeAccountLimitsAuthority interface {
 }
 
 func (a *authority) AuthorizeNativeAccountLimits(ctx context.Context, consumer string, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+	return a.authorizeNativeAccountRead(ctx, consumer, in, "/private/native/v1/account-limits-authority")
+}
+
+type NativeAccountInfoAuthority interface {
+	AuthorizeNativeAccountInfo(context.Context, string, service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error)
+}
+
+func (a *authority) AuthorizeNativeAccountInfo(ctx context.Context, consumer string, in service.GatewayAccountLimitsInput) (service.GatewayNativeRoute, error) {
+	return a.authorizeNativeAccountRead(ctx, consumer, in, "/private/native/v1/account-info-authority")
+}
+
+// The same logical selector and strict reply proof are shared. The purpose is
+// fixed by the public method, not by caller data or quota eligibility.
+func (a *authority) authorizeNativeAccountRead(ctx context.Context, consumer string, in service.GatewayAccountLimitsInput, path string) (service.GatewayNativeRoute, error) {
 	var empty service.GatewayNativeRoute
 	if !identifier.MatchString(consumer) || !in.Valid() {
 		return empty, ErrDenied
@@ -35,7 +49,7 @@ func (a *authority) AuthorizeNativeAccountLimits(ctx context.Context, consumer s
 			Model      string `json:"model"`
 		} `json:"native"`
 	}
-	if a.postReplyDecoded(ctx, "/private/native/v1/account-limits-authority", body, &reply, 2048, decodeStrict) != nil || !reply.OK {
+	if a.postReplyDecoded(ctx, path, body, &reply, 2048, decodeStrict) != nil || !reply.OK {
 		return empty, ErrDenied
 	}
 	birth, err := time.Parse(time.RFC3339Nano, reply.Native.CreatedAt)

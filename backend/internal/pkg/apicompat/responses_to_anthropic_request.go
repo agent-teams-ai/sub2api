@@ -1,13 +1,20 @@
 package apicompat
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 )
+
+// ErrResponsesOutputFormat identifies a caller constraint that Anthropic's
+// structured-output protocol cannot represent; it is not an upstream failure.
+var ErrResponsesOutputFormat = errors.New("invalid or unsupported structured output format")
 
 // ResponsesToAnthropicRequest converts a Responses API request into an
 // Anthropic Messages request. This is the reverse of AnthropicToResponses and
@@ -32,6 +39,13 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 
 	if len(system) > 0 {
 		out.System = system
+	}
+	format, err := responsesTextToAnthropicOutputFormat(req.Text)
+	if err != nil {
+		return nil, err
+	}
+	if format != nil {
+		out.OutputConfig = &AnthropicOutputConfig{Format: format}
 	}
 
 	// max_output_tokens → max_tokens
@@ -126,14 +140,20 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 			return nil, fmt.Errorf("%s does not support reasoning effort %q; use low, medium, high, xhigh or max", req.Model, effort)
 		}
 		out.Thinking = &AnthropicThinking{Type: "adaptive"}
-		out.OutputConfig = &AnthropicOutputConfig{Effort: effort}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &AnthropicOutputConfig{}
+		}
+		out.OutputConfig.Effort = effort
 		return out, nil
 	}
 
 	// reasoning.effort → output_config.effort + thinking
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		effort := mapResponsesEffortToAnthropic(req.Reasoning.Effort)
-		out.OutputConfig = &AnthropicOutputConfig{Effort: effort}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &AnthropicOutputConfig{}
+		}
+		out.OutputConfig.Effort = effort
 		// Enable thinking for non-low efforts
 		if effort != "low" {
 			out.Thinking = &AnthropicThinking{
@@ -144,6 +164,38 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 	}
 
 	return out, nil
+}
+
+// The schema is opaque here: conversion never removes constraints. The name,
+// description and strict flag belong to the Responses envelope, while the
+// equivalent Anthropic envelope contains only type and the original schema.
+func responsesTextToAnthropicOutputFormat(text *ResponsesText) (*AnthropicOutputFormat, error) {
+	if text == nil || len(text.Format) == 0 || bytes.Equal(bytes.TrimSpace(text.Format), []byte("null")) {
+		return nil, nil
+	}
+	if len(text.Format) > 64<<10 {
+		return nil, ErrResponsesOutputFormat
+	}
+	var format struct {
+		Type        string          `json:"type"`
+		Name        string          `json:"name,omitempty"`
+		Description string          `json:"description,omitempty"`
+		Strict      *bool           `json:"strict,omitempty"`
+		Schema      json.RawMessage `json:"schema,omitempty"`
+	}
+	d := json.NewDecoder(bytes.NewReader(text.Format))
+	d.DisallowUnknownFields()
+	if d.Decode(&format) != nil || d.Decode(new(any)) != io.EOF {
+		return nil, ErrResponsesOutputFormat
+	}
+	if format.Type == "text" && len(format.Schema) == 0 && format.Name == "" && format.Description == "" && format.Strict == nil {
+		return nil, nil
+	}
+	schema := bytes.TrimSpace(format.Schema)
+	if format.Type != "json_schema" || len(schema) == 0 || schema[0] != '{' || !json.Valid(schema) {
+		return nil, ErrResponsesOutputFormat
+	}
+	return &AnthropicOutputFormat{Type: "json_schema", Schema: append(json.RawMessage(nil), format.Schema...)}, nil
 }
 
 // defaultThinkingBudget returns a sensible thinking budget based on effort level.
@@ -213,13 +265,14 @@ func convertResponsesInputToAnthropic(instructions string, inputRaw json.RawMess
 
 		case item.Type == "function_call":
 			// function_call → assistant message with tool_use block
+			// Preserve the explicit call_id; it is not a Responses output item ID.
 			input := json.RawMessage("{}")
 			if item.Arguments != "" {
 				input = json.RawMessage(item.Arguments)
 			}
 			block := AnthropicContentBlock{
 				Type:  "tool_use",
-				ID:    fromResponsesCallIDToAnthropic(item.CallID),
+				ID:    item.CallID,
 				Name:  item.Name,
 				Input: input,
 			}
@@ -234,7 +287,7 @@ func convertResponsesInputToAnthropic(instructions string, inputRaw json.RawMess
 			contentJSON := responsesFunctionOutputToAnthropicContent(item)
 			block := AnthropicContentBlock{
 				Type:      "tool_result",
-				ToolUseID: fromResponsesCallIDToAnthropic(item.CallID),
+				ToolUseID: item.CallID,
 				Content:   contentJSON,
 			}
 			blockJSON, _ := json.Marshal([]AnthropicContentBlock{block})
@@ -631,22 +684,6 @@ func convertResponsesAssistantToAnthropicContent(raw json.RawMessage) (json.RawM
 		blocks = append(blocks, AnthropicContentBlock{Type: "text", Text: ""})
 	}
 	return json.Marshal(blocks)
-}
-
-// fromResponsesCallIDToAnthropic converts an OpenAI function call ID back to
-// Anthropic format. Reverses toResponsesCallID.
-func fromResponsesCallIDToAnthropic(id string) string {
-	// If it has our "fc_" prefix wrapping a known Anthropic prefix, strip it
-	if after, ok := strings.CutPrefix(id, "fc_"); ok {
-		if strings.HasPrefix(after, "toolu_") || strings.HasPrefix(after, "call_") {
-			return after
-		}
-	}
-	// Generate a synthetic Anthropic tool ID
-	if !strings.HasPrefix(id, "toolu_") && !strings.HasPrefix(id, "call_") {
-		return "toolu_" + id
-	}
-	return id
 }
 
 // dataURIToAnthropicImageSource parses a data URI into an AnthropicImageSource.

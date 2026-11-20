@@ -300,19 +300,19 @@ func TestGatewayNativeOpenRouterAcceptsReplayedReasoningText(t *testing.T) {
 		`[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"s"}],"content":[{"type":"reasoning_text","text":"t"}],"encrypted_content":"abc","status":"completed"}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[]}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"t"}],"format":"unknown"}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"content":null}]`,
+		`[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":null}]`,
 	}
 	for _, raw := range accepted {
 		require.True(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)
 	}
-	// Everything else stays strict: unknown keys, null values, other part types.
+	// Everything else stays strict: unknown keys, nonoptional nulls, other part types.
 	rejected := []string{
 		`[{"type":"reasoning","id":"rs_1","summary":[],"format":null}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"format":7}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"signature":"x"}]`,
-		`[{"type":"reasoning","id":"rs_1","summary":[],"content":null}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"input_text","text":"x"}]}]`,
 		`[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"x","extra":1}]}]`,
-		`[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":null}]`,
 	}
 	for _, raw := range rejected {
 		require.False(t, gatewayNativeProviderTextInput(GatewayOpenRouterResponsesProfile, []byte(raw)), raw)

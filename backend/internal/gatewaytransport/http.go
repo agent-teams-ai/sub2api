@@ -118,7 +118,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			return
 		}
 	} else {
-		requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
+		requireTier := !service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) && !service.GatewayNativeOfficialAPIProfileIDValid(profile.Profile) && profile.Profile != service.GatewayGrokOAuthResponsesProfile
 		if profile.Profile == service.GatewayCodexOAuthResponsesProfile || profile.Profile == service.GatewayOpenRouterResponsesProfile || service.GatewayModelCatalogProfile(profile.Profile) {
 			fields, valid := service.GatewayNativePayloadFields(input.Payload, "model")
 			if !valid || json.Unmarshal(fields["model"], &requestedModel) != nil || !service.GatewayAccountModelIDValid(requestedModel) ||
@@ -137,7 +137,7 @@ func (h *Handler) serveRequest(raw http.ResponseWriter, r *http.Request, peer Pe
 			return
 		}
 	}
-	if service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) || profile.Profile == service.GatewayGrokOAuthResponsesProfile {
+	if service.GatewayNativeCodingPlanProfileIDValid(profile.Profile) || service.GatewayNativeOfficialAPIProfileIDValid(profile.Profile) || profile.Profile == service.GatewayGrokOAuthResponsesProfile {
 		if service.ValidateGatewayNativeProviderResponsesBounded(profile.Profile, payload, input.Admission.Limits.RequestBytes) != nil {
 			writeExecutionError(raw, public, http.StatusBadRequest, input.RequestRef)
 			return

@@ -60,15 +60,14 @@ func runPrivateProviderQuota(ctx context.Context, db *sql.DB, c Config, gateway 
 				}
 				_ = rows.Close()
 				for _, p := range accounts {
-					collectPrivateQuota(ctx, db, p, func(bounded context.Context) (service.GatewayAccountLimitsSnapshotV2, time.Time, error) {
-						var snapshot service.GatewayAccountLimitsSnapshotV2
-						var observed time.Time
+					collectPrivateQuotaInfo(ctx, db, p, func(bounded context.Context) (service.GatewayProviderQuotaObservation, error) {
+						var observation service.GatewayProviderQuotaObservation
 						err := gateway.WithGatewayNativeQuotaCredential(bounded, p.Scope, p.Route, custody, func(key []byte, _ service.GatewayNativeOAuthPhysical) error {
 							var e error
-							snapshot, observed, e = collector.FetchObserved(bounded, service.GatewayAccountLimitsProviderV2(p.Route.Profile), key)
+							observation, e = collector.FetchWithAccountInfo(bounded, service.GatewayAccountLimitsProviderV2(p.Route.Profile), key)
 							return e
 						})
-						return snapshot, observed, err
+						return observation, err
 					}, cache)
 				}
 			}
@@ -95,6 +94,13 @@ func runPrivateProviderQuota(ctx context.Context, db *sql.DB, c Config, gateway 
 	}
 }
 func collectPrivateQuota(ctx context.Context, db *sql.DB, p service.GatewayNativeOAuthPhysical, fetch func(context.Context) (service.GatewayAccountLimitsSnapshotV2, time.Time, error), cache service.GatewayAccountLimitsRepositoryV2) {
+	collectPrivateQuotaInfo(ctx, db, p, func(ctx context.Context) (service.GatewayProviderQuotaObservation, error) {
+		s, at, e := fetch(ctx)
+		return service.GatewayProviderQuotaObservation{Limits: s, ObservedAt: at}, e
+	}, cache)
+}
+
+func collectPrivateQuotaInfo(ctx context.Context, db *sql.DB, p service.GatewayNativeOAuthPhysical, fetch func(context.Context) (service.GatewayProviderQuotaObservation, error), cache service.GatewayAccountLimitsRepositoryV2) {
 	bounded, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	conn, err := db.Conn(bounded)
@@ -123,9 +129,28 @@ func collectPrivateQuota(ctx context.Context, db *sql.DB, p service.GatewayNativ
 	if err != nil {
 		return
 	}
-	snapshot, observed, err := fetch(bounded)
+	composite, ok := cache.(service.GatewayAccountQuotaInfoRepository)
+	var order int64
+	if service.GatewayAccountInfoPlanQuotaProfile(p.Route.Profile) {
+		if !ok {
+			return
+		}
+		order, err = composite.ReserveGatewayAccountInfoOrder(bounded)
+		if err != nil {
+			return
+		}
+	}
+	observation, err := fetch(bounded)
 	if err != nil {
 		return
 	}
-	_ = cache.StoreGatewayAccountLimitsV2(bounded, p, snapshot, observed)
+	if observation.Info != nil {
+		if !ok {
+			return
+		}
+		info := service.GatewayAccountInfoObservation{Source: "plan_quota", Order: order, CredentialRevision: p.CredentialRevision, Fields: *observation.Info}
+		_ = composite.StoreGatewayQuotaAndInfo(bounded, p, observation.Limits, observation.ObservedAt, &info)
+	} else {
+		_ = cache.StoreGatewayAccountLimitsV2(bounded, p, observation.Limits, observation.ObservedAt)
+	}
 }

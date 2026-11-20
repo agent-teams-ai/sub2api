@@ -52,6 +52,12 @@ type GatewayAccountLimitsRepositoryV2 interface {
 	GatewayAccountLimitsCacheV2
 	StoreGatewayAccountLimitsV2(context.Context, GatewayNativeOAuthPhysical, GatewayAccountLimitsSnapshotV2, time.Time) error
 }
+
+type GatewayAccountQuotaInfoRepository interface {
+	GatewayAccountLimitsRepositoryV2
+	ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
+	StoreGatewayQuotaAndInfo(context.Context, GatewayNativeOAuthPhysical, GatewayAccountLimitsSnapshotV2, time.Time, *GatewayAccountInfoObservation) error
+}
 type GatewayAccountLimitsReaderV2 struct {
 	repository GatewayAccountLimitsCacheV2
 	authorize  GatewayAccountLimitsAuthorizer

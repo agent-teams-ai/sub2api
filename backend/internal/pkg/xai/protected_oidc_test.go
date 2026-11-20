@@ -49,7 +49,7 @@ func TestProtectedOIDCRejectsForgedPrincipal(t *testing.T) {
 		{name: "signed team mismatch", field: "team_id", value: "team", userSubject: "owner", userTeam: "different"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			claims := jwt.MapClaims{"iss": OAuthIssuer, "aud": "qualified-client", "sub": "owner", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": "saved-nonce"}
+			claims := jwt.MapClaims{"iss": OAuthIssuer, "aud": "qualified-client", "sub": "owner", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": "saved-nonce", "email": "claim-not-userinfo@example.test", "name": "Claim name"}
 			if tc.field != "" {
 				if tc.value == nil {
 					delete(claims, tc.field)
@@ -75,7 +75,7 @@ func TestProtectedOIDCRejectsForgedPrincipal(t *testing.T) {
 					body = map[string]any{"keys": []any{map[string]string{"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": "fixture", "x": base64.RawURLEncoding.EncodeToString(key.X.FillBytes(make([]byte, 32))), "y": base64.RawURLEncoding.EncodeToString(key.Y.FillBytes(make([]byte, 32)))}}}
 				case ProtectedUserinfoURL:
 					require.Equal(t, "Bearer private-access", r.Header.Get("Authorization"))
-					body = map[string]string{"sub": tc.userSubject, "team_id": tc.userTeam}
+					body = map[string]string{"sub": tc.userSubject, "team_id": tc.userTeam, "email": "authenticated@example.test", "name": "Authenticated label", "private_extra": "never-export"}
 				default:
 					t.Fatalf("unexpected request: %s", r.URL.String())
 				}
@@ -86,6 +86,8 @@ func TestProtectedOIDCRejectsForgedPrincipal(t *testing.T) {
 			if tc.valid {
 				require.NoError(t, err)
 				require.Equal(t, "owner", principal.Subject)
+				require.Equal(t, "authenticated@example.test", principal.Email)
+				require.Equal(t, "Authenticated label", principal.Name)
 				if tc.userTeam == "" {
 					require.Equal(t, "personal:owner", principal.Account)
 				} else {
@@ -94,7 +96,7 @@ func TestProtectedOIDCRejectsForgedPrincipal(t *testing.T) {
 				require.Equal(t, 2, calls)
 			} else {
 				require.ErrorIs(t, err, ErrProtectedIdentity)
-				require.Empty(t, principal.Subject)
+				require.Equal(t, ProtectedPrincipal{}, principal)
 			}
 		})
 	}

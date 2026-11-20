@@ -147,6 +147,10 @@ func (r *accountRepository) QualifyGatewayNativeOAuthDispatch(ctx context.Contex
 	}
 	// Secondary cleanup must preserve the original operation/commit result.
 	defer func() { _ = tx.Rollback() }()
+	var locked int64
+	if tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=$1 AND created_at=$2 AND deleted_at IS NULL FOR UPDATE`, p.Route.AccountID, p.Route.CreatedAt).Scan(&locked) != nil {
+		return service.ErrGatewayNativeIdentity
+	}
 	_, current, err := gatewayOAuthPhysicalRead(ctx, tx, p.Scope, p.Operation, p.Route.AccountID)
 	if err != nil || !service.SameGatewayNativeDescriptor(current.Route, p.Route) || current.Issuer != p.Issuer || current.Subject != p.Subject {
 		return service.ErrGatewayNativeIdentity
@@ -169,6 +173,12 @@ func (r *accountRepository) QualifyGatewayNativeOAuthDispatch(ctx context.Contex
 	n, err := result.RowsAffected()
 	if err != nil || n != 1 {
 		return service.ErrGatewayOAuthConflict
+	}
+	p.CredentialRevision = version
+	for _, observation := range p.AccountInfoObservations(version) {
+		if err := storeGatewayAccountInfoTx(ctx, tx, p, observation, false); err != nil {
+			return err
+		}
 	}
 	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity

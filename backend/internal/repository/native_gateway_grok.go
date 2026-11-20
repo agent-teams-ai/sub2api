@@ -22,6 +22,12 @@ func NewGatewayNativeGrokRepository(db *sql.DB) (service.GatewayNativeGrokReposi
 	}
 	return &gatewayGrokRepository{db}, nil
 }
+func (r *gatewayGrokRepository) ReserveGatewayAccountInfoOrder(ctx context.Context) (int64, error) {
+	return NewGatewayAccountInfoRepository(r.db).ReserveGatewayAccountInfoOrder(ctx)
+}
+func (r *gatewayGrokRepository) StoreGatewayAccountInfo(ctx context.Context, p service.GatewayNativeOAuthPhysical, initialize bool, observations ...service.GatewayAccountInfoObservation) error {
+	return NewGatewayAccountInfoRepository(r.db).StoreGatewayAccountInfo(ctx, p, initialize, observations...)
+}
 func grokArgs(s service.GatewayNativeCredentialScope, op string) []any {
 	return []any{s.Consumer, op, s.Owner, s.Account, s.Generation, s.Purpose}
 }
@@ -104,7 +110,17 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokConnect(ctx context.Context, 
 	}
 	args := append(grokArgs(s, op), id, birth, account, org)
 	_, err = tx.ExecContext(ctx, `UPDATE gateway_grok_connect_intents SET state='completed',material_envelope='',account_id=$7,native_created_at=$8,subject_ref=$9,team_ref=$10`+grokWhere, args...)
-	if err != nil || tx.Commit() != nil {
+	if err != nil {
+		return out, service.ErrGatewayNativeIdentity
+	}
+	p := service.GatewayNativeOAuthPhysical{Scope: s, Operation: op, Route: grokRoute(id, birth, s.Generation), Issuer: service.GatewayGrokOAuthIssuer, Subject: account, ProviderAccount: org, CredentialRevision: 1}
+	for _, observation := range in.Identity.AccountInfo() {
+		observation.CredentialRevision = p.CredentialRevision
+		if storeGatewayAccountInfoTx(ctx, tx, p, observation, false) != nil {
+			return out, service.ErrGatewayNativeIdentity
+		}
+	}
+	if tx.Commit() != nil {
 		return out, service.ErrGatewayNativeIdentity
 	}
 	return service.GatewayNativeOAuthOutcome{Operation: op, AccountID: id, Generation: s.Generation, State: "staged"}, nil
@@ -208,7 +224,7 @@ func (r *gatewayGrokRepository) ClaimGatewayGrokRefresh(ctx context.Context, s s
 	}
 	return p, envelope, true, nil
 }
-func (r *gatewayGrokRepository) CompleteGatewayGrokRefresh(ctx context.Context, p service.GatewayNativeOAuthPhysical, attempt, envelope string) error {
+func (r *gatewayGrokRepository) CompleteGatewayGrokRefresh(ctx context.Context, p service.GatewayNativeOAuthPhysical, attempt, envelope string, info ...service.GatewayAccountInfoObservation) error {
 	tx, current, _, err := r.physicalTx(ctx, p.Scope, p.Operation, &p.Route, true, true)
 	if err != nil {
 		return err
@@ -234,7 +250,14 @@ func (r *gatewayGrokRepository) CompleteGatewayGrokRefresh(ctx context.Context, 
 		return service.ErrGatewayNativeIdentity
 	}
 	n, _ = result.RowsAffected()
-	if n != 1 || tx.Commit() != nil {
+	if n != 1 {
+		return service.ErrGatewayNativeIdentity
+	}
+	current.CredentialRevision++
+	if err := storeGatewayRefreshAccountInfoTx(ctx, tx, current, info); err != nil {
+		return err
+	}
+	if tx.Commit() != nil {
 		return service.ErrGatewayNativeIdentity
 	}
 	return nil
@@ -383,7 +406,10 @@ func (r *gatewayGrokRepository) LockGatewayGrokMaintenance(ctx context.Context, 
 		return p, "", "", "", nil, err
 	}
 	var state, attempt string
-	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,'') FROM gateway_grok_connect_intents`+grokWhere, grokArgs(s, op)...).Scan(&state, &attempt)
+	args := append(grokArgs(s, op), p.Route.AccountID, p.Route.CreatedAt, p.Route.Generation, service.GatewayAccountInfoPrincipal(p))
+	err = tx.QueryRowContext(ctx, `SELECT refresh_state,COALESCE(refresh_operation,''),EXISTS(
+ SELECT 1 FROM gateway_account_info_snapshots WHERE account_id=$7 AND native_created_at=$8 AND generation=$9 AND principal_version=$10)
+ FROM gateway_grok_connect_intents`+grokWhere, args...).Scan(&state, &attempt, &p.AccountInfoInitialized)
 	if err != nil {
 		_ = tx.Rollback()
 		return p, "", "", "", nil, service.ErrGatewayNativeIdentity

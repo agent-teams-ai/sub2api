@@ -37,15 +37,17 @@ type GatewayNativeOAuthRefreshFence interface {
 
 type GatewayNativeOAuthPhysical struct {
 	CredentialRevision int64
-	Scope              GatewayNativeCredentialScope
-	Operation          string
-	Route              GatewayNativeRoute
-	Issuer             string
-	Subject            string
-	ProviderAccount    string
-	QualifiedAt        time.Time
-	proof              *gatewayOAuthQualificationProof
-	RefreshFence       GatewayNativeOAuthRefreshFence
+	// Computed by the existing maintenance read; never a stored mirror flag.
+	AccountInfoInitialized bool `json:"-"`
+	Scope                  GatewayNativeCredentialScope
+	Operation              string
+	Route                  GatewayNativeRoute
+	Issuer                 string
+	Subject                string
+	ProviderAccount        string
+	QualifiedAt            time.Time
+	proof                  *gatewayOAuthQualificationProof
+	RefreshFence           GatewayNativeOAuthRefreshFence
 }
 
 type GatewayNativeOAuthDispatchRepository interface {
@@ -87,12 +89,25 @@ func (s *GatewayNativeOAuthDispatch) BindApproved(ctx context.Context, route Gat
 type gatewayOAuthQualificationProof struct {
 	physical GatewayNativeOAuthPhysical
 	version  int64
+	info     []GatewayAccountInfoObservation
 }
 
 // Kept outside JSON and outside Account.Extra so existing immutable birth and
 // refresh guards remain authoritative. A copied DTO does not mint a proof.
 func (p GatewayNativeOAuthPhysical) QualificationValid(version int64) bool {
 	return p.proof != nil && version == p.proof.version && sameGatewayOAuthPhysical(p, p.proof.physical)
+}
+
+// Metadata is minted by the same verified qualification. Return a deep copy so
+// repository callers cannot mutate the private proof through exported pointers.
+func (p GatewayNativeOAuthPhysical) AccountInfoObservations(version int64) []GatewayAccountInfoObservation {
+	if !p.QualificationValid(version) {
+		return nil
+	}
+	raw, _ := json.Marshal(p.proof.info)
+	var out []GatewayAccountInfoObservation
+	_ = json.Unmarshal(raw, &out)
+	return out
 }
 
 func sameGatewayOAuthPhysical(a, b GatewayNativeOAuthPhysical) bool {
@@ -197,12 +212,22 @@ func (s *GatewayNativeOAuthDispatch) Descriptor(ctx context.Context, scope Gatew
 	if err != nil {
 		return out, ErrGatewayNativeIdentity
 	}
+	var infoOrder int64
+	if source, ok := s.repository.(interface {
+		ReserveGatewayAccountInfoOrder(context.Context) (int64, error)
+	}); ok {
+		infoOrder, err = source.ReserveGatewayAccountInfoOrder(bounded)
+		if err != nil {
+			return out, ErrGatewayNativeIdentity
+		}
+	}
 	identity, err := s.verifier.Verify(bounded, bundle.IDToken)
 	issuer, subject := identity.Principal()
 	if err != nil || issuer != physical.Issuer || subject != physical.Subject {
 		return out, ErrGatewayNativeIdentity
 	}
-	provider, err := s.accountCheck(bounded, bundle.AccessToken)
+	credentialInfo := gatewayCodexCredentialInfo(bundle, s.custody, time.Now())
+	provider, info, err := s.accountCheckInfo(bounded, bundle.AccessToken)
 	bundle = GatewayNativeOAuthBundle{}
 	if err != nil {
 		return out, nil
@@ -210,6 +235,13 @@ func (s *GatewayNativeOAuthDispatch) Descriptor(ctx context.Context, scope Gatew
 	physical.ProviderAccount = provider
 	physical.QualifiedAt = time.Now().UTC().Truncate(time.Microsecond)
 	physical.proof = &gatewayOAuthQualificationProof{physical: physical, version: version}
+	if infoOrder > 0 {
+		physical.proof.info = []GatewayAccountInfoObservation{
+			{Source: "verified_claims", Order: infoOrder, CredentialRevision: version, ValidUntil: &identity.expiresAt, Fields: identity.info},
+			{Source: "account_check", Order: infoOrder, CredentialRevision: version, Fields: info},
+			{Source: "credential", Order: infoOrder, CredentialRevision: version, Fields: credentialInfo},
+		}
+	}
 	if err = s.repository.QualifyGatewayNativeOAuthDispatch(bounded, physical, version); err != nil {
 		return out, ErrGatewayNativeIdentity
 	}
@@ -220,9 +252,15 @@ func (s *GatewayNativeOAuthDispatch) Descriptor(ctx context.Context, scope Gatew
 }
 
 func (s *GatewayNativeOAuthDispatch) accountCheck(ctx context.Context, access string) (string, error) {
+	id, _, err := s.accountCheckInfo(ctx, access)
+	return id, err
+}
+
+func (s *GatewayNativeOAuthDispatch) accountCheckInfo(ctx context.Context, access string) (string, GatewayAccountInfoFields, error) {
+	empty := GatewayAccountInfoEmptyFields(GatewayCodexOAuthResponsesProfile)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gatewayCodexAccountCheckURL, nil)
 	if err != nil {
-		return "", ErrGatewayNativeIdentity
+		return "", empty, ErrGatewayNativeIdentity
 	}
 	for name, values := range s.accountCheckHeaders {
 		req.Header[name] = append([]string(nil), values...)
@@ -233,17 +271,22 @@ func (s *GatewayNativeOAuthDispatch) accountCheck(ctx context.Context, access st
 	req.Header.Set("Accept", "application/json")
 	response, err := s.client.Do(req)
 	if err != nil {
-		return "", ErrGatewayNativeIdentity
+		return "", empty, ErrGatewayNativeIdentity
 	}
 	if response.Body == nil {
-		return "", ErrGatewayNativeIdentity
+		return "", empty, ErrGatewayNativeIdentity
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 65537))
 	closeErr := response.Body.Close()
 	if readErr != nil || closeErr != nil || len(raw) > 65536 || response.StatusCode != http.StatusOK || response.Request == nil || response.Request.URL.String() != gatewayCodexAccountCheckURL {
-		return "", ErrGatewayNativeIdentity
+		return "", empty, ErrGatewayNativeIdentity
 	}
-	return gatewayOAuthSelectAccount(raw, time.Now())
+	at := time.Now().UTC()
+	id, err := gatewayOAuthSelectAccount(raw, at)
+	if err != nil {
+		return "", empty, err
+	}
+	return id, gatewayCodexAccountInfo(raw, id, at), nil
 }
 
 // Returned account records are authenticated by the fixed bearer endpoint.

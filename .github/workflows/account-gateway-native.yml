@@ -73,6 +73,33 @@ jobs:
           go test -tags integration ./internal/handler/admin -run '^TestGatewayNativeReviewReasoningHTTPRedis$' -count=1 -v -timeout 180s | tee /tmp/native-redis.log
           test "$(sed -n '/^--- PASS: TestGatewayNativeReviewReasoningHTTPRedis /p' /tmp/native-redis.log | wc -l)" -eq 1
 
+      - name: Native account facts, credential imports and official review APIs
+        working-directory: backend
+        env:
+          GATEWAY_NATIVE_INFO_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_info_test_ci?sslmode=disable
+          GATEWAY_NATIVE_IMPORT_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_import_test_ci?sslmode=disable
+          GATEWAY_NATIVE_CODEX_INFO_TEST_DSN: postgres://native_contract_test@127.0.0.1:5432/gateway_info_test_codex_ci?sslmode=disable
+        run: |
+          set -o pipefail
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_info_test_ci
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_import_test_ci
+          docker exec "${{ job.services.postgres.id }}" createdb -U native_contract_test gateway_info_test_codex_ci
+          go test -tags unit ./internal/pkg/apicompat ./internal/service -run 'TestGeminiContinuation|TestResponsesToAnthropic.*StructuredOutput|TestGatewayGeminiContinuation|TestGatewayAccountInfo|TestGatewayQuotaAndInfo|TestGatewayCodex(Info|RetainedInfo|Maintenance)|TestGatewayClaudeInfo|TestGatewayGrokInfo|TestGatewayOAuthInfo|TestGatewayAccountCapabilities|TestGatewayNativeGemini|TestGatewayNativeOfficial|TestGatewayNativeAnthropicSchema' -count=1 -v | tee "$RUNNER_TEMP/native-account-info-unit.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-account-info-unit.log"
+          go test -tags unit ./internal/gatewaybootstrap ./internal/handler/admin -run 'TestNativeAccountCapabilities|TestNativeOfficialAPIConfig|TestGatewayAccountLimitsAuthorityHTTP|TestGatewayAccountInfoPrivateHTTPContract|TestGatewayNativeOAuthConnectHTTPImportStrictIngress' -count=1 -v | tee "$RUNNER_TEMP/native-account-info-http.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-account-info-http.log"
+          for critical in TestNativeAccountCapabilitiesExposeImportsOnlyWithComposedCodex TestNativeOfficialAPIConfigUsesExistingClosedFD6Profiles TestGatewayAccountLimitsAuthorityHTTP TestGatewayAccountInfoPrivateHTTPContract TestGatewayNativeOAuthConnectHTTPImportStrictIngress; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-account-info-http.log")" -eq 1
+          done
+          for critical in TestGatewayNativeOfficialGeminiActualTLSContinuationAndSchema TestGatewayNativeOfficialAnthropicActualTLSHeadersToolsAndSchema TestGatewayGeminiContinuationBindsEveryAuthorityAndNativeIdentity TestGatewayAccountInfoReaderUsesCurrentSnapshotAndFinalAuthority; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-account-info-unit.log")" -eq 1
+          done
+          go test -tags integration ./internal/repository -run '^TestGateway(AccountInfoPostgresOrderingAtomicityAndReplacement|AccountInfoCodexPostgresHydrationAndRefresh|NativeOAuthImportPostgresClaimsReplayAndLostACK)$' -count=1 -v -timeout 180s | tee "$RUNNER_TEMP/native-account-info-pg.log"
+          ! grep -Fq -- '--- SKIP:' "$RUNNER_TEMP/native-account-info-pg.log"
+          for critical in TestGatewayAccountInfoPostgresOrderingAtomicityAndReplacement TestGatewayAccountInfoCodexPostgresHydrationAndRefresh TestGatewayNativeOAuthImportPostgresClaimsReplayAndLostACK; do
+            test "$(grep -c "^--- PASS: $critical " "$RUNNER_TEMP/native-account-info-pg.log")" -eq 1
+          done
+
       - name: OAuth joined descriptor wire and PostgreSQL connect lifecycle
         working-directory: backend
         env:

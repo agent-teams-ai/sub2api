@@ -332,7 +332,6 @@ func gatewayClaudeInput(raw json.RawMessage) bool {
 }
 
 func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry GatewayNativeClaudeDispatchEntry, wire []byte, headers map[string]string, transport http.RoundTripper) (*OpenAIForwardResult, error) {
-	nativeMessages := gatewayNativeClaudeMessagesMode(ctx)
 	if entry.Release == nil || entry.Claim == nil {
 		return nil, ErrGatewayNativeIdentity
 	}
@@ -381,6 +380,13 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 	// check. The owned response body and cancellation remain with the lifetime;
 	// a long SSE response must not retain a database connection.
 	entry.Release()
+	return gatewayNativeAnthropicResponse(ctx, c, response, GatewayClaudeOAuthModel, start, cancel, &observation, nil)
+}
+
+// The shared response consumer owns only strict Messages protocol, bounded SSE,
+// conversion, delivery and usage. Credential kind/headers remain with callers.
+func gatewayNativeAnthropicResponse(ctx context.Context, c *gin.Context, response *http.Response, model string, start time.Time, cancel context.CancelFunc, observation *GatewayNativeUsage, validateFinal func([]apicompat.ResponsesOutput) bool) (*OpenAIForwardResult, error) {
+	nativeMessages := gatewayNativeClaudeMessagesMode(ctx)
 	if response.StatusCode != http.StatusOK || gatewayNativeUpstreamMediaCategory(response.Header.Get("Content-Type")) != "sse" || (response.Header.Get("Content-Encoding") != "" && !strings.EqualFold(response.Header.Get("Content-Encoding"), "identity")) {
 		return nil, ErrGatewayNativeEffectUnknown
 	}
@@ -393,8 +399,12 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 	scanner.Split(gatewayNativeRawSSELine)
 	scanner.Buffer(make([]byte, 4096), gatewayNativeSSEFrameLimit+1)
 	state := apicompat.NewAnthropicEventToResponsesState()
-	state.Model = GatewayClaudeOAuthModel
-	result := &OpenAIForwardResult{Stream: true, Model: GatewayClaudeOAuthModel, UpstreamEndpoint: "/v1/messages"}
+	state.Model = model
+	var restorer *apicompat.ResponsesClientToolStreamRestorer
+	if mapping, ok := grokResponsesClientToolMapping(c); ok {
+		restorer = apicompat.NewResponsesClientToolStreamRestorer(mapping)
+	}
+	result := &OpenAIForwardResult{Stream: true, Model: model, UpstreamEndpoint: "/v1/messages"}
 	var frame bytes.Buffer
 	var data []string
 	eventName := ""
@@ -477,7 +487,7 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 				continue
 			}
 		case "message_start":
-			if started || event.Message == nil || event.Message.Type != "message" || event.Message.Role != "assistant" || event.Message.ID == "" || event.Message.Model != GatewayClaudeOAuthModel || len(event.Message.Content) != 0 {
+			if started || event.Message == nil || event.Message.Type != "message" || event.Message.Role != "assistant" || event.Message.ID == "" || event.Message.Model != model || len(event.Message.Content) != 0 {
 				return nil, ErrGatewayNativeEffectUnknown
 			}
 			message, valid := gatewayNativeCanonicalObject(fields["message"], "usage", "id", "type", "role", "model", "content", "stop_reason", "stop_sequence")
@@ -630,12 +640,28 @@ func gatewayNativeClaudeResponses(ctx context.Context, c *gin.Context, entry Gat
 		if nativeMessages {
 			encodedFrames = []string{frame.String()}
 		} else {
-			for _, converted := range apicompat.AnthropicEventToResponsesEvents(&event, state) {
-				encoded, err := apicompat.ResponsesEventToSSE(converted)
-				if err != nil {
+			convertedEvents := apicompat.AnthropicEventToResponsesEvents(&event, state)
+			if event.Type == "message_stop" && validateFinal != nil {
+				toolTurn := false
+				for _, item := range state.Outputs {
+					toolTurn = toolTurn || item.Type == "function_call"
+				}
+				if state.StopReason == "tool_use" && !toolTurn || state.StopReason != "tool_use" && !validateFinal(state.Outputs) {
 					return nil, ErrGatewayNativeEffectUnknown
 				}
-				encodedFrames = append(encodedFrames, encoded)
+			}
+			for _, converted := range convertedEvents {
+				convertedEvents := []apicompat.ResponsesStreamEvent{converted}
+				if restorer != nil {
+					convertedEvents = restorer.Restore(converted)
+				}
+				for _, restored := range convertedEvents {
+					encoded, err := apicompat.ResponsesEventToSSE(restored)
+					if err != nil {
+						return nil, ErrGatewayNativeEffectUnknown
+					}
+					encodedFrames = append(encodedFrames, encoded)
+				}
 			}
 		}
 		for _, encoded := range encodedFrames {
