@@ -203,7 +203,11 @@ func (s *GeminiMessagesCompatService) ForwardGetModel(ctx context.Context, accou
 
 	location := account.VertexLocation(model)
 	if isVertexMultiRegion(location) {
-		location = vertexGlobalLocation
+		// Global publisher lists are used for account-default multi-regions, but
+		// explicit per-model pins must use the same region as generateContent.
+		if _, pinned := account.vertexModelLocationOverride(model); !pinned {
+			location = vertexGlobalLocation
+		}
 	}
 	modelIDs, failure, err := s.listVertexGeminiModels(ctx, account, location)
 	if err != nil {

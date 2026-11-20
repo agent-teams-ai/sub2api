@@ -168,6 +168,27 @@ func TestForwardGetModel_VertexServiceAccountLooksUpModelList(t *testing.T) {
 	})
 }
 
+func TestForwardGetModel_VertexRespectsExplicitMultiRegionPin(t *testing.T) {
+	for _, region := range []string{"us", "eu"} {
+		t.Run(region, func(t *testing.T) {
+			upstream := &httpUpstreamRecorder{resp: vertexModelsJSONResponse(http.StatusOK,
+				`{"publisherModels":[{"name":"publishers/google/models/gemini-private-in-region"}]}`)}
+			svc := newGeminiModelsEndpointsTestService(nil, upstream)
+			account := vertexModelSyncTestAccount(map[string]any{
+				"location": "us",
+				"vertex_model_locations": map[string]any{
+					"gemini-private-in-region": region,
+				},
+			})
+			res, err := svc.ForwardGetModel(context.Background(), account, "gemini-private-in-region")
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, res.StatusCode)
+			require.Equal(t, "https://aiplatform."+region+".rep.googleapis.com/v1beta1/publishers/google/models?pageSize=300",
+				upstream.lastReq.URL.String())
+		})
+	}
+}
+
 func TestForwardGetModel_VertexUsesModelLocation(t *testing.T) {
 	upstream := &httpUpstreamRecorder{resp: vertexModelsJSONResponse(http.StatusOK, `{"publisherModels":[{"name":"publishers/google/models/gemini-3.8-flash"}]}`)}
 	svc := newGeminiModelsEndpointsTestService(nil, upstream)

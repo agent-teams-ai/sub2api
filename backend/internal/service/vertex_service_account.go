@@ -90,18 +90,29 @@ func (a *Account) VertexLocation(model string) string {
 	if a == nil {
 		return vertexDefaultLocation
 	}
-	if model != "" && a.Credentials != nil {
-		if raw, ok := a.Credentials["vertex_model_locations"].(map[string]any); ok {
-			if loc, ok := raw[model].(string); ok && strings.TrimSpace(loc) != "" {
-				return strings.TrimSpace(loc)
-			}
-		}
+	if location, pinned := a.vertexModelLocationOverride(model); pinned {
+		return location
 	}
 	location := a.vertexAccountLocation()
 	if a.Platform != PlatformGemini {
 		return location
 	}
 	return resolveVertexModelLocation(location, model)
+}
+
+// vertexModelLocationOverride returns a caller-pinned location without applying
+// the default multi-region model availability table.
+func (a *Account) vertexModelLocationOverride(model string) (string, bool) {
+	if a == nil || model == "" || a.Credentials == nil {
+		return "", false
+	}
+	locations, ok := a.Credentials["vertex_model_locations"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	location, ok := locations[model].(string)
+	location = strings.TrimSpace(location)
+	return location, ok && location != ""
 }
 
 // vertexAccountLocation 返回账号配置的区域，未配置时为 vertexDefaultLocation。
