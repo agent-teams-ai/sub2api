@@ -14,6 +14,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ForwardGemini 转发 Gemini 协议请求
@@ -522,47 +524,70 @@ func cleanGeminiRequest(body []byte) ([]byte, error) {
 		}
 	}
 
-	// 2. 结构化输出 Schema
-	if normalizeGeminiResponseSchema(payload) {
-		modified = true
+	// Tool schemas use the existing cleaner. Only re-encode the whole request
+	// when a tool parameter was actually touched; the response schema rewrite
+	// below operates on raw JSON to preserve property order and large numbers.
+	if modified {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = encoded
 	}
-
-	if !modified {
-		return body, nil
-	}
-
-	return json.Marshal(payload)
+	return normalizeGeminiResponseSchemaRaw(body)
 }
 
-// normalizeGeminiResponseSchema 将 generationConfig.responseJsonSchema 改写为 responseSchema。
-// Antigravity 上游接受 responseJsonSchema 字段但静默忽略（返回普通文本而非 JSON），只有 responseSchema 生效；
-// 而 @ai-sdk/google >= 4.0.70 等客户端只发送 responseJsonSchema。已有 responseSchema 时以其为准。
-func normalizeGeminiResponseSchema(payload map[string]any) bool {
-	changed := false
+// normalizeGeminiResponseSchemaRaw renames responseJsonSchema without encoding
+// the surrounding JSON through map[string]any. This preserves property order
+// and exact JSON numbers when the Antigravity cleaner requires no changes.
+func normalizeGeminiResponseSchemaRaw(body []byte) ([]byte, error) {
 	for _, configKey := range []string{"generationConfig", "generation_config"} {
-		config, ok := payload[configKey].(map[string]any)
-		if !ok {
-			continue
-		}
 		for _, schemaKey := range []string{"responseJsonSchema", "response_json_schema"} {
-			raw, exists := config[schemaKey]
-			if !exists {
+			path := configKey + "." + schemaKey
+			raw := gjson.GetBytes(body, path)
+			if !raw.Exists() {
 				continue
 			}
-			delete(config, schemaKey)
-			changed = true
-			_, hasSchema := config["responseSchema"]
-			_, hasSnakeSchema := config["response_schema"]
-			if hasSchema || hasSnakeSchema {
+			hasReplacement := gjson.GetBytes(body, configKey+".responseSchema").Exists() ||
+				gjson.GetBytes(body, configKey+".response_schema").Exists()
+			var err error
+			body, err = sjson.DeleteBytes(body, path)
+			if err != nil {
+				return nil, err
+			}
+			if hasReplacement || !raw.IsObject() {
 				continue
 			}
-			if schema, ok := raw.(map[string]any); ok {
-				antigravity.DeepCleanUndefined(schema)
-				config["responseSchema"] = antigravity.CleanJSONSchema(schema)
+
+			var schema map[string]any
+			decoder := json.NewDecoder(strings.NewReader(raw.Raw))
+			decoder.UseNumber() // never round numbers beyond 2^53
+			if err := decoder.Decode(&schema); err != nil {
+				return nil, err
+			}
+			before, err := json.Marshal(schema)
+			if err != nil {
+				return nil, err
+			}
+			antigravity.DeepCleanUndefined(schema)
+			cleaned := antigravity.CleanJSONSchema(schema)
+			after, err := json.Marshal(cleaned)
+			if err != nil {
+				return nil, err
+			}
+			schemaBytes := after
+			if bytes.Equal(before, after) {
+				// The schema was already compatible: retain the exact original
+				// property order, integer precision, and client formatting.
+				schemaBytes = []byte(raw.Raw)
+			}
+			body, err = sjson.SetRawBytes(body, configKey+".responseSchema", schemaBytes)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
-	return changed
+	return body, nil
 }
 
 // filterEmptyPartsFromGeminiRequest 过滤掉 parts 为空的消息
