@@ -13,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -130,4 +131,28 @@ func TestOpenAIReferralHandlerInvalidatesCacheAfterRefreshDeadline(t *testing.T)
 		require.True(t, body.Data.CachePersisted)
 		require.Equal(t, 1, stub.sends)
 	})
+}
+
+func TestScopedReferralDTODoesNotMutateCachedSnapshot(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil).WithContext(
+		adminaccess.WithPrincipal(context.Background(), &adminaccess.Principal{
+			Policy: adminaccess.Policy{FullAccess: false},
+		}),
+	)
+	full := &service.OpenAIReferralEligibility{
+		ShouldShow: true,
+		Title: "Original invitation offer",
+		Description: "Original conditions",
+		Rules: []string{"Original rule"},
+	}
+	h := &OpenAIOAuthHandler{}
+	masked := h.scopedReferralDTO(c, full)
+	require.NotSame(t, full, masked)
+	require.Empty(t, masked.Title)
+	require.Empty(t, masked.Description)
+	require.Empty(t, masked.Rules)
+	require.Equal(t, "Original invitation offer", full.Title)
+	require.Equal(t, "Original conditions", full.Description)
+	require.Equal(t, []string{"Original rule"}, full.Rules)
 }
