@@ -333,14 +333,14 @@ func FindGeminiCachedContentReference(body []byte) (*GeminiCachedContentReferenc
 
 // geminiCachedContentLocationInBody 返回请求体引用的 Vertex 显式缓存所在区域；未引用 Vertex 缓存时返回空串。
 func geminiCachedContentLocationInBody(body []byte) string {
-	if !bytes.Contains(body, []byte("/cachedContents/")) {
+	// Use the same validated reference as routing/rewrite, rather than relying
+	// on its raw JSON encoding or silently choosing one conflicting location.
+	ref, err := FindGeminiCachedContentReference(body)
+	if err != nil || ref == nil {
 		return ""
 	}
-	for _, path := range geminiCachedContentReferencePaths {
-		name := strings.TrimSpace(gjson.GetBytes(body, path).String())
-		if m := geminiCachedContentVertexName.FindStringSubmatch(name); m != nil {
-			return m[1]
-		}
+	if match := geminiCachedContentVertexName.FindStringSubmatch(ref.Name); match != nil {
+		return match[1]
 	}
 	return ""
 }
