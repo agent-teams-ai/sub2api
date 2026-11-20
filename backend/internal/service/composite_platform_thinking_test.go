@@ -72,6 +72,19 @@ func TestCompositeRewriteToSonnet55SendsDisabledThinkingAsBetweenTools(t *testin
 
 // Without a model rewrite the client's own invalid thinking mode is still
 // rejected.
+func TestCompositeRewriteToFableAndMythos52AdaptsDisabledThinking(t *testing.T) {
+	for _, model := range []string{"claude-fable-5-2", "claude-mythos-5-2", "anthropic/claude-fable-5.2", "anthropic/claude-mythos-5.2"} {
+		t.Run(model, func(t *testing.T) {
+			rec, upstream, err := forwardCompositeThinkingRequest(t, "claude-sonnet-5", model,
+				`{"model":"claude-sonnet-5","max_tokens":64,"stream":false,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`)
+			require.NoError(t, err)
+			require.NotEqual(t, http.StatusBadRequest, rec.Code)
+			require.NotNil(t, upstream.lastReq)
+			require.Equal(t, "adaptive", gjson.GetBytes(upstream.lastBody, "thinking.type").String())
+		})
+	}
+}
+
 func TestDirectOpus55RequestWithEnabledThinkingIsStillRejected(t *testing.T) {
 	rec, upstream, err := forwardCompositeThinkingRequest(t, "claude-opus-5-5", "claude-opus-5-5",
 		`{"model":"claude-opus-5-5","max_tokens":64,"stream":false,"thinking":{"type":"enabled","budget_tokens":4096},"messages":[{"role":"user","content":"hi"}]}`)
