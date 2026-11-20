@@ -13,6 +13,27 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
+// scopedAdminGroupRuleAlternatives builds the same SQL-scope predicates for
+// group capacity and model listing. Each rule is conjunctive (ID + platform)
+// and alternatives are ORed, so unrelated permissions cannot be composed.
+func scopedAdminGroupRuleAlternatives(rules []adminaccess.Rule) []predicate.Group {
+	alternatives := make([]predicate.Group, 0, len(rules))
+	for _, rule := range rules {
+		terms := []predicate.Group{group.IDGT(0)}
+		if !rule.AllGroups {
+			if len(rule.GroupIDs) == 0 {
+				continue
+			}
+			terms = append(terms, group.IDIn(rule.GroupIDs...))
+		}
+		if len(rule.Platforms) > 0 {
+			terms = append(terms, group.PlatformIn(rule.Platforms...))
+		}
+		alternatives = append(alternatives, group.And(terms...))
+	}
+	return alternatives
+}
+
 func (r *groupRepository) ScopedAdminUpdateGroupModels(ctx context.Context, id int64, cfg service.GroupModelAllowlist) (*service.Group, error) {
 	p := adminaccess.FromContext(ctx)
 	if p == nil {
@@ -51,21 +72,8 @@ func (r *groupRepository) ScopedAdminListGroupModels(ctx context.Context, params
 	if p == nil {
 		return nil, 0, infraerrors.Forbidden("SCOPED_GROUP_MODELS_FORBIDDEN", "缺少受限身份")
 	}
-	alternatives := []predicate.Group{}
 	rules := append(p.Policy.RulesFor("groups.models.read"), p.Policy.RulesFor("groups.list.read")...)
-	for _, rule := range rules {
-		terms := []predicate.Group{group.IDGT(0)}
-		if !rule.AllGroups {
-			if len(rule.GroupIDs) == 0 {
-				continue
-			}
-			terms = append(terms, group.IDIn(rule.GroupIDs...))
-		}
-		if len(rule.Platforms) > 0 {
-			terms = append(terms, group.PlatformIn(rule.Platforms...))
-		}
-		alternatives = append(alternatives, group.And(terms...))
-	}
+	alternatives := scopedAdminGroupRuleAlternatives(rules)
 	if len(alternatives) == 0 {
 		return []service.Group{}, 0, nil
 	}
