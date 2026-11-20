@@ -37,6 +37,9 @@ func (e *ExaProvider) Search(ctx context.Context, req SearchRequest) (*SearchRes
 	if numResults <= 0 {
 		numResults = defaultMaxResults
 	}
+	if numResults > 100 {
+		numResults = 100
+	}
 
 	// Search type and highlight length are left to Exa's defaults.
 	payload := exaRequest{
