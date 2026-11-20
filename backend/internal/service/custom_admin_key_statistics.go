@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -50,7 +51,10 @@ func scopedAccountIDAccess(ctx context.Context, repo AccountRepository, id int64
 	}
 	a, err := repo.GetByID(ctx, id)
 	if err != nil {
-		return infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在")
+		if errors.Is(err, ErrAccountNotFound) {
+			return infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在")
+		}
+		return err
 	}
 	return scopedAccountAccess(ctx, repo, a, action, parent)
 }
