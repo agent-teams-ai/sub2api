@@ -1253,6 +1253,31 @@ func TestStreamUpstreamResponse_UsageAndFirstToken(t *testing.T) {
 
 // TestStreamUpstreamResponse_NormalComplete
 // 验证：正常流式转发完成时，数据正确透传、usage 正确收集、clientDisconnect=false
+func TestStreamUpstreamResponse_OversizedEventSendsError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newAntigravityTestService(&config.Config{
+		Gateway: config.GatewayConfig{MaxLineSize: 4096, SSEEventMaxBytes: 128},
+	})
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{},
+		Body: io.NopCloser(strings.NewReader(
+			"event: message_start\ndata: {}\n\n"+
+				"data: "+strings.Repeat("x", 512)+"\n\n",
+		)),
+	}
+
+	result := svc.streamUpstreamResponse(c, resp, time.Now())
+	require.NotNil(t, result)
+	require.False(t, result.clientDisconnect)
+	require.Contains(t, rec.Body.String(), "event: error")
+	require.Contains(t, rec.Body.String(), "response_too_large")
+	require.NotContains(t, rec.Body.String(), strings.Repeat("x", 512))
+}
+
 func TestStreamUpstreamResponse_NormalComplete(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := newAntigravityTestService(&config.Config{
