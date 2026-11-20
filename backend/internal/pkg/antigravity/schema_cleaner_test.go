@@ -240,3 +240,16 @@ func TestCleanJSONSchema_EmptyPrefixItems(t *testing.T) {
 	require.True(t, ok, "empty_tuple.items must be an object")
 	assert.Equal(t, "string", emptyTupleItems["type"])
 }
+
+func TestCleanJSONSchemaEnumCoercionRemovesArrayItems(t *testing.T) {
+	input := map[string]any{
+		"type": "array",
+		"items": map[string]any{"type": "integer"},
+		"enum": []any{float64(1), "other"},
+	}
+	cleaned := CleanJSONSchema(input)
+	require.NotNil(t, cleaned)
+	assert.Equal(t, "string", cleaned["type"])
+	assert.Equal(t, []any{"1", "other"}, cleaned["enum"])
+	assert.NotContains(t, cleaned, "items", "string schema cannot retain array items")
+}
