@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
@@ -325,29 +326,41 @@ func gatewayNativeProviderTextInput(profile string, raw []byte) bool {
 				return false
 			}
 		case "reasoning":
-			keys := []string{"type", "id", "summary", "encrypted_content", "status"}
+			keys := []string{"type", "id", "summary", "encrypted_content", "status", "content"}
 			// MiniMax and the open reasoning models served through OpenRouter
 			// return clear reasoning content in their Responses output. Clients
 			// replay output items unchanged on the next turn, so a text-only
 			// reasoning_text content part must be accepted there; without it
 			// every multi-turn review on such a model was refused at input
 			// admission. It stays opaque through the existing client-tool codec.
-			if profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile {
-				keys = append(keys, "content")
-			}
+			allowClearReasoning := profile == GatewayMiniMaxMPlanResponsesProfile || profile == GatewayOpenRouterResponsesProfile || profile == GatewayNVIDIABuildChatProfile
 			// OpenRouter tags every reasoning item with the format of its
 			// reasoning data (observed in production: a replayed item with this
 			// key was the only thing refused at input admission).
 			if profile == GatewayOpenRouterResponsesProfile {
 				keys = append(keys, "format")
 			}
-			fields, ok = gatewayClaudeObject(raw, keys...)
+			fields, ok = gatewayNativeCanonicalObject(raw, keys...)
 			if !ok {
 				return false
 			}
+			for name, value := range fields {
+				if !slices.Contains(keys, name) {
+					return false
+				}
+				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+					// Codex 0.133 serializes absent optional reasoning fields as
+					// null. Treat only these two as absent in the admission view;
+					// the original history bytes remain unchanged on the wire.
+					if name != "content" && name != "encrypted_content" {
+						return false
+					}
+					delete(fields, name)
+				}
+			}
 			if content := fields["content"]; content != nil {
 				var parts []json.RawMessage
-				if bytes.Equal(bytes.TrimSpace(content), []byte("null")) || json.Unmarshal(content, &parts) != nil {
+				if !allowClearReasoning || json.Unmarshal(content, &parts) != nil {
 					return false
 				}
 				for _, raw := range parts {
