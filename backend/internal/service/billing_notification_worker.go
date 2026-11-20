@@ -51,6 +51,12 @@ func (w *usageNotificationWorker) submit(task func(context.Context)) bool {
 			if recovered := recover(); recovered != nil {
 				slog.Error("panic in usage notification", "recover", recovered)
 			}
+			if ctx.Err() == context.DeadlineExceeded {
+				// The budget covers all recipients and quota dimensions. Never
+				// silently mark a partially delivered batch as fully notified.
+				slog.Warn("usage notification delivery budget expired; some recipients or quota alerts may be skipped",
+					"budget", usageNotificationTimeout)
+			}
 		}()
 		task(ctx)
 	})
