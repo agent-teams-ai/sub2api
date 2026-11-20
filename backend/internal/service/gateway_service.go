@@ -1687,7 +1687,15 @@ func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform
 	normalizedPlatform := strings.TrimSpace(platform)
 	// 完整匹配时精准失效；否则按维度批量失效。
 	if groupID != nil && normalizedPlatform != "" {
-		s.modelsListCache.Delete(modelsListCacheKey(groupID, normalizedPlatform))
+		baseKey := modelsListCacheKey(groupID, normalizedPlatform)
+		s.modelsListCache.Delete(baseKey)
+		if normalizedPlatform == PlatformAnthropic {
+			for key := range s.modelsListCache.Items() {
+				if strings.HasPrefix(key, baseKey+"|long:") {
+					s.modelsListCache.Delete(key)
+				}
+			}
+		}
 		return
 	}
 
@@ -1704,7 +1712,8 @@ func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform
 		if groupID != nil && groupPart != targetGroup {
 			continue
 		}
-		if normalizedPlatform != "" && parts[1] != normalizedPlatform {
+		if normalizedPlatform != "" && parts[1] != normalizedPlatform &&
+			!(normalizedPlatform == PlatformAnthropic && strings.HasPrefix(parts[1], PlatformAnthropic+"|long:")) {
 			continue
 		}
 		s.modelsListCache.Delete(key)
