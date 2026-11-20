@@ -38,6 +38,71 @@ func cgroupMemoryMountRootLimit(root string, v2 bool) uint64 {
 	return cgroupPathMemoryLimit(filepath.Join(root, "memory"), "/", "memory.limit_in_bytes")
 }
 
+// CgroupMemoryUsageAndLimitBytes returns paired usage and the tightest cgroup
+// memory limit for the current process. Both values are read from the same
+// hierarchy level; ok is false if the matching usage counter is unavailable.
+func CgroupMemoryUsageAndLimitBytes() (usedBytes, totalBytes uint64, ok bool) {
+	return cgroupMemoryUsageAndLimit(cgroupRoot, "/proc/self/cgroup")
+}
+
+type cgroupMemoryStats struct {
+	used  uint64
+	total uint64
+	ok    bool
+}
+
+// cgroupMemoryUsageAndLimit selects the tightest positive limit in the v1/v2
+// hierarchy and reads usage at precisely that level (a parent slice may have
+// a tighter limit and include usage from other children). If the usage of the
+// limiting level is missing, the pair is unavailable rather than mismatched.
+func cgroupMemoryUsageAndLimit(root, selfCgroupFile string) (uint64, uint64, bool) {
+	var selected cgroupMemoryStats
+	consider := func(next cgroupMemoryStats) {
+		if next.total > 0 && (selected.total == 0 || next.total < selected.total ||
+			(next.total == selected.total && !selected.ok && next.ok)) {
+			selected = next
+		}
+	}
+	if raw, err := os.ReadFile(selfCgroupFile); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.SplitN(strings.TrimSpace(line), ":", 3)
+			if len(fields) != 3 {
+				continue
+			}
+			switch {
+			case fields[1] == "":
+				consider(cgroupPathMemoryStats(root, fields[2], "memory.max", "memory.current"))
+			case slices.Contains(strings.Split(fields[1], ","), "memory"):
+				consider(cgroupPathMemoryStats(filepath.Join(root, "memory"), fields[2], "memory.limit_in_bytes", "memory.usage_in_bytes"))
+			}
+		}
+	}
+	consider(cgroupPathMemoryStats(root, "/", "memory.max", "memory.current"))
+	consider(cgroupPathMemoryStats(filepath.Join(root, "memory"), "/", "memory.limit_in_bytes", "memory.usage_in_bytes"))
+	return selected.used, selected.total, selected.ok
+}
+
+func cgroupPathMemoryStats(mount, cgroupPath, limitFile, usageFile string) cgroupMemoryStats {
+	mountRoot, err := os.OpenRoot(mount)
+	if err != nil {
+		return cgroupMemoryStats{}
+	}
+	defer func() { _ = mountRoot.Close() }()
+	var out cgroupMemoryStats
+	for dir := path.Clean("/" + cgroupPath); ; dir = path.Dir(dir) {
+		rel := filepath.FromSlash(strings.TrimPrefix(dir, "/"))
+		limit := readCgroupLimitFile(mountRoot, filepath.Join(rel, limitFile))
+		if limit > 0 && (out.total == 0 || limit < out.total) {
+			rawUsage, readErr := mountRoot.ReadFile(filepath.Join(rel, usageFile))
+			used, parseErr := strconv.ParseUint(strings.TrimSpace(string(rawUsage)), 10, 64)
+			out = cgroupMemoryStats{used: used, total: limit, ok: readErr == nil && parseErr == nil}
+		}
+		if dir == "/" {
+			return out
+		}
+	}
+}
+
 // MemoryLimitBytes returns the memory available to this process: the smallest
 // of physical memory, the cgroup (container/systemd) limit and GOMEMLIMIT.
 // It returns 0 when none of them can be determined.

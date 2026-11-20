@@ -722,17 +722,9 @@ func (c *OpsMetricsCollector) tryCgroupCPUPercent(now time.Time) *float64 {
 }
 
 func readCgroupMemoryBytes() (usedBytes uint64, totalBytes uint64, ok bool) {
-	// memory.current / memory.usage_in_bytes are sampled at the mount root.
-	// Pair them ONLY with that same hierarchy's root limit. Using the
-	// process's tighter nested slice limit mixes different populations and
-	// can report >100% usage on non-namespaced hosts.
-	if used, available := readUintFile("/sys/fs/cgroup/memory.current"); available {
-		return used, sysutil.CgroupMemoryMountRootLimitBytes(true), true
-	}
-	if used, available := readUintFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); available {
-		return used, sysutil.CgroupMemoryMountRootLimitBytes(false), true
-	}
-	return 0, 0, false
+	// Read usage and limit from the same cgroup hierarchy level. The tightest
+	// parent limit must not be paired with unrelated mount-root usage.
+	return sysutil.CgroupMemoryUsageAndLimitBytes()
 }
 
 func readCgroupCPUUsageNanos() (usageNanos uint64, ok bool) {
