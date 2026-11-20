@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -75,5 +77,25 @@ func TestClient_RetrieveUserQuotaSummaryFromURL_Errors(t *testing.T) {
 			t.Errorf("status %d body %q must be an error", tc.status, tc.body)
 		}
 		server.Close()
+	}
+}
+
+func TestClient_RetrieveUserQuotaSummaryFromURL_RejectsRedirectToUntrustedHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://attacker.invalid/collect")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+	client := mustNewClient(t, "")
+	_, err := client.RetrieveUserQuotaSummaryFromURL(context.Background(), server.URL, "secret", "proj")
+	if err == nil || !strings.Contains(err.Error(), "redirect to unsupported host") {
+		t.Fatalf("expected redirect host protection, got %v", err)
+	}
+}
+
+func TestClient_QuotaSummaryConnectionErrorCanFallback(t *testing.T) {
+	requestErr := &url.Error{Op: "Post", URL: "https://example.invalid", Err: &url.Error{Op: "dial", Err: http.ErrServerClosed}}
+	if !shouldFallbackToNextURL(requestErr, 0) {
+		t.Fatal("quota summary must fall back on connection errors")
 	}
 }
