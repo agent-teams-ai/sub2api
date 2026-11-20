@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"log/slog"
 	"strconv"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
@@ -95,8 +96,16 @@ func (h *OpenAIOAuthHandler) scopedOpenAIQuota(c *gin.Context, refresh bool) {
 		return
 	}
 	result := openAIQuotaRefreshResponse{OpenAIQuotaUsage: *safe}
-	result.CreditsCachePersisted = h.quotaService.CacheCreditsSnapshot(c.Request.Context(), id, safe) == nil
-	result.CachePersisted = h.quotaService.CacheResetCreditsSnapshot(c.Request.Context(), id, safe.RateLimitResetCredits) == nil
+	if err := h.quotaService.CacheCreditsSnapshot(c.Request.Context(), id, safe); err != nil {
+		slog.Warn("scoped openai credits snapshot persistence failed", "account_id", id, "error", err)
+	} else {
+		result.CreditsCachePersisted = true
+	}
+	if err := h.quotaService.CacheResetCreditsSnapshot(c.Request.Context(), id, safe.RateLimitResetCredits); err != nil {
+		slog.Warn("scoped openai reset credits snapshot persistence failed", "account_id", id, "error", err)
+	} else {
+		result.CachePersisted = true
+	}
 	response.Success(c, result)
 }
 
