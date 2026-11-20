@@ -28,6 +28,23 @@ type ClaudeOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
 }
 
+// UnmarshalJSON ignores a non-string effort without rejecting an otherwise
+// valid Claude request; output_config can carry provider-defined fields.
+func (c *ClaudeOutputConfig) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	c.Effort = ""
+	if raw, ok := fields["effort"]; ok {
+		var effort string
+		if json.Unmarshal(raw, &effort) == nil {
+			c.Effort = effort
+		}
+	}
+	return nil
+}
+
 // ClaudeMessage Claude 消息
 type ClaudeMessage struct {
 	Role    string          `json:"role"` // user, assistant
