@@ -135,14 +135,14 @@ func TestCleanGeminiRequest_ToolSchemaPreservesUnrelatedJSONAndLargeIntegers(t *
 	require.Contains(t, string(out), "9007199254740993")
 	require.Less(t, strings.Index(string(out), `"tools"`), strings.Index(string(out), `"generationConfig"`))
 	require.Less(t, strings.Index(string(out), `"generationConfig"`), strings.Index(string(out), `"contents"`))
-	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.count.enum.0").Raw)
-	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "generationConfig.responseSchema.properties.value.enum.0").Raw)
+	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.count.enum.0").String())
+	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "generationConfig.responseSchema.properties.value.enum.0").String())
 	require.False(t, gjson.GetBytes(out, "generationConfig.responseJsonSchema").Exists())
 	require.True(t, gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.title.description").Exists())
 }
 
 func TestCleanGeminiRequest_RejectsMalformedOrNonObjectJSON(t *testing.T) {
-	for _, body := range []string{`{"tools":[`, `[]`} {
+	for _, body := range []string{`{"tools":[`, `[]`, `null`, `true`, `""`} {
 		_, err := cleanGeminiRequest([]byte(body))
 		require.Error(t, err)
 	}
