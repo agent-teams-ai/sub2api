@@ -18,10 +18,11 @@ import (
 )
 
 // gatewayAccountModelsSnapshotTTL is how long an account model snapshot stays
-// fresh (its expiresAt). Five minutes matches the live catalogue cache
-// (gatewayLiveModelsFreshFor), so a user can pick a model from a list the web
-// opened without it expiring mid-choice, and each open does not cost another
-// upstream /models read. Consumers still reject a snapshot past expiresAt.
+// fresh (its expiresAt); it was chosen equal to gatewayLiveModelsFreshFor. A
+// catalogue snapshot is rebuilt on every read, so a list the web just opened
+// gets the full window. Codex and OpenRouter return a cached snapshot with its
+// original expiresAt, so theirs can have less left. Consumers still reject a
+// snapshot past expiresAt.
 const gatewayAccountModelsSnapshotTTL = 5 * time.Minute
 
 // Model selection is mutable account capability; Route.Model remains the
@@ -250,12 +251,8 @@ func (cache *gatewayModelsCache) read(ctx context.Context, key, obsoletePrefix s
 		cache.pending[key] = pending
 		cache.Unlock()
 		out := fetch()
-		ttl := 5 * time.Second
-		if out.Status == "snapshot" {
-			ttl = 60 * time.Second
-		}
 		cache.Lock()
-		expiry := time.Now().Add(ttl)
+		expiry := time.Now().Add(5 * time.Second)
 		if out.Status == "snapshot" {
 			expiry, _ = time.Parse(time.RFC3339Nano, out.ExpiresAt)
 		}
