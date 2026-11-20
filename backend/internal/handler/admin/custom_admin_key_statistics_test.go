@@ -32,6 +32,30 @@ func statisticsContext(c *gin.Context, permission string) {
 	c.Request = c.Request.WithContext(adminaccess.WithPrincipal(c.Request.Context(), &adminaccess.Principal{Policy: statisticsPolicy(permission)}))
 }
 
+func TestScopedAdminOptionalPermissionMatchesProtectedAccountPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	self := int64(1)
+	parentID := int64(2)
+	shadow := &service.Account{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, GroupIDs: []int64{1}, ParentAccountID: &self}
+	svc := &scopedStatisticsAccounts{accounts: map[int64]*service.Account{1: shadow}}
+	h := &OpenAIOAuthHandler{adminService: svc}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest("GET", "/quota", nil)
+	statisticsContext(c, "openai.quota.read")
+	require.False(t, h.scopedOpenAIHasPermission(c, 1, "openai.quota.read", true), "self-parent shadow must fail closed")
+	require.Zero(t, rec.Body.Len(), "optional field check must not write a response")
+	_, allowed := scopedAuthorizedAccount(c, svc, 1, "openai.quota.read", true)
+	require.False(t, allowed)
+	require.Equal(t, 404, rec.Code)
+
+	shadow.ParentAccountID = &parentID
+	svc.accounts[2] = &service.Account{ID: 2, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, GroupIDs: []int64{1}}
+	require.True(t, h.scopedOpenAIHasPermission(c, 1, "openai.quota.read", true))
+	svc.accounts[2].Extra = map[string]any{service.GatewayGenerationExtraKey: "fixture-native-identity"}
+	require.False(t, h.scopedOpenAIHasPermission(c, 1, "openai.quota.read", true), "native parent must fail closed")
+}
+
 func TestScopedAdminStatisticsRejectBeforeCacheOrService(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &scopedStatisticsAccounts{accounts: map[int64]*service.Account{1: {ID: 1, Platform: "openai", Type: "oauth", GroupIDs: []int64{1}}, 2: {ID: 2, Platform: "openai", Type: "oauth", GroupIDs: []int64{2}}}}

@@ -61,6 +61,16 @@ func TestScopedParentAccountLookupPreservesInfrastructureError(t *testing.T) {
 	require.Equal(t, 404, infraerrors.Code(err))
 }
 
+func TestScopedAccountAccessRejectsGatewayNativeIdentity(t *testing.T) {
+	ctx := scopedStatisticsServiceContext("accounts.usage.read")
+	native := &Account{
+		ID: 17, Platform: PlatformOpenAI, Type: AccountTypeOAuth, GroupIDs: []int64{1},
+		Extra: map[string]any{GatewayGenerationExtraKey: "fixture-native-identity"},
+	}
+	err := CheckScopedAccountAccess(ctx, native, nil, "accounts.usage.read", false)
+	require.Equal(t, 404, infraerrors.Code(err), "native identities must not be exposed via scoped account reads")
+}
+
 func TestScopedAdminUsageServiceRechecksScopeBeforeSnapshot(t *testing.T) {
 	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, GroupIDs: []int64{2}, Extra: map[string]any{"codex_5h_used_percent": 25.0}}
 	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{1: a}}

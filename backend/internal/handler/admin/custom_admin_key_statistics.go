@@ -20,33 +20,29 @@ func scopedAccountResource(a *service.Account) adminaccess.Account {
 	return adminaccess.Account{ID: a.ID, GroupIDs: a.GroupIDs, Platform: a.Platform, Type: a.Type}
 }
 
-// 仅校验实际读取对象；上游凭证来自母账户时，母账户必须同时获授权。
-func scopedAuthorizedAccount(c *gin.Context, reader scopedAccountReader, id int64, action string, parent bool) (*service.Account, bool) {
-	p := adminaccess.RestrictedFromContext(c.Request.Context())
-	if p == nil {
+// scopedAccountPermitted shares the service policy without writing an HTTP
+// response. Callers that only probe optional response fields must not abort.
+func scopedAccountPermitted(ctx context.Context, reader scopedAccountReader, id int64, action string, parent bool) (*service.Account, bool) {
+	if adminaccess.RestrictedFromContext(ctx) == nil {
 		return nil, true
 	}
 	if reader == nil || id <= 0 {
-		response.Error(c, 404, "账户不存在")
 		return nil, false
 	}
-	a, err := reader.GetAccount(c.Request.Context(), id)
-	if err != nil || a == nil || !p.Policy.AllowsAccount(action, scopedAccountResource(a)) {
-		response.Error(c, 404, "账户不存在")
+	a, err := reader.GetAccount(ctx, id)
+	if err != nil || service.CheckScopedAccountAccess(ctx, a, reader.GetAccount, action, parent) != nil {
 		return nil, false
-	}
-	if parent && a.IsShadow() {
-		if a.ParentAccountID == nil || *a.ParentAccountID == id {
-			response.Error(c, 404, "账户不存在")
-			return nil, false
-		}
-		source, err := reader.GetAccount(c.Request.Context(), *a.ParentAccountID)
-		if err != nil || source == nil || source.IsShadow() || !p.Policy.AllowsAccount(action, scopedAccountResource(source)) {
-			response.Error(c, 404, "账户不存在")
-			return nil, false
-		}
 	}
 	return a, true
+}
+
+// 仅校验实际读取对象；上游凭证来自母账户时，母账户必须同时获授权。
+func scopedAuthorizedAccount(c *gin.Context, reader scopedAccountReader, id int64, action string, parent bool) (*service.Account, bool) {
+	a, allowed := scopedAccountPermitted(c.Request.Context(), reader, id, action, parent)
+	if !allowed {
+		response.Error(c, 404, "账户不存在")
+	}
+	return a, allowed
 }
 
 func (h *AccountHandler) scopedAdminStatistics(c *gin.Context) bool {

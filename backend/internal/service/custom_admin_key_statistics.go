@@ -22,31 +22,44 @@ func scopedAccountOperation(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-func scopedAccountAccess(ctx context.Context, repo AccountRepository, a *Account, action string, parent bool) error {
+// CheckScopedAccountAccess is the shared, side-effect-free policy check for
+// service and admin HTTP callers. Reader is deliberately a callback so the
+// handler can use AdminService.GetAccount (which rejects native identities)
+// while services may use their repository. Both paths enforce native identity
+// exclusion before any account or parent credentials can be consulted.
+func CheckScopedAccountAccess(ctx context.Context, a *Account, load func(context.Context, int64) (*Account, error), action string, parent bool) error {
 	p := adminaccess.RestrictedFromContext(ctx)
 	if p == nil {
 		return nil
 	}
 	denied := func() error { return infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在") }
-	if a == nil || !p.Policy.AllowsAccount(action, scopedAccountResource(a)) {
+	if a == nil || HasGatewayNativeIdentity(a) || !p.Policy.AllowsAccount(action, scopedAccountResource(a)) {
 		return denied()
 	}
 	if parent && a.IsShadow() {
-		if repo == nil || a.ParentAccountID == nil || *a.ParentAccountID == a.ID {
+		if load == nil || a.ParentAccountID == nil || *a.ParentAccountID == a.ID {
 			return denied()
 		}
-		source, err := repo.GetByID(ctx, *a.ParentAccountID)
+		source, err := load(ctx, *a.ParentAccountID)
 		if err != nil {
-			if errors.Is(err, ErrAccountNotFound) {
+			if errors.Is(err, ErrAccountNotFound) || errors.Is(err, ErrGatewayNativeIdentity) {
 				return denied()
 			}
 			return err
 		}
-		if source == nil || source.IsShadow() || !p.Policy.AllowsAccount(action, scopedAccountResource(source)) {
+		if source == nil || HasGatewayNativeIdentity(source) || source.IsShadow() || !p.Policy.AllowsAccount(action, scopedAccountResource(source)) {
 			return denied()
 		}
 	}
 	return nil
+}
+
+func scopedAccountAccess(ctx context.Context, repo AccountRepository, a *Account, action string, parent bool) error {
+	var load func(context.Context, int64) (*Account, error)
+	if repo != nil {
+		load = repo.GetByID
+	}
+	return CheckScopedAccountAccess(ctx, a, load, action, parent)
 }
 func scopedAccountIDAccess(ctx context.Context, repo AccountRepository, id int64, action string, parent bool) error {
 	if adminaccess.RestrictedFromContext(ctx) == nil {

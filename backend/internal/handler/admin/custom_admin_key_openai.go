@@ -21,25 +21,8 @@ func (h *OpenAIOAuthHandler) scopedOpenAIAllowed(c *gin.Context, id int64, actio
 }
 
 func (h *OpenAIOAuthHandler) scopedOpenAIHasPermission(c *gin.Context, id int64, action string, parent bool) bool {
-	p := adminaccess.RestrictedFromContext(c.Request.Context())
-	if p == nil {
-		return true
-	}
-	if h.adminService == nil {
-		return false
-	}
-	a, err := h.adminService.GetAccount(c.Request.Context(), id)
-	if err != nil || a == nil || !p.Policy.AllowsAccount(action, scopedAccountResource(a)) {
-		return false
-	}
-	if parent && a.IsShadow() {
-		if a.ParentAccountID == nil {
-			return false
-		}
-		source, err := h.adminService.GetAccount(c.Request.Context(), *a.ParentAccountID)
-		return err == nil && source != nil && !source.IsShadow() && p.Policy.AllowsAccount(action, scopedAccountResource(source))
-	}
-	return true
+	_, allowed := scopedAccountPermitted(c.Request.Context(), h.adminService, id, action, parent)
+	return allowed
 }
 
 func scopedOpenAIError(c *gin.Context, err error) {
