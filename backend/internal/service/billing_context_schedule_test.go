@@ -317,6 +317,8 @@ func scheduleScenarios() []scheduleScenario {
 				require.Len(t, s.Tiers, 2)
 				requireTier(t, s.Tiers[0], 0, intPtr(272000), "≤272K", p(5e-6), p(30e-6), p(6.25e-6), p(0.5e-6))
 				requireTier(t, s.Tiers[1], 272000, nil, ">272K", p(10e-6), p(45e-6), p(12.5e-6), p(1e-6))
+				requirePrice(t, p(12.5e-6), s.Tiers[0].CacheWrite12h, "default gpt-5.6 12h cache write")
+				requirePrice(t, p(25e-6), s.Tiers[1].CacheWrite12h, "long-context gpt-5.6 12h cache write")
 			},
 		},
 		{

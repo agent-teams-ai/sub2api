@@ -123,7 +123,12 @@ func (s *BillingService) ResolveContextPricingSchedule(ctx context.Context, reso
 
 	tiers := make([]ContextPricingTier, 0, len(segments))
 	for _, seg := range segments {
-		tier, err := probeContextTier(seg, resolved, probe)
+		// Use the same per-tier, policy-adjusted pricing as calculateTokenCost.
+		// The raw BasePricing misses model defaults such as GPT-5.6's 12h write tier.
+		tierPricing := resolver.GetIntervalPricing(resolved, seg.min+1)
+		tierPricing = s.applyModelSpecificPricingPolicyEx(in.Model, tierPricing, resolved.Source == PricingSourceLiteLLM, timezone.Now())
+		has12hWritePrice := tierPricing != nil && tierPricing.CacheCreation12hPricePerToken != nil
+		tier, err := probeContextTier(seg, resolved, has12hWritePrice, probe)
 		if err != nil {
 			return nil, err
 		}
@@ -272,7 +277,7 @@ func buildContextSegments(bounds []int) []contextSegment {
 // 每次只喂一种 token，ActualCost 即该项费用；旧边际规则的加倍只体现在 ActualCost
 // 而不在分项费用里，因此统一读 ActualCost。整单阶梯与边际规则在同一段内都是
 // 线性函数，差商同时适用，无需区分规则类型。
-func probeContextTier(seg contextSegment, resolved *ResolvedPricing, probe func(UsageTokens) (*CostBreakdown, error)) (ContextPricingTier, error) {
+func probeContextTier(seg contextSegment, resolved *ResolvedPricing, has12hWritePrice bool, probe func(UsageTokens) (*CostBreakdown, error)) (ContextPricingTier, error) {
 	tier := ContextPricingTier{MinTokens: seg.min, MaxTokens: seg.max}
 	c := seg.min + 1
 	delta := contextProbeDelta
@@ -305,7 +310,7 @@ func probeContextTier(seg contextSegment, resolved *ResolvedPricing, probe func(
 		return tier, err
 	}
 	explicit := explicitContextPricingFields(resolved, c)
-	if explicit.cacheWrite12h || (resolved.BasePricing != nil && resolved.BasePricing.CacheCreation12hPricePerToken != nil) {
+	if explicit.cacheWrite12h || has12hWritePrice {
 		tier.CacheWrite12h, err = probeComponentPrice(func(n int) UsageTokens { return UsageTokens{CacheCreationTokens: n, CacheCreation12hTokens: n} }, c, delta, probe)
 		if err != nil {
 			return tier, err
