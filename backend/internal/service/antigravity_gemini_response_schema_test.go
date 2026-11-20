@@ -101,3 +101,28 @@ func TestCleanGeminiRequest_DoesNotRoundLargeEnumIntegerDuringCleanup(t *testing
 	require.Equal(t, "9007199254740993", gjson.GetBytes(out, "generationConfig.responseSchema.properties.value.enum.0").String())
 }
 
+func TestCleanGeminiRequest_ToolSchemaPreservesUntouchedOrderAndLargeNumbers(t *testing.T) {
+	// A tool with compatible parameters must not cause whole-body re-encoding.
+	// A second tool requires enum normalization and must keep its uint64
+	// integer value intact; the response schema must keep its own field order.
+	body := []byte(`{"tools":[{"functionDeclarations":[{"name":"one","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"]}},{"name":"two","parameters":{"type":"object","properties":{"number":{"type":"integer","enum":[9007199254740993]}}}}]}],"generationConfig":{"responseJsonSchema":{"type":"object","properties":{"last":{"type":"string"},"first":{"type":"string"}}}}}`)
+	out, err := cleanGeminiRequest(body)
+	require.NoError(t, err)
+	rawTool := gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters").Raw
+	require.Contains(t, rawTool, `"properties":{"zeta":`)
+	require.Less(t, strings.Index(rawTool, `"zeta"`), strings.Index(rawTool, `"alpha"`))
+	require.Contains(t, string(out), "9007199254740993")
+	require.NotContains(t, string(out), "9007199254740992")
+	require.Equal(t, "9007199254740993",
+		gjson.GetBytes(out, "tools.0.functionDeclarations.1.parameters.properties.number.enum.0").String())
+	responseSchema := gjson.GetBytes(out, "generationConfig.responseSchema").Raw
+	require.Less(t, strings.Index(responseSchema, `"last"`), strings.Index(responseSchema, `"first"`))
+	require.False(t, gjson.GetBytes(out, "generationConfig.responseJsonSchema").Exists())
+}
+
+func TestCleanGeminiRequest_SnakeCaseToolDeclarationsKeepExactJSON(t *testing.T) {
+	body := []byte(`{"tools":[{"function_declarations":[{"name":"call","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}]}]}`)
+	out, err := cleanGeminiRequest(body)
+	require.NoError(t, err)
+	require.Equal(t, string(body), string(out), "unchanged snake_case schemas retain exact client bytes")
+}

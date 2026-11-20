@@ -481,58 +481,51 @@ handleSuccess:
 
 // cleanGeminiRequest 清理 Gemini 请求体中的 Schema
 func cleanGeminiRequest(body []byte) ([]byte, error) {
-	var payload map[string]any
+	// Decode only the top-level envelope into RawMessages: converting the
+	// complete request into map[string]any loses field order and rounds large
+	// JSON integers, even when only one tool parameter needs normalization.
+	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-
-	modified := false
-
-	// 1. 清理 Tools
-	if tools, ok := payload["tools"].([]any); ok && len(tools) > 0 {
-		for _, t := range tools {
-			toolMap, ok := t.(map[string]any)
-			if !ok {
+	for toolIndex, tool := range gjson.ParseBytes(payload["tools"]).Array() {
+		declarationsKey := "functionDeclarations"
+		declarations := tool.Get(declarationsKey)
+		if !declarations.IsArray() {
+			declarationsKey = "function_declarations"
+			declarations = tool.Get(declarationsKey)
+		}
+		for declarationIndex, declaration := range declarations.Array() {
+			rawSchema := declaration.Get("parameters")
+			if !rawSchema.IsObject() {
 				continue
 			}
-
-			// function_declarations (snake_case) or functionDeclarations (camelCase)
-			var funcs []any
-			if f, ok := toolMap["functionDeclarations"].([]any); ok {
-				funcs = f
-			} else if f, ok := toolMap["function_declarations"].([]any); ok {
-				funcs = f
+			var schema map[string]any
+			decoder := json.NewDecoder(strings.NewReader(rawSchema.Raw))
+			decoder.UseNumber() // preserve integers above 2^53 in nested enums
+			if err := decoder.Decode(&schema); err != nil {
+				return nil, err
 			}
-
-			if len(funcs) == 0 {
+			before, err := json.Marshal(schema)
+			if err != nil {
+				return nil, err
+			}
+			antigravity.DeepCleanUndefined(schema)
+			cleaned := antigravity.CleanJSONSchema(schema)
+			after, err := json.Marshal(cleaned)
+			if err != nil {
+				return nil, err
+			}
+			if bytes.Equal(before, after) {
+				// Keep the untouched tool schema's exact key order and numbers.
 				continue
 			}
-
-			for _, f := range funcs {
-				funcMap, ok := f.(map[string]any)
-				if !ok {
-					continue
-				}
-
-				if params, ok := funcMap["parameters"].(map[string]any); ok {
-					antigravity.DeepCleanUndefined(params)
-					cleaned := antigravity.CleanJSONSchema(params)
-					funcMap["parameters"] = cleaned
-					modified = true
-				}
+			path := fmt.Sprintf("tools.%d.%s.%d.parameters", toolIndex, declarationsKey, declarationIndex)
+			body, err = sjson.SetRawBytes(body, path, after)
+			if err != nil {
+				return nil, err
 			}
 		}
-	}
-
-	// Tool schemas use the existing cleaner. Only re-encode the whole request
-	// when a tool parameter was actually touched; the response schema rewrite
-	// below operates on raw JSON to preserve property order and large numbers.
-	if modified {
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		body = encoded
 	}
 	return normalizeGeminiResponseSchemaRaw(body)
 }
