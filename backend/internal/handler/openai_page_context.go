@@ -53,9 +53,11 @@ func normalizeCodexUntrustedContext(body []byte) ([]byte, bool) {
 		if json.Unmarshal(item["output"], &output) != nil || output == nil || !validCodexUntrustedContext(name, *output) {
 			continue
 		}
-		text := "<external_" + name + ">" + *output + "</external_" + name + ">"
+		// Never allow a page/IDE snippet to terminate its own untrusted wrapper.
+		safeOutput := strings.ReplaceAll(*output, "</external_", "&lt;/external_")
+		text := "<external_" + name + ">" + safeOutput + "</external_" + name + ">"
 		if validCodexPageContext(name, *output) {
-			text = "<external_" + name + ">\n" + *output + "\n</external_" + name + ">"
+			text = "<external_" + name + ">\n" + safeOutput + "\n</external_" + name + ">"
 		}
 		message := map[string]any{
 			"type": "message",
