@@ -288,3 +288,20 @@ func TestAsyncImageHandlerDisabledReturns404(t *testing.T) {
 	// No task was created / persisted.
 	require.Empty(t, store.tasks)
 }
+
+func TestNewAsyncImageContextReservesBackingCapacity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	budget := pkghttputil.NewBodyMemoryBudget(128)
+	parent, releaseParent := pkghttputil.WithRequestBodyMemoryBudget(context.Background(), budget)
+	defer releaseParent()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations/async", nil).WithContext(parent)
+	body := make([]byte, 10, 256)
+	_, _, cancel, err := newAsyncImageContext(c, body, time.Second)
+	if cancel != nil {
+		cancel()
+	}
+	require.ErrorIs(t, err, pkghttputil.ErrRequestBodyMemoryBudget,
+		"async work must reserve the entire retained slice allocation, not only its length")
+}
