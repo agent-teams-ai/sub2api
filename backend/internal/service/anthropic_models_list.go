@@ -7,7 +7,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// Long-context model metadata can change on other replicas, so this is a
+// short-lived eventual-consistency cache, not an immediate write-through
+// invalidation guarantee. Freshness is bounded to at most five seconds.
+const maxAnthropicLongContextCacheTTL = 5 * time.Second
+
+func anthropicLongContextCacheTTL(configured time.Duration) time.Duration {
+	if configured <= 0 || configured > maxAnthropicLongContextCacheTTL {
+		return maxAnthropicLongContextCacheTTL
+	}
+	return configured
+}
 
 func anthropicLongContextCacheKey(group *Group, models []string) string {
 	var groupID *int64
@@ -110,7 +123,7 @@ func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, g
 		}
 	}
 	if s.modelsListCache != nil {
-		s.modelsListCache.Set(cacheKey, cloneStringSlice(result), s.modelsListCacheTTL)
+		s.modelsListCache.Set(cacheKey, cloneStringSlice(result), anthropicLongContextCacheTTL(s.modelsListCacheTTL))
 	}
 	return result
 }

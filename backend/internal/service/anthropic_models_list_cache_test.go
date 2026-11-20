@@ -57,3 +57,9 @@ func TestExpandAnthropicLongContextModelsCachesAndInvalidatesByGroup(t *testing.
 		svc.ExpandAnthropicLongContextModels(context.Background(), group, []string{"public"}))
 	require.Equal(t, 3, repo.calls, "invalidating base models must also evict long-context variants")
 }
+
+func TestAnthropicLongContextCacheTTLIsBoundedAcrossReplicas(t *testing.T) {
+	require.Equal(t, 5*time.Second, anthropicLongContextCacheTTL(0))
+	require.Equal(t, 5*time.Second, anthropicLongContextCacheTTL(time.Minute))
+	require.Equal(t, 2*time.Second, anthropicLongContextCacheTTL(2*time.Second))
+}
