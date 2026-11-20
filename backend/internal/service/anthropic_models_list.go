@@ -68,7 +68,7 @@ func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, g
 	for _, model := range models {
 		variant := model + claudeCodeLongContextModelSuffix
 		variantKey := strings.ToLower(variant)
-		if seen[variantKey] || strings.Contains(model, "*") {
+		if strings.HasSuffix(strings.ToLower(model), claudeCodeLongContextModelSuffix) || seen[variantKey] || strings.Contains(model, "*") {
 			continue
 		}
 		var routedAccountIDs []int64
