@@ -79,3 +79,29 @@ func TestWorkerClaimsWithoutWaitingForIdlePoll(t *testing.T) {
 		nilRunner.Notify()
 	})
 }
+
+// Round-robin only among configured active workers, never all 32. Drain the
+// startup wakeups before exercising Notify and consume each signal per call.
+func TestRunnerNotifyWakesExactlyOneConfiguredWorker(t *testing.T) {
+	cfg := asyncConfig()
+	cfg.WorkerCount = 3
+	runner := NewRunner(&fakeConfigStore{cfg: cfg, active: true}, nil, nil, nil, nil)
+	for _, ch := range runner.wake {
+		<-ch
+	}
+
+	for i := 0; i < 9; i++ {
+		runner.Notify()
+		count := 0
+		for workerID, ch := range runner.wake {
+			select {
+			case <-ch:
+				count++
+				require.Equal(t, i%cfg.WorkerCount, workerID,
+					"only an active worker should be awakened")
+			default:
+			}
+		}
+		require.Equal(t, 1, count, "one enqueue should wake one worker")
+	}
+}

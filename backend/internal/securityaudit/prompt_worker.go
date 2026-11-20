@@ -32,6 +32,7 @@ type Runner struct {
 	clock   Clock
 	runtime WorkerRuntime
 	wake    []chan struct{}
+	wakeNext atomic.Uint64 // only one active worker is notified per enqueue
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -48,17 +49,23 @@ func NewRunner(config ConfigStore, repo JobRepository, payload PayloadStore, sca
 	return &Runner{config: config, repo: repo, payload: payload, scanner: scanner, metrics: metrics, clock: realClock{}, wake: wake}
 }
 
-// Notify wakes every worker to claim queued jobs. It never blocks; a worker that
-// already has a pending wake-up keeps just one.
+// Notify wakes one active worker for each enqueue, round-robin. Broadcasting
+// on every enqueue causes one empty DB claim per idle worker; all workers still
+// have the periodic poll for scheduled retries and cross-replica publishes.
+// Pending wakeups remain coalesced to one token per worker.
 func (r *Runner) Notify() {
-	if r == nil {
+	if r == nil || r.config == nil || len(r.wake) == 0 {
 		return
 	}
-	for _, ch := range r.wake {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
+	cfg, ok := r.config.Active()
+	if !ok || !cfg.Enabled || !cfg.RiskControlEnabled || cfg.WorkerCount <= 0 {
+		return
+	}
+	count := min(cfg.WorkerCount, len(r.wake))
+	index := int((r.wakeNext.Add(1) - 1) % uint64(count))
+	select {
+	case r.wake[index] <- struct{}{}:
+	default:
 	}
 }
 
