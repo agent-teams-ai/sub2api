@@ -85,26 +85,23 @@ func (p *StreamingProcessor) ProcessLine(line string) []byte {
 		return nil
 	}
 
-	// 解包 v1internal 响应
-	var v1Resp V1InternalResponse
-	var envelope struct {
-		Response json.RawMessage `json:"response"`
+	// Decode either a wrapped v1internal response or a direct Gemini response
+	// in one pass. Embedding populates direct fields without a second unmarshal.
+	var parsed struct {
+		Response *GeminiResponse `json:"response"`
+		GeminiResponse
 	}
-	if err := json.Unmarshal([]byte(data), &envelope); err != nil {
+	if err := json.Unmarshal([]byte(data), &parsed); err != nil {
 		return nil
 	}
-	if len(envelope.Response) == 0 {
-		// A direct response also unmarshals into V1InternalResponse without
-		// an error, but leaves Response empty. Select the shape explicitly.
-		var directResp GeminiResponse
-		if err2 := json.Unmarshal([]byte(data), &directResp); err2 != nil {
-			return nil
-		}
-		v1Resp.Response = directResp
-		v1Resp.ResponseID = directResp.ResponseID
-		v1Resp.ModelVersion = directResp.ModelVersion
-	} else if err := json.Unmarshal([]byte(data), &v1Resp); err != nil {
-		return nil
+	v1Resp := V1InternalResponse{
+		ResponseID: parsed.GeminiResponse.ResponseID,
+		ModelVersion: parsed.GeminiResponse.ModelVersion,
+	}
+	if parsed.Response != nil {
+		v1Resp.Response = *parsed.Response
+	} else {
+		v1Resp.Response = parsed.GeminiResponse
 	}
 
 	geminiResp := &v1Resp.Response
