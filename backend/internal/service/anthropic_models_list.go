@@ -75,12 +75,19 @@ func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, g
 		if group != nil {
 			routedAccountIDs = group.GetRoutingAccountIDs(model)
 		}
+		// The scheduler may select ANY eligible account for the base model.
+		// Advertising [1m] when only one account supports the large window
+		// misrepresents capabilities and can route to a smaller context. Only
+		// advertise when every eligible/routed account has a 900k+ observation.
+		eligible := false
+		allLarge := true
 		for i := range accounts {
 			account := &accounts[i]
 			if !account.IsAnthropic() || !account.IsModelSupported(model) ||
 				(len(routedAccountIDs) > 0 && !slices.Contains(routedAccountIDs, account.ID)) {
 				continue
 			}
+			eligible = true
 			snapshot, parsed := metadataByAccount[account.ID]
 			if !parsed {
 				// Snapshot decoding is expensive; do it at most once per account.
@@ -88,14 +95,18 @@ func (s *GatewayService) ExpandAnthropicLongContextModels(ctx context.Context, g
 				metadataByAccount[account.ID] = snapshot
 			}
 			if snapshot == nil {
-				continue
-			}
-			metadata, ok := snapshot.Models[strings.TrimSpace(account.GetMappedModel(model))]
-			if ok && metadata.ContextWindow >= 900_000 {
-				result = append(result, variant)
-				seen[variantKey] = true
+				allLarge = false
 				break
 			}
+			metadata, ok := snapshot.Models[strings.TrimSpace(account.GetMappedModel(model))]
+			if !ok || metadata.ContextWindow < 900_000 {
+				allLarge = false
+				break
+			}
+		}
+		if eligible && allLarge {
+			result = append(result, variant)
+			seen[variantKey] = true
 		}
 	}
 	if s.modelsListCache != nil {
