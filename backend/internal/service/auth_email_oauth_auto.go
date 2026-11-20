@@ -195,10 +195,17 @@ func (s *AuthService) createEmailOAuthUser(ctx context.Context, email, username,
 	if err := s.createUserWithRegistrationEmailGuard(ctx, user); err != nil {
 		if errors.Is(err, ErrEmailExists) {
 			existing, loadErr := s.userRepo.GetByEmail(ctx, email)
+			if errors.Is(loadErr, ErrUserNotFound) {
+				// An email alias (plus/dot variant) can conflict even when exact lookup misses.
+				return nil, ErrEmailExists
+			}
 			if loadErr != nil {
 				return nil, ErrServiceUnavailable
 			}
 			return existing, nil
+		}
+		if errors.Is(err, ErrEmailDomainRegistrationLimit) {
+			return nil, ErrEmailDomainRegistrationLimit
 		}
 		return nil, ErrServiceUnavailable
 	}

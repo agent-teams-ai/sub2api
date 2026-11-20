@@ -99,7 +99,8 @@ func TestEmailOAuthAuto_RespectsDomainQuotaAtCreation(t *testing.T) {
 	first, err := svc.createEmailOAuthUser(ctx, "first@custom.example", "first", "github", "", "")
 	require.NoError(t, err)
 	require.NotNil(t, first)
-	require.Equal(t, 1, repo.guardedCreates, "OAuth creation must use an atomic alias/domain guarded insert")
+	require.Equal(t, 1, repo.domainLimitedCreates, "OAuth creation must use the domain-limited atomic insertion")
+	require.Equal(t, 1, repo.guardedCreates)
 
 	// Emulate an existing registration in the same domain as a second identity.
 	repo.domainCounts["custom.example"] = 1
