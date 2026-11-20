@@ -722,14 +722,15 @@ func (c *OpsMetricsCollector) tryCgroupCPUPercent(now time.Time) *float64 {
 }
 
 func readCgroupMemoryBytes() (usedBytes uint64, totalBytes uint64, ok bool) {
-	// The limit and its sentinel/cgroup-path handling must match the process
-	// memory budget. A parent systemd slice can be tighter than memory.max at
-	// the mount root; use the shared sysutil reader for both v1 and v2.
+	// memory.current / memory.usage_in_bytes are sampled at the mount root.
+	// Pair them ONLY with that same hierarchy's root limit. Using the
+	// process's tighter nested slice limit mixes different populations and
+	// can report >100% usage on non-namespaced hosts.
 	if used, available := readUintFile("/sys/fs/cgroup/memory.current"); available {
-		return used, sysutil.CgroupMemoryLimitBytes(), true
+		return used, sysutil.CgroupMemoryMountRootLimitBytes(true), true
 	}
 	if used, available := readUintFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); available {
-		return used, sysutil.CgroupMemoryLimitBytes(), true
+		return used, sysutil.CgroupMemoryMountRootLimitBytes(false), true
 	}
 	return 0, 0, false
 }

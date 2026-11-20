@@ -98,6 +98,27 @@ func TestCgroupMemoryLimit(t *testing.T) {
 	})
 }
 
+func TestCgroupMemoryMountRootLimitPairsWithRootUsage(t *testing.T) {
+	root := t.TempDir()
+	self := filepath.Join(t.TempDir(), "cgroup")
+	writeFile(t, self, "0::/system.slice/app\n")
+	writeFile(t, filepath.Join(root, "memory.max"), "8589934592\n")
+	writeFile(t, filepath.Join(root, "system.slice", "memory.max"), "2147483648\n")
+	require.Equal(t, uint64(2<<30), cgroupMemoryLimit(root, self),
+		"process budget should respect the tighter nested slice")
+	require.Equal(t, uint64(8<<30), cgroupMemoryMountRootLimit(root, true),
+		"mount-root usage must be compared with the mount-root limit")
+
+	writeFile(t, filepath.Join(root, "memory", "memory.limit_in_bytes"), "4294967296\n")
+	writeFile(t, filepath.Join(root, "memory", "system.slice", "memory.limit_in_bytes"), "1073741824\n")
+	require.Equal(t, uint64(4<<30), cgroupMemoryMountRootLimit(root, false),
+		"v1 usage must be compared with its own hierarchy root limit")
+
+	writeFile(t, filepath.Join(root, "memory.max"), "max\n")
+	require.Zero(t, cgroupMemoryMountRootLimit(root, true),
+		"unlimited roots must fall back to coherent host metrics")
+}
+
 func TestGoMemoryLimit(t *testing.T) {
 	require.Zero(t, goMemoryLimit(math.MaxInt64))
 	require.Equal(t, uint64(1<<30), goMemoryLimit(1<<30))

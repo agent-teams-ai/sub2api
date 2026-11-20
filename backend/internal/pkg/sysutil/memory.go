@@ -22,6 +22,22 @@ func CgroupMemoryLimitBytes() uint64 {
 	return cgroupMemoryLimit(cgroupRoot, "/proc/self/cgroup")
 }
 
+// CgroupMemoryMountRootLimitBytes returns the cgroup mount-root memory limit
+// in bytes for the selected hierarchy (v2=true, v1=false), or 0 when the
+// root is unlimited or unavailable. Ops pairs this with mount-root usage,
+// whereas process memory budgeting uses the potentially tighter child/parent
+// cgroup limit from CgroupMemoryLimitBytes.
+func CgroupMemoryMountRootLimitBytes(v2 bool) uint64 {
+	return cgroupMemoryMountRootLimit(cgroupRoot, v2)
+}
+
+func cgroupMemoryMountRootLimit(root string, v2 bool) uint64 {
+	if v2 {
+		return cgroupPathMemoryLimit(root, "/", "memory.max")
+	}
+	return cgroupPathMemoryLimit(filepath.Join(root, "memory"), "/", "memory.limit_in_bytes")
+}
+
 // MemoryLimitBytes returns the memory available to this process: the smallest
 // of physical memory, the cgroup (container/systemd) limit and GOMEMLIMIT.
 // It returns 0 when none of them can be determined.
