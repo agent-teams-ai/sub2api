@@ -17,6 +17,14 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/gatewaymodelcatalog"
 )
 
+// gatewayAccountModelsSnapshotTTL is how long an account model snapshot stays
+// fresh (its expiresAt); it was chosen equal to gatewayLiveModelsFreshFor. A
+// catalogue snapshot is rebuilt on every read, so a list the web just opened
+// gets the full window. Codex and OpenRouter return a cached snapshot with its
+// original expiresAt, so theirs can have less left. Consumers still reject a
+// snapshot past expiresAt.
+const gatewayAccountModelsSnapshotTTL = 5 * time.Minute
+
 // Model selection is mutable account capability; Route.Model remains the
 // immutable qualification/birth anchor. This private catalogue never projects
 // provider instructions, tokens, labels, or arbitrary manifest metadata.
@@ -180,7 +188,7 @@ func (s *GatewayAccountModelsReader) readNativeCatalogAccountModels(
 		Status: "snapshot", Source: gatewayModelCatalogSource(before.Profile), PhysicalGeneration: before.Generation,
 		PrincipalVersion: in.AccountRef,
 		FetchedAt:        now.Format(time.RFC3339Nano),
-		ExpiresAt:        now.Add(time.Minute).Format(time.RFC3339Nano),
+		ExpiresAt:        now.Add(gatewayAccountModelsSnapshotTTL).Format(time.RFC3339Nano),
 		Models:           &models,
 	}
 }
@@ -243,12 +251,8 @@ func (cache *gatewayModelsCache) read(ctx context.Context, key, obsoletePrefix s
 		cache.pending[key] = pending
 		cache.Unlock()
 		out := fetch()
-		ttl := 5 * time.Second
-		if out.Status == "snapshot" {
-			ttl = 60 * time.Second
-		}
 		cache.Lock()
-		expiry := time.Now().Add(ttl)
+		expiry := time.Now().Add(5 * time.Second)
 		if out.Status == "snapshot" {
 			expiry, _ = time.Parse(time.RFC3339Nano, out.ExpiresAt)
 		}
@@ -313,7 +317,7 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 		return unavailable
 	}
 	now := time.Now().UTC()
-	return GatewayAccountModelsResult{Status: "snapshot", PhysicalGeneration: p.Scope.Generation, PrincipalVersion: principal, Source: "codex", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano), Models: &models}
+	return GatewayAccountModelsResult{Status: "snapshot", PhysicalGeneration: p.Scope.Generation, PrincipalVersion: principal, Source: "codex", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(gatewayAccountModelsSnapshotTTL).Format(time.RFC3339Nano), Models: &models}
 }
 
 type gatewayCodexCatalogProjection struct {

@@ -97,7 +97,7 @@ func TestGatewayAccountModelsReadFencesAndRedaction(t *testing.T) {
 			require.NotContains(t, string(wire), "instructions")
 			first, _ := time.Parse(time.RFC3339Nano, result.FetchedAt)
 			last, _ := time.Parse(time.RFC3339Nano, result.ExpiresAt)
-			require.Equal(t, time.Minute, last.Sub(first))
+			require.Equal(t, gatewayAccountModelsSnapshotTTL, last.Sub(first))
 			require.Equal(t, int32(1), f.modelsReads.Load())
 			require.Equal(t, int32(0), f.entries.Load())
 		})

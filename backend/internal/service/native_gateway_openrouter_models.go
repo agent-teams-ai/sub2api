@@ -87,7 +87,7 @@ func (s *GatewayOpenRouterModels) fetch(ctx context.Context) GatewayAccountModel
 		return unavailable
 	}
 	now := time.Now().UTC()
-	return GatewayAccountModelsResult{Status: "snapshot", Source: "openrouter", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano), Models: &models}
+	return GatewayAccountModelsResult{Status: "snapshot", Source: "openrouter", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(gatewayAccountModelsSnapshotTTL).Format(time.RFC3339Nano), Models: &models}
 }
 
 func parseGatewayOpenRouterModels(raw []byte) ([]GatewayAccountModel, error) {
