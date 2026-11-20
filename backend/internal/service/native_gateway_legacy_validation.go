@@ -211,17 +211,32 @@ func gatewayNativeLegacyStreamFailure(ctx context.Context, phase gatewayNativeRe
 }
 
 func gatewayNativeLegacyFailureWithReason(ctx context.Context, phase gatewayNativeResponseFailurePhase, readErrorReason string) error {
+	return gatewayNativeLegacyFailureLine(ctx, phase, readErrorReason, 0)
+}
+
+// The bridge answers every non-2xx Chat response with the same bare 502.
+// Only the integer status leaves the process, the same http_status phase the
+// Responses path reports; never the body, headers or provider text.
+func gatewayNativeLegacyHTTPStatusFailure(ctx context.Context, status int) error {
+	return gatewayNativeLegacyFailureLine(ctx, gatewayNativeFailureHTTP, "", status)
+}
+
+func gatewayNativeLegacyFailureLine(ctx context.Context, phase gatewayNativeResponseFailurePhase, readErrorReason string, status int) error {
 	if ctx.Err() == context.DeadlineExceeded {
 		phase = gatewayNativeFailureDeadline
 	}
 	if phase != gatewayNativeFailureSSERead {
 		readErrorReason = ""
 	}
+	if status < 100 || status > 599 {
+		status = 0
+	}
 	line, _ := json.Marshal(struct {
 		Event           string                            `json:"event"`
 		Phase           gatewayNativeResponseFailurePhase `json:"phase"`
+		HTTPStatus      int                               `json:"http_status,omitempty"`
 		ReadErrorReason string                            `json:"read_error_reason,omitempty"`
-	}{"gateway_native_response_failure", phase, readErrorReason})
+	}{"gateway_native_response_failure", phase, status, readErrorReason})
 	_, _ = fmt.Fprintln(os.Stderr, string(line))
 	return ErrGatewayNativeEffectUnknown
 }

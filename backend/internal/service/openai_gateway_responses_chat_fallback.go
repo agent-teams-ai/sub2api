@@ -144,7 +144,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletionsWithStartTim
 
 	if HasGatewayNativeIdentity(account) && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "native_effect_unknown", "native upstream request failed")
-		return nil, ErrGatewayNativeEffectUnknown
+		return nil, gatewayNativeLegacyHTTPStatusFailure(ctx, resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
