@@ -17,6 +17,13 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/gatewaymodelcatalog"
 )
 
+// gatewayAccountModelsSnapshotTTL is how long an account model snapshot stays
+// fresh (its expiresAt). Five minutes matches the live catalogue cache
+// (gatewayLiveModelsFreshFor), so a user can pick a model from a list the web
+// opened without it expiring mid-choice, and each open does not cost another
+// upstream /models read. Consumers still reject a snapshot past expiresAt.
+const gatewayAccountModelsSnapshotTTL = 5 * time.Minute
+
 // Model selection is mutable account capability; Route.Model remains the
 // immutable qualification/birth anchor. This private catalogue never projects
 // provider instructions, tokens, labels, or arbitrary manifest metadata.
@@ -180,7 +187,7 @@ func (s *GatewayAccountModelsReader) readNativeCatalogAccountModels(
 		Status: "snapshot", Source: gatewayModelCatalogSource(before.Profile), PhysicalGeneration: before.Generation,
 		PrincipalVersion: in.AccountRef,
 		FetchedAt:        now.Format(time.RFC3339Nano),
-		ExpiresAt:        now.Add(time.Minute).Format(time.RFC3339Nano),
+		ExpiresAt:        now.Add(gatewayAccountModelsSnapshotTTL).Format(time.RFC3339Nano),
 		Models:           &models,
 	}
 }
@@ -313,7 +320,7 @@ func (s *GatewayNativeOAuthDispatch) fetchAccountModels(ctx context.Context, a *
 		return unavailable
 	}
 	now := time.Now().UTC()
-	return GatewayAccountModelsResult{Status: "snapshot", PhysicalGeneration: p.Scope.Generation, PrincipalVersion: principal, Source: "codex", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano), Models: &models}
+	return GatewayAccountModelsResult{Status: "snapshot", PhysicalGeneration: p.Scope.Generation, PrincipalVersion: principal, Source: "codex", FetchedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(gatewayAccountModelsSnapshotTTL).Format(time.RFC3339Nano), Models: &models}
 }
 
 type gatewayCodexCatalogProjection struct {

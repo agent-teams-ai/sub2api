@@ -220,7 +220,7 @@ func TestGatewayGLMAccountModelsCatalog(t *testing.T) {
 			require.NoError(t, err)
 			last, err := time.Parse(time.RFC3339Nano, result.ExpiresAt)
 			require.NoError(t, err)
-			require.Equal(t, time.Minute, last.Sub(first))
+			require.Equal(t, gatewayAccountModelsSnapshotTTL, last.Sub(first))
 			wire, err := json.Marshal(result)
 			require.NoError(t, err)
 			require.NotContains(t, string(wire), "sandbox-fixture")

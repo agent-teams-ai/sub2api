@@ -102,7 +102,7 @@ func TestGatewayNVIDIAAccountModelsPhysicalRouteAndFences(t *testing.T) {
 			require.NoError(t, err)
 			last, err := time.Parse(time.RFC3339Nano, result.ExpiresAt)
 			require.NoError(t, err)
-			require.Equal(t, time.Minute, last.Sub(first))
+			require.Equal(t, 5*time.Minute, last.Sub(first), "a picker list stays fresh while the user chooses")
 			wire, err := json.Marshal(result)
 			require.NoError(t, err)
 			require.NotContains(t, string(wire), "nvidia-synthetic-credential")
