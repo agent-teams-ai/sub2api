@@ -115,9 +115,9 @@ func (s *adminServiceImpl) BatchDisableUsers(ctx context.Context, userIDs []int6
 	if s.authCacheInvalidator != nil && len(disabled) <= maxImmediateBatchAuthCacheInvalidations {
 		invalidateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), immediateBatchAuthCacheInvalidationTimeout)
 		defer cancel()
-		for _, userID := range disabled {
+		for i, userID := range disabled {
 			if invalidateCtx.Err() != nil {
-				logger.LegacyPrintf("service.admin", "batch auth cache eager invalidation expired after %d users; remaining entries will be processed by the durable outbox", len(disabled))
+				logger.LegacyPrintf("service.admin", "batch auth cache eager invalidation expired after %d/%d users; remaining entries will be processed by the durable outbox", i, len(disabled))
 				break
 			}
 			s.authCacheInvalidator.InvalidateAuthCacheByUserID(invalidateCtx, userID)
