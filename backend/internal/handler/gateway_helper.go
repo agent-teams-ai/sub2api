@@ -379,7 +379,7 @@ func (h *ConcurrencyHelper) waitForSlotWithPingTimeout(c *gin.Context, slotType 
 		}
 	}
 
-	// Determine if ping is needed (streaming + ping format defined)
+	// Ping only when streaming, a ping format is configured, and the interval is positive.
 	needPing := isStream && h.pingFormat != "" && h.pingInterval > 0
 
 	var flusher http.Flusher

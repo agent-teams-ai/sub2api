@@ -8,8 +8,8 @@ import (
 )
 
 // requestBodyReadFailure maps a request body read error to the response status
-// and message. Read timeouts (408) are no longer reported as malformed
-// requests; other read failures keep the stable generic 400 message. Failures
+// and message. Timeouts return 408 and client disconnects return 499;
+// malformed reads retain 400, with separate 413/503 capacity responses. Failures
 // other than the configured size limit are logged with bounded, payload-free
 // diagnostics (kind, declared length, bytes received and read duration) so
 // operators can tell a stalled or slow upload from a broken client without
