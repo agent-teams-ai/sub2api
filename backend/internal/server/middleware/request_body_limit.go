@@ -1,13 +1,15 @@
 package middleware
 
 import (
-	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"net/http"
 
+	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/gin-gonic/gin"
 )
 
 // RequestBodyLimit 使用 MaxBytesReader 限制请求体大小。
+// budgets is optional for legacy callers; when supplied, only its first entry
+// is used. Pass at most one budget: additional entries are intentionally ignored.
 func RequestBodyLimit(maxBytes int64, budgets ...*pkghttputil.BodyMemoryBudget) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if len(budgets) > 0 {

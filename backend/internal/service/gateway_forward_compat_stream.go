@@ -194,7 +194,7 @@ func (st *anthropicCompatStream) failure() *anthropicCompatStreamFailure {
 		return &anthropicCompatStreamFailure{
 			err:     fmt.Errorf("stream usage incomplete: %w", st.readErr),
 			errType: "response_too_large",
-			message: fmt.Sprintf("upstream SSE line exceeded %d bytes", st.maxLineSize),
+			message: "upstream SSE event exceeded configured transport limits",
 		}
 	case st.readErr != nil && !errors.Is(st.readErr, io.EOF):
 		return &anthropicCompatStreamFailure{
