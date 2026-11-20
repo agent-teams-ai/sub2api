@@ -46,6 +46,8 @@ case "${1-} ${2-}" in
    git --git-dir="$destgit" rev-parse "$sha^{tree}"
    ;;
  'pr view')
+   # Verify the probe reads the exact source PR, not an unrelated branch or PR.
+   [[ $# -eq 9 && ${3-} == 106 && ${4-} == --repo && ${5-} == agent-teams-ai/sub2api && ${6-} == --json && ${7-} == headRefOid && ${8-} == --jq && ${9-} == .headRefOid ]] || { echo "Unexpected gh pr view: $*" >&2; exit 12; }
    git --git-dir="$sourcegit" rev-parse refs/heads/sync/wei-shaw-upstream-20261120
    ;;
  'repo create')
@@ -63,6 +65,11 @@ case "${1-} ${2-}" in
    else exit 9; fi
    ;;
  'pr create')
+   # Fail if the trial PR is created in the wrong repo, on the wrong base/head,
+   # or without a traceable reference to source PR #106 and the current SHA.
+   [[ $# -eq 12 && ${3-} == --repo && ${4-} == agent-teams-ai/sub2api-standalone && ${5-} == --base && ${6-} == main && ${7-} == --head && ${8-} == sync/wei-shaw-upstream-20261120 && ${9-} == --title && -n ${10-} && ${11-} == --body ]] || { echo "Unexpected gh pr create arguments: $*" >&2; exit 13; }
+   expected_head="$(git --git-dir="$sourcegit" rev-parse refs/heads/sync/wei-shaw-upstream-20261120)"
+   [[ ${12-} == *"Sub2API PR #106 HEAD $expected_head"* && ${12-} == *"https://github.com/agent-teams-ai/sub2api/pull/106"* ]] || { echo 'Missing exact source reference in trial PR' >&2; exit 14; }
    touch "$ROOT/pr-created"
    echo pr-created >> "$ROOT/pr-calls"
    ;;
