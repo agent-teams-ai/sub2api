@@ -140,3 +140,10 @@ func TestCleanGeminiRequest_ToolSchemaPreservesUnrelatedJSONAndLargeIntegers(t *
 	require.False(t, gjson.GetBytes(out, "generationConfig.responseJsonSchema").Exists())
 	require.True(t, gjson.GetBytes(out, "tools.0.functionDeclarations.0.parameters.properties.title.description").Exists())
 }
+
+func TestCleanGeminiRequest_RejectsMalformedOrNonObjectJSON(t *testing.T) {
+	for _, body := range []string{`{"tools":[`, `[]`} {
+		_, err := cleanGeminiRequest([]byte(body))
+		require.Error(t, err)
+	}
+}

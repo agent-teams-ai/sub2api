@@ -1680,8 +1680,8 @@ func (s *GatewayService) GetSchedulablePlatforms(ctx context.Context, groupID *i
 
 // InvalidateAvailableModelsCache explicitly purges local model-list entries.
 // Admin account/group writes do not invoke it: production listings deliberately
-// use modelsListCacheTTL (15s) bounded eventual consistency, including the
-// Anthropic [1m] variants. This is not a synchronous cross-replica invalidation.
+// use bounded eventual consistency (base entries use modelsListCacheTTL;
+// Anthropic [1m] entries use at most 5s). This is not synchronous cross-replica invalidation.
 func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform string) {
 	if s == nil || s.modelsListCache == nil {
 		return

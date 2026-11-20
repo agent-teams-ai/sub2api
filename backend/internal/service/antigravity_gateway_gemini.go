@@ -481,6 +481,12 @@ handleSuccess:
 
 // cleanGeminiRequest 清理 Gemini 请求体中的 Schema
 func cleanGeminiRequest(body []byte) ([]byte, error) {
+	// Preserve the original contract: malformed JSON or a non-object envelope
+	// must be rejected before any raw-path tool/schema transformation.
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
 	// Rewrite individual tool parameter schemas instead of decoding and
 	// re-marshaling the entire payload. The latter reorders unrelated JSON
 	// properties and converts large integers to float64.
