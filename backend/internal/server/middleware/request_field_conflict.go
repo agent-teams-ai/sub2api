@@ -87,6 +87,11 @@ func writeGatewayInvalidRequest(c *gin.Context, status int, message string) {
 			"type":  "error",
 			"error": gin.H{"type": "invalid_request_error", "message": message},
 		})
+	case strings.Contains(path, "/responses"):
+		// Responses clients inspect error.code; Chat Completions uses error.type.
+		c.JSON(status, gin.H{
+			"error": gin.H{"code": "invalid_request_error", "message": message},
+		})
 	default:
 		c.JSON(status, gin.H{
 			"error": gin.H{"type": "invalid_request_error", "message": message},
