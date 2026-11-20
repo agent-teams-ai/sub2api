@@ -3,8 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"net/http/httptest"
-	"testing"
 	"strings"
+	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
