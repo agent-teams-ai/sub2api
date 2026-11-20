@@ -493,7 +493,12 @@ func usageFailureInfo(usage *UsageInfo) (failed, credentialInvalid bool, msg str
 	if usage == nil {
 		return false, false, ""
 	}
-	if usage.ErrorCode == "quota_unknown" || usage.ErrorCode == errorCodeQuotaRefreshFailed {
+	if usage.ErrorCode == "quota_unknown" {
+		return false, false, ""
+	}
+	// A failed active refresh is harmless only when a usable prior quota
+	// observation exists. An empty snapshot must not report operational.
+	if usage.ErrorCode == errorCodeQuotaRefreshFailed && len(usageQuotaTiers(usage)) > 0 {
 		return false, false, ""
 	}
 	failed = usage.Error != "" || usage.NeedsReauth || usage.IsBanned ||
