@@ -537,9 +537,10 @@ func cleanGeminiRequest(body []byte) ([]byte, error) {
 	return normalizeGeminiResponseSchemaRaw(body)
 }
 
-// normalizeGeminiResponseSchemaRaw renames responseJsonSchema without encoding
-// the surrounding JSON through map[string]any. This preserves property order
-// and exact JSON numbers when the Antigravity cleaner requires no changes.
+// normalizeGeminiResponseSchemaRaw renames responseJsonSchema to responseSchema:
+// Antigravity silently ignores responseJsonSchema, so the latter is required
+// for JSON-mode structured output to work. Raw paths preserve property order
+// and exact JSON numbers when the schema cleaner makes no changes.
 func normalizeGeminiResponseSchemaRaw(body []byte) ([]byte, error) {
 	for _, configKey := range []string{"generationConfig", "generation_config"} {
 		for _, schemaKey := range []string{"responseJsonSchema", "response_json_schema"} {

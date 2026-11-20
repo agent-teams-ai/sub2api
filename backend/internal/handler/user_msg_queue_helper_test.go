@@ -9,17 +9,17 @@ import (
 
 func TestUserMsgQueueHelperPingInterval(t *testing.T) {
 	cases := []struct {
-		name string
+		name     string
 		interval time.Duration
-		stream bool
-		format SSEPingFormat
-		want bool
+		stream   bool
+		format   SSEPingFormat
+		want     bool
 	}{
-		{name:"zero disables pings", interval:0, stream:true, format:SSEPingFormatComment},
-		{name:"positive enables pings", interval:time.Second, stream:true, format:SSEPingFormatComment, want:true},
-		{name:"negative falls back to default", interval:-time.Second, stream:true, format:SSEPingFormatComment, want:true},
-		{name:"non-streaming disables pings", interval:time.Second, stream:false, format:SSEPingFormatComment},
-		{name:"empty format disables pings", interval:time.Second, stream:true, format:SSEPingFormatNone},
+		{name: "zero disables pings", interval: 0, stream: true, format: SSEPingFormatComment},
+		{name: "positive enables pings", interval: time.Second, stream: true, format: SSEPingFormatComment, want: true},
+		{name: "negative falls back to default", interval: -time.Second, stream: true, format: SSEPingFormatComment, want: true},
+		{name: "non-streaming disables pings", interval: time.Second, stream: false, format: SSEPingFormatComment},
+		{name: "empty format disables pings", interval: time.Second, stream: true, format: SSEPingFormatNone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

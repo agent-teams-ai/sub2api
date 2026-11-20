@@ -15,9 +15,9 @@ import (
 
 const cgroupRoot = "/sys/fs/cgroup"
 
-// CgroupMemoryLimitBytes reports the tightest cgroup memory limit along the
-// process's hierarchy; the Ops collector uses this same reader as memory
-// budgeting, instead of a separate mount-root-only implementation.
+// CgroupMemoryLimitBytes returns the smallest positive memory limit applying
+// to the current process along its cgroup v1/v2 hierarchy (including parents).
+// It returns 0 if the limit is unlimited or cannot be determined.
 func CgroupMemoryLimitBytes() uint64 {
 	return cgroupMemoryLimit(cgroupRoot, "/proc/self/cgroup")
 }

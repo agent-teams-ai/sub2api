@@ -24,14 +24,14 @@ type WorkerRuntime struct {
 }
 
 type Runner struct {
-	config  ConfigStore
-	repo    JobRepository
-	payload PayloadStore
-	scanner PromptScanner
-	metrics Metrics
-	clock   Clock
-	runtime WorkerRuntime
-	wake    []chan struct{}
+	config   ConfigStore
+	repo     JobRepository
+	payload  PayloadStore
+	scanner  PromptScanner
+	metrics  Metrics
+	clock    Clock
+	runtime  WorkerRuntime
+	wake     []chan struct{}
 	wakeNext atomic.Uint64 // only one active worker is notified per enqueue
 
 	mu     sync.Mutex

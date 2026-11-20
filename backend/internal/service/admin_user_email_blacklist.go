@@ -14,7 +14,7 @@ const MaxBatchDisableUsers = 20000
 const (
 	// Eagerly clear small batches, but rely on the PostgreSQL users-status
 	// trigger/outbox for large batches rather than one query per user in HTTP.
-	maxImmediateBatchAuthCacheInvalidations = 32
+	maxImmediateBatchAuthCacheInvalidations    = 32
 	immediateBatchAuthCacheInvalidationTimeout = 15 * time.Second
 )
 
