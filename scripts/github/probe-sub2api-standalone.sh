@@ -5,13 +5,16 @@ set -euo pipefail
 SOURCE='agent-teams-ai/sub2api'
 DEST='agent-teams-ai/sub2api-standalone'
 BRANCH='sync/wei-shaw-upstream-20261120'
-EXPECTED_MAIN='14f500eb4db78b47b5d028a8a811ec62b348ac92'
-EXPECTED_HEAD='2318cc715088c9573c96096ef40ecb7781e7e70c'
+
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 for bin in git gh; do command -v "$bin" >/dev/null || fail "Missing $bin"; done
 gh auth status >/dev/null || fail 'GitHub CLI is not authenticated'
 [[ "$(gh repo view "$SOURCE" --json isFork --jq '.isFork')" == true ]] || fail 'Source is not a fork'
+# Resolve immutable source identities at invocation time (the source branch can advance).
+EXPECTED_MAIN="$(gh api "repos/$SOURCE/branches/main" --jq '.commit.sha')"
+EXPECTED_HEAD="$(gh pr view 106 --repo "$SOURCE" --json headRefOid --jq '.headRefOid')"
+[[ -n "$EXPECTED_MAIN" && -n "$EXPECTED_HEAD" ]] || fail 'Source refs unavailable'
 if gh repo view "$DEST" >/dev/null 2>&1; then
   fail "Destination already exists: $DEST (inspect before changing)"
 fi
