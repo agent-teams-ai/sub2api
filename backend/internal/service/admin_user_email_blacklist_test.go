@@ -110,6 +110,22 @@ func (s *ctxRecordingAuthCacheInvalidator) InvalidateAuthCacheByUserID(ctx conte
 	s.authCacheInvalidatorStub.InvalidateAuthCacheByUserID(ctx, userID)
 }
 
+
+func TestAdminService_BatchDisableUsers_LargeBatchUsesDurableOutboxInsteadOfBlockingHTTP(t *testing.T) {
+	disabled := make([]int64, maxImmediateBatchAuthCacheInvalidations+1)
+	for i := range disabled {
+		disabled[i] = int64(i + 1)
+	}
+	repo := &emailBlacklistUserRepoStub{userRepoStub: &userRepoStub{}, disabled: disabled}
+	invalidator := &authCacheInvalidatorStub{}
+	svc := &adminServiceImpl{userRepo: repo, authCacheInvalidator: invalidator}
+
+	affected, err := svc.BatchDisableUsers(context.Background(), disabled)
+	require.NoError(t, err)
+	require.Equal(t, len(disabled), affected)
+	require.Empty(t, invalidator.userIDs, "bulk invalidation is enqueued transactionally by the users-status outbox trigger")
+}
+
 func TestAdminService_BatchDisableUsers_InvalidatesCacheAfterRequestCanceled(t *testing.T) {
 	repo := &emailBlacklistUserRepoStub{userRepoStub: &userRepoStub{}, disabled: []int64{4, 5}}
 	invalidator := &ctxRecordingAuthCacheInvalidator{}

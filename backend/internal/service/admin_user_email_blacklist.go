@@ -3,12 +3,20 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 )
 
 // MaxBatchDisableUsers 是单次批量禁用的用户数上限。
 const MaxBatchDisableUsers = 20000
+
+const (
+	// Eagerly clear small batches, but rely on the PostgreSQL users-status
+	// trigger/outbox for large batches rather than one query per user in HTTP.
+	maxImmediateBatchAuthCacheInvalidations = 32
+	immediateBatchAuthCacheInvalidationTimeout = 15 * time.Second
+)
 
 // UserEmailBlacklistRepository 是精确邮箱黑名单关联已注册用户所需的仓储能力。
 type UserEmailBlacklistRepository interface {
@@ -99,10 +107,19 @@ func (s *adminServiceImpl) BatchDisableUsers(ctx context.Context, userIDs []int6
 	if err != nil {
 		return 0, err
 	}
-	if s.authCacheInvalidator != nil {
-		// 状态已落库，缓存失效不随请求取消中断，否则未清到的用户在缓存 TTL 内仍能用 API Key。
-		invalidateCtx := context.WithoutCancel(ctx)
+	// Migration 184's users-status trigger enqueues API-key invalidation for
+	// every disabled user transactionally, and the outbox processes/retries
+	// those keys with bounded concurrency. For small batches, additionally
+	// clear caches eagerly, detached from canceled HTTP requests but bounded
+	// in time. Never issue 20,000 sequential DB/cache lookups in one request.
+	if s.authCacheInvalidator != nil && len(disabled) <= maxImmediateBatchAuthCacheInvalidations {
+		invalidateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), immediateBatchAuthCacheInvalidationTimeout)
+		defer cancel()
 		for _, userID := range disabled {
+			if invalidateCtx.Err() != nil {
+				logger.LegacyPrintf("service.admin", "batch auth cache eager invalidation expired after %d users; remaining entries will be processed by the durable outbox", len(disabled))
+				break
+			}
 			s.authCacheInvalidator.InvalidateAuthCacheByUserID(invalidateCtx, userID)
 		}
 	}
