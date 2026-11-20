@@ -8,7 +8,7 @@ import (
 )
 
 // MaxBatchDisableUsers 是单次批量禁用的用户数上限。
-const MaxBatchDisableUsers = MaxRegistrationEmailBlacklistSize
+const MaxBatchDisableUsers = 20000
 
 // UserEmailBlacklistRepository 是精确邮箱黑名单关联已注册用户所需的仓储能力。
 type UserEmailBlacklistRepository interface {

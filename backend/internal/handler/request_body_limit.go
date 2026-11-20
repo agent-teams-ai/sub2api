@@ -18,7 +18,10 @@ import (
 // a client that went away (499).
 func handleRequestBodyReadError(c *gin.Context, reqLog *zap.Logger, err error) bool {
 	if err != nil && !pkghttputil.IsRequestBodyReadTimeout(err) && failoverClientGone(c) {
-		logRequestBodyReadFailure(reqLog, pkghttputil.DescribeRequestBodyReadFailure(c.Request, err))
+		failure := pkghttputil.DescribeRequestBodyReadFailure(c.Request, err)
+		if failure.Kind != pkghttputil.RequestBodyReadErrorMaxBytes {
+			logRequestBodyReadFailure(reqLog, failure)
+		}
 		c.Abort()
 		return true
 	}

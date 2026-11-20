@@ -86,8 +86,8 @@ func geminiThinkingLevelFromBody(body []byte) string {
 }
 
 // geminiThinkingLevelFromClaudeBody 结合兼容层转换后的 output_config.effort 与 thinking 配置推导档位。
-// OpenAI Responses / Chat Completions 在 effort=low/minimal/none 时可能只写 output_config.effort 而不写 thinking，
-// 优先读取显式 effort 可避免裸 Gemini 模型被默认归入 high 变体。
+// OpenAI Responses / Chat Completions 的显式 effort（包括 none/minimal/low）可能与转换后的 thinking budget 同时出现；
+// 显式 effort 优先于冲突的 thinking budget，避免裸 Gemini 模型被错误归入 high 变体。
 func geminiThinkingLevelFromClaudeBody(claudeBody []byte, thinking *antigravity.ThinkingConfig) string {
 	switch parseClaudeThinkingIntent(claudeBody).tier {
 	case "minimal", "low":
