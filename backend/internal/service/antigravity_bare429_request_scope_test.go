@@ -121,3 +121,37 @@ func TestAntigravityRetryLoop_429WithResetDelay_CoolsEveryAccount(t *testing.T) 
 	require.True(t, runBare429Loop(t, c, bare429Account(13), body))
 	require.True(t, runBare429Loop(t, c, bare429Account(6), body))
 }
+
+func TestBareAntigravity429RequiresExhaustionPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"known request-scoped 429", bareAntigravity429Body, true},
+		{"empty 429 body", "", false},
+		{"unrelated status", `{"error":{"code":429,"message":"Account disabled","status":"PERMISSION_DENIED"}}`, false},
+		{"unrelated quota failure", `{"error":{"code":429,"message":"Account quota reached","status":"RESOURCE_EXHAUSTED"}}`, false},
+		{"unrelated 429 message", `{"error":{"code":429,"message":"Transient error","status":"RESOURCE_EXHAUSTED"}}`, false},
+		{"malformed 429 message", `{"error":{"code":429,"message":{},"status":"RESOURCE_EXHAUSTED"}}`, false},
+		{"explicit details", `{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED","details":[{"reason":"QUOTA_EXHAUSTED"}]}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isBareAntigravity429(http.StatusTooManyRequests, []byte(tc.body)))
+		})
+	}
+}
+
+func TestBare429CooldownExcludedCodeDoesNotClaimRequest(t *testing.T) {
+	ctx := newBare429TestContext()
+	account := bare429Account(1)
+	account.Type = AccountTypeAPIKey
+	account.Credentials = map[string]any{"custom_error_codes_enabled": true, "custom_error_codes": []any{float64(500)}}
+	require.False(t, account.ShouldHandleErrorCode(http.StatusTooManyRequests))
+	svc := &AntigravityGatewayService{}
+	result := svc.handleUpstreamErrorAfterRetryLoop(context.Background(), ctx, "[test]", account,
+		http.StatusTooManyRequests, http.Header{}, []byte(bareAntigravity429Body),
+		"gemini-4-argon-high", 0, "", false)
+	require.Nil(t, result)
+	require.True(t, claimBare429Cooldown(ctx, 2), "non-handled 429 must not consume the one-account cooldown claim")
+}
