@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"errors"
 	"log/slog"
+	"net/http"
 	"strconv"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
@@ -42,6 +44,11 @@ func (h *OpenAIOAuthHandler) scopedOpenAIHasPermission(c *gin.Context, id int64,
 
 func scopedOpenAIError(c *gin.Context, err error) {
 	if adminaccess.RestrictedFromContext(c.Request.Context()) != nil {
+		if errors.Is(err, service.ErrSparkShadowResetNotSupported) {
+			// Permanent shadow-account restriction: do not describe it as a retryable busy state.
+			response.Error(c, http.StatusConflict, "影子账户不支持额度重置，请直接操作母账户")
+			return
+		}
 		scopedAdminAccountError(c, err)
 		return
 	}
