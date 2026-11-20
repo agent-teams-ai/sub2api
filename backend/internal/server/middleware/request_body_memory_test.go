@@ -107,3 +107,24 @@ func TestRejectRequestBodyReadErrorCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestRejectRequestBodyMemoryOverloadProtocolErrors(t *testing.T) {
+	for _, tt := range []struct{ path, field string }{
+		{"/v1/responses", `"code":"service_unavailable"`},
+		{"/v1/chat/completions", `"type":"server_error"`},
+		{"/v1/messages", `"type":"api_error"`},
+		{"/v1beta/models/gemini-3:generateContent", `"code":503`},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, nil)
+			require.True(t, RejectRequestBodyMemoryOverload(c, pkghttputil.ErrRequestBodyMemoryBudget))
+			require.True(t, c.IsAborted())
+			require.Equal(t, http.StatusServiceUnavailable, w.Code)
+			require.Equal(t, "1", w.Header().Get("Retry-After"))
+			require.Contains(t, w.Body.String(), tt.field)
+			require.NotContains(t, w.Body.String(), "model_not_found")
+		})
+	}
+}
