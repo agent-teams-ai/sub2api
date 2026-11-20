@@ -23,6 +23,27 @@ import (
 func scopedStatisticsServiceContext(action string) context.Context {
 	return adminaccess.WithPrincipal(context.Background(), &adminaccess.Principal{Policy: adminaccess.Policy{Rules: []adminaccess.Rule{{Permissions: []string{action}, GroupIDs: []int64{1}, AccountTypes: []string{"oauth"}, Platforms: []string{"openai"}}}}})
 }
+type scopedAccountLookupErrorRepo struct {
+	AccountRepository
+	err error
+}
+
+func (r *scopedAccountLookupErrorRepo) GetByID(context.Context, int64) (*Account, error) {
+	return nil, r.err
+}
+
+func TestScopedAccountLookupPreservesInfrastructureError(t *testing.T) {
+	ctx := scopedStatisticsServiceContext("accounts.usage.read")
+	storageErr := fmt.Errorf("database unavailable")
+	err := scopedAccountIDAccess(ctx, &scopedAccountLookupErrorRepo{err: storageErr}, 1, "accounts.usage.read", false)
+	require.ErrorIs(t, err, storageErr)
+	require.Equal(t, 500, infraerrors.Code(err), "database failures must not look like missing accounts")
+
+	missing := fmt.Errorf("wrapped: %w", ErrAccountNotFound)
+	err = scopedAccountIDAccess(ctx, &scopedAccountLookupErrorRepo{err: missing}, 1, "accounts.usage.read", false)
+	require.Equal(t, 404, infraerrors.Code(err), "missing accounts must remain hidden as 404")
+}
+
 func TestScopedAdminUsageServiceRechecksScopeBeforeSnapshot(t *testing.T) {
 	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, GroupIDs: []int64{2}, Extra: map[string]any{"codex_5h_used_percent": 25.0}}
 	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{1: a}}
