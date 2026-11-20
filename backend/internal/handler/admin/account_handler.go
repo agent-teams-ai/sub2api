@@ -1741,6 +1741,8 @@ func (h *AccountHandler) GetStats(c *gin.Context) {
 
 	stats, err := h.accountUsageService.GetAccountUsageStats(c.Request.Context(), accountID, startTime, endTime)
 	if err != nil {
+		// Scoped responses deliberately redact details, but operators still need the cause.
+		slog.Warn("account usage statistics query failed", "account_id", accountID, "error", err)
 		scopedOpenAIError(c, err)
 		return
 	}
