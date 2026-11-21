@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This repository has moved to [agent-teams-ai/sub2api-standalone](https://github.com/agent-teams-ai/sub2api-standalone).** It is a non-fork repository with the same Git history, and all development, CI and releases happen there. GitHub paused workflow runs on this fork, so it is kept read-only for its history, branches and pull requests. Upstream is still [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api).
+
 <div align="center">
 
 <img src="assets/logo.svg" alt="Sub2API Logo" width="128" />
